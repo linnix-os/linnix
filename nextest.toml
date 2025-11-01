@@ -1,0 +1,8 @@
+[profile.default]
+# Retry once on failure for flakiness
+retries = 1
+
+[profile.e2e]
+# End-to-end tests run serially
+retries = 1
+test-threads = 1

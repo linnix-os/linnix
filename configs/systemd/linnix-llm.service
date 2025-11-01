@@ -1,0 +1,51 @@
+[Unit]
+Description=Linnix LLM Inference Server (llama.cpp)
+Documentation=https://github.com/ggerganov/llama.cpp
+After=network.target cognitod.service
+PartOf=cognitod.service
+
+[Service]
+Type=simple
+User=linnix
+Group=linnix
+WorkingDirectory=/opt/linnix
+Environment="LLAMA_MODEL_PATH=/opt/linnix/models/linnix-qwen-v1-q5_k_m.gguf"
+ExecStart=/opt/linnix/bin/llama-server \
+  -m ${LLAMA_MODEL_PATH} \
+  --host 127.0.0.1 \
+  --port 8090 \
+  --ctx-size 4096 \
+  --threads 12 \
+  -ngl 0 \
+  --log-format text
+
+# Restart policy
+Restart=on-failure
+RestartSec=10s
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+# Resource limits
+MemoryMax=8G
+MemoryHigh=7G
+CPUQuota=800%
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/linnix
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+PrivateMounts=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+[package]
+name = "linnix-ai-ebpf-common"
+version = "0.1.0"
+edition = "2021"
+
+license.workspace = true
+
+[features]
+default = ["user"]  # userspace by default
+bpf = []            # kernel-side, no_std, no serde
+user = ["dep:serde"]           # userspace, serde enabled in code via cfg(feature="user")
+
+[dependencies]
+bytemuck = { version = "1.17", default-features = false, features = ["derive"] }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"], optional = true }
+
+[dev-dependencies]
+serde_json = "1"
+
+[lib]
+path = "src/lib.rs"

@@ -1,0 +1,25 @@
+/etc/systemd/system/cognitod.service
+[Unit]
+Description=Linnix cognitod (eBPF process observer)
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/linnix/linnix.env
+ExecStart=/usr/local/bin/cognitod --config /etc/linnix/linnix.toml --handler rules:/etc/linnix/rules.toml
+Environment=LINNIX_BPF_PATH=/usr/local/share/linnix/linnix-ai-ebpf-ebpf
+Environment=LINNIX_RSS_TRACE_BPF_PATH=/usr/local/share/linnix/rss_trace.o
+Environment=LINNIX_KERNEL_BTF=/sys/kernel/btf/vmlinux
+Environment=LLM_ENDPOINT=http://127.0.0.1:8090/v1/chat/completions
+Environment=LLM_MODEL=linnix-qwen-v1
+Environment=RUST_LOG=info
+# caps + limits for eBPF/perf
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN
+NoNewPrivileges=true
+LimitMEMLOCK=infinity
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

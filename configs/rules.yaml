@@ -1,0 +1,21 @@
+- name: fork_storm
+  severity: high
+  detector: fork_burst
+  window_seconds: 5
+  threshold: 100
+  cooldown: 60
+
+- name: short_job_flood
+  severity: medium
+  detector: short_job_flood
+  window_seconds: 10
+  threshold: 50
+  max_exec_duration_ms: 1000
+  cooldown: 120
+
+- name: runaway_tree
+  severity: high
+  detector: runaway_tree
+  window_seconds: 10
+  threshold: 30
+  cooldown: 120

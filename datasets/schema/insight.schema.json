@@ -1,0 +1,58 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "properties": {
+    "actions": {
+      "items": {
+        "maxLength": 160,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 3,
+      "type": "array"
+    },
+    "class": {
+      "enum": [
+        "fork_storm",
+        "short_job_flood",
+        "runaway_tree",
+        "cpu_spin",
+        "io_saturation",
+        "oom_risk",
+        "normal"
+      ],
+      "type": "string"
+    },
+    "confidence": {
+      "maximum": 1.0,
+      "minimum": 0.0,
+      "type": "number"
+    },
+    "primary_process": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "maxLength": 120,
+          "minLength": 1,
+          "type": "string"
+        }
+      ]
+    },
+    "why": {
+      "maxLength": 120,
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "class",
+    "confidence",
+    "primary_process",
+    "why",
+    "actions"
+  ],
+  "title": "Insight",
+  "type": "object"
+}

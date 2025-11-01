@@ -1,0 +1,18 @@
+[package]
+name = "linnix-reasoner"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { version = "1.37", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+colored = "3"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+chrono = "0.4"
+futures-util = "0.3"
+eventsource-stream = "0.2"
+linnix-ai-ebpf-common = { path = "../linnix-ai-ebpf/linnix-ai-ebpf-common", features = ["user"] }

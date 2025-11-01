@@ -1,0 +1,47 @@
+[advisories]
+yanked = "warn"
+
+[[advisories.ignore]]
+id = "RUSTSEC-2025-0052"
+reason = "httpmock is used in tests only; async-std is unmaintained but no replacement is available yet."
+
+[licenses]
+# Only these SPDX licenses are allowed; everything else fails.
+allow = [
+  "Apache-2.0",
+  "AGPL-3.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "MIT",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Zlib",                  # <- NEW: for foldhash
+  "CDLA-Permissive-2.0",   # <- NEW: for webpki-roots
+]
+# (Optional) warn if you listed a license above that doesn't actually appear
+unused-allowed-license = "warn"
+
+[[licenses.exceptions]]
+name = "linnix-ai-ebpf-common"
+allow = ["AGPL-3.0"]
+
+[[licenses.exceptions]]
+name = "linnix-reasoner"
+allow = ["AGPL-3.0"]
+
+[[licenses.exceptions]]
+name = "cognitod"
+allow = ["AGPL-3.0"]
+
+[[licenses.exceptions]]
+name = "xtask"
+allow = ["AGPL-3.0"]
+
+[sources]
+unknown-git = "deny"
+allow-git = ["https://github.com/aya-rs/aya"]
+
+[bans]
+multiple-versions = "warn"
+deny = []

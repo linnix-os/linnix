@@ -1,0 +1,24 @@
+[package]
+name = "linnix-ai-ebpf-ebpf"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+aya-ebpf = { git = "https://github.com/aya-rs/aya", package = "aya-ebpf", rev = "fe8e1c48b0f8e14634d55b6abd2207584110546d", default-features = false }
+aya-log-ebpf = { git = "https://github.com/aya-rs/aya", package = "aya-log-ebpf", rev = "fe8e1c48b0f8e14634d55b6abd2207584110546d", default-features = false }
+linnix-ai-ebpf-common = { path = "../linnix-ai-ebpf-common", default-features = false, features = ["bpf"] }
+
+[build-dependencies]
+which = "6.0.3"
+
+[[bin]]
+name = "linnix-ai-ebpf-ebpf"
+path = "src/main.rs"
+
+[[bin]]
+name = "rss_trace"
+path = "src/rss_trace.rs"

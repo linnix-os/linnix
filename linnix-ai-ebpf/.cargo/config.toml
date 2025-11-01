@@ -1,0 +1,8 @@
+[build]
+target = "bpfel-unknown-none"
+
+[unstable]
+build-std = ["core"]
+
+[target.bpfel-unknown-none]
+rustflags = ["-C", "linker=bpf-linker", "-C", "target-feature=+alu32"]
