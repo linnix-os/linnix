@@ -5,6 +5,7 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::env;
+use sysinfo::System;
 
 #[derive(Parser)]
 struct Args {
@@ -72,7 +73,7 @@ struct ProcessAlert {
     reason: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct ProcessEvent {
     pid: u32,
     ppid: u32,
@@ -298,21 +299,145 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let url = "http://localhost:3000/system";
+    let url = format!("{}/system", args.host.trim_end_matches('/'));
 
-    let resp = client.get(url).send().await?;
+    let resp = client.get(&url).send().await?;
     let snapshot: SystemSnapshot = resp.json().await?;
 
-    // Prepare prompt
+    // Get top processes using sysinfo
+    let mut sys = System::new_all();
+    sys.refresh_all();
+
+    // Get top CPU processes
+    let mut processes_by_cpu: Vec<_> = sys
+        .processes()
+        .iter()
+        .filter(|(_, p)| p.cpu_usage() > 0.1)
+        .collect();
+    processes_by_cpu.sort_by(|a, b| {
+        b.1.cpu_usage()
+            .partial_cmp(&a.1.cpu_usage())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let top_cpu = processes_by_cpu.iter().take(10).collect::<Vec<_>>();
+
+    // Get top memory processes
+    let mut processes_by_mem: Vec<_> = sys
+        .processes()
+        .iter()
+        .filter(|(_, p)| p.memory() > 1024 * 1024) // >1MB
+        .collect();
+    processes_by_mem.sort_by(|a, b| b.1.memory().cmp(&a.1.memory()));
+    let top_mem = processes_by_mem.iter().take(10).collect::<Vec<_>>();
+
+    // Build process context string with human-readable names in table format
+    let total_mem = sys.total_memory();
+    let mut process_context = String::new();
+    
+    // Build table for top 5 CPU and memory consumers
+    let top_cpu_limited = top_cpu.iter().take(5).collect::<Vec<_>>();
+    let top_mem_limited = top_mem.iter().take(5).collect::<Vec<_>>();
+    
+    if !top_cpu_limited.is_empty() || !top_mem_limited.is_empty() {
+        process_context.push_str("\n\nTop Resource Consumers:\n");
+        process_context.push_str("┌─────────┬──────────────────────────────────────────────────────────────────┬─────────┬─────────┐\n");
+        process_context.push_str("│   PID   │ Process                                                          │   CPU%  │  MEM%   │\n");
+        process_context.push_str("├─────────┼──────────────────────────────────────────────────────────────────┼─────────┼─────────┤\n");
+        
+        // Add top CPU processes
+        for (pid, proc) in &top_cpu_limited {
+            let mem_pct = if total_mem > 0 {
+                (proc.memory() as f64 / total_mem as f64) * 100.0
+            } else {
+                0.0
+            };
+            let cmd = proc.cmd();
+            let display_name = if !cmd.is_empty() {
+                let cmd_parts: Vec<String> = cmd
+                    .iter()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .collect();
+                let full_cmd = cmd_parts.join(" ");
+                if full_cmd.len() > 66 {
+                    format!("{}...", &full_cmd[..63])
+                } else {
+                    full_cmd
+                }
+            } else {
+                proc.name().to_string_lossy().to_string()
+            };
+            
+            process_context.push_str(&format!(
+                "│ {:>7} │ {:<68} │ {:>6.1}% │ {:>6.1}% │\n",
+                pid,
+                display_name,
+                proc.cpu_usage(),
+                mem_pct
+            ));
+        }
+        
+        // Add separator before memory processes
+        if !top_mem_limited.is_empty() {
+            process_context.push_str("├─────────┼──────────────────────────────────────────────────────────────────┼─────────┼─────────┤\n");
+            
+            // Add top memory processes (avoid duplicates)
+            let cpu_pids: std::collections::HashSet<_> = top_cpu_limited.iter().map(|(pid, _)| *pid).collect();
+            let mut added = 0;
+            for (pid, proc) in &top_mem_limited {
+                if cpu_pids.contains(pid) {
+                    continue; // Skip if already shown in CPU section
+                }
+                if added >= 5 {
+                    break;
+                }
+                
+                let mem_pct = if total_mem > 0 {
+                    (proc.memory() as f64 / total_mem as f64) * 100.0
+                } else {
+                    0.0
+                };
+                let cmd = proc.cmd();
+                let display_name = if !cmd.is_empty() {
+                    let cmd_parts: Vec<String> = cmd
+                        .iter()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .collect();
+                    let full_cmd = cmd_parts.join(" ");
+                    if full_cmd.len() > 66 {
+                        format!("{}...", &full_cmd[..63])
+                    } else {
+                        full_cmd
+                    }
+                } else {
+                    proc.name().to_string_lossy().to_string()
+                };
+                
+                process_context.push_str(&format!(
+                    "│ {:>7} │ {:<68} │ {:>6.1}% │ {:>6.1}% │\n",
+                    pid,
+                    display_name,
+                    proc.cpu_usage(),
+                    mem_pct
+                ));
+                added += 1;
+            }
+        }
+        
+        process_context.push_str("└─────────┴──────────────────────────────────────────────────────────────────┴─────────┴─────────┘\n");
+    }
+
+    // Prepare prompt with process information
     let prompt = if args.short {
         format!(
-            "Given this Linux system snapshot: {snapshot:#?}\n\
-            Summarize the system state in one short sentence."
+            "Given this Linux system snapshot: {snapshot:#?}{process_context}\n\
+            Provide a one-sentence summary mentioning the key processes from the table above."
         )
     } else {
         format!(
-            "Given this Linux system snapshot: {snapshot:#?}\n\
-            Answer in one paragraph: What is happening in the OS? Any anomalies or risks? Suggest a cleanup if needed."
+            "Given this Linux system snapshot: {snapshot:#?}{process_context}\n\
+            IMPORTANT: Start your response by copying the process table exactly as shown above (including the box drawing characters).\n\
+            Then provide analysis: What is happening in the OS? Which specific processes (mention PIDs and full paths from the table) are consuming resources? \
+            Any anomalies or risks? Suggest cleanup if needed."
         )
     };
 
