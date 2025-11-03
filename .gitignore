@@ -56,6 +56,28 @@ env/
 .ipynb_checkpoints/
 notebooks/*.ipynb  # Move training notebooks to enterprise
 
+# Training/Enterprise documentation
+H200_DISTILLATION_SUCCESS_REPORT.md
+docs/colab-gpu-setup.md
+docs/upload-lora-to-runpod.md
+docs/README-PERFORMANCE.md
+scripts/connect_runpod_vscode.sh
+scripts/convert_7b_to_gguf.sh
+scripts/merge_lora_on_runpod.py
+scripts/migrate_to_larger_pod.sh
+scripts/runpod_ssh_setup.sh
+scripts/runpod_upgrade_analysis.sh
+scripts/setup_colab_endpoint.sh
+scripts/test_gguf_performance.sh
+scripts/upload_finetuned_to_runpod.sh
+test_gguf_model.py
+
+# Debug/temporary scripts
+debug_llm_prompt.sh
+show_process_format.sh
+test_process_output.sh
+test_reasoner_integration.sh
+
 # Environment files with secrets
 .env
 .env.local
