@@ -7,6 +7,8 @@
 
 Linnix captures every process fork, exec, and exit with lightweight CPU/memory telemetry using eBPF, then uses AI to detect incidents before they become outages.
 
+> **Note**: This is the open-source version. For custom model training, advanced datasets, and enterprise features, see [Linnix Enterprise](https://linnix.io/enterprise) and [FEATURE_DISTRIBUTION.md](FEATURE_DISTRIBUTION.md).
+
 ## 🎯 Why Linnix?
 
 - **⚡ Zero Overhead**: <1% CPU usage with eBPF probes
@@ -159,6 +161,31 @@ See [API Reference](docs/api-reference.md) for details.
 
 Linnix works with any OpenAI-compatible LLM endpoint:
 
+### 🎁 Demo Model (Included)
+
+We provide a distilled 3B model optimized for CPU inference:
+
+```bash
+# Download demo model (2.1GB)
+wget https://github.com/linnix-os/linnix/releases/download/v0.1.0/linnix-3b-distilled-q5_k_m.gguf
+
+# Serve with llama.cpp
+./serve_distilled_model.sh  # Starts on port 8090
+
+# Or manually:
+llama-server -m linnix-3b-distilled-q5_k_m.gguf \
+  --port 8090 --ctx-size 4096 -t 8
+
+# Test the model
+export LLM_ENDPOINT="http://localhost:8090/v1/chat/completions"
+export LLM_MODEL="linnix-3b-distilled"
+linnix-reasoner --insights
+```
+
+**Performance**: 12.78 tok/s on CPU (no GPU required!)
+
+### Bring Your Own Model
+
 ```bash
 # Option 1: Local model with llama.cpp
 ./llama-server -m qwen2.5-7b-instruct-q5_k_m.gguf --port 8090
@@ -178,6 +205,8 @@ linnix-reasoner --insights
 ```
 
 You can also use commercial APIs (OpenAI, Anthropic, etc.) by pointing to their endpoints.
+
+> **Enterprise**: Get custom-trained models fine-tuned on your specific workloads. See [FEATURE_DISTRIBUTION.md](FEATURE_DISTRIBUTION.md) for details.
 
 ## 🔧 Configuration
 

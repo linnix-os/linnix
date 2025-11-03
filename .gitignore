@@ -1,0 +1,70 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo lock for libraries (keep for binaries)
+# Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+*.log.*
+nohup.out
+
+# Enterprise/Training artifacts (keep in linnix-enterprise repo)
+h200-distilled-model/
+training_data*.json
+training_data*.jsonl
+distillation_*.log
+runpod_migration*/
+*.safetensors
+model-*.safetensors
+
+# Large model files (use Git LFS or external storage)
+*.gguf
+!linnix-3b-distilled-q5_k_m.gguf  # Keep demo model (2.1GB)
+*.pt
+*.pth
+*.bin
+
+# Temporary files
+/tmp/
+*.tmp
+model_server.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+notebooks/*.ipynb  # Move training notebooks to enterprise
+
+# Environment files with secrets
+.env
+.env.local
+.env.*.local
+!.env.distilled  # Keep demo config
+
+# Database
+*.db
+*.sqlite
+
+# Runtime
+cognitod.pid
