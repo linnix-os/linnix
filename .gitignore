@@ -90,3 +90,4 @@ test_reasoner_integration.sh
 
 # Runtime
 cognitod.pid
+notebooks/
