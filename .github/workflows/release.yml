@@ -1,0 +1,230 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-packages:
+    name: Build Packages
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            rust_target: x86_64-unknown-linux-gnu
+          - arch: aarch64
+            rust_target: aarch64-unknown-linux-gnu
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.arch == 'aarch64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-target-${{ matrix.rust_target }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build cognitod
+        run: |
+          cargo build --release --target ${{ matrix.rust_target }} -p cognitod
+
+      - name: Build linnix-cli
+        run: |
+          cargo build --release --target ${{ matrix.rust_target }} -p linnix-cli
+
+      - name: Build linnix-reasoner
+        run: |
+          cargo build --release --target ${{ matrix.rust_target }} -p linnix-reasoner
+
+      - name: Install packaging tools
+        run: |
+          cargo install cargo-deb cargo-generate-rpm
+
+      - name: Build DEB package
+        run: |
+          cargo deb --target ${{ matrix.rust_target }} -p cognitod --no-build
+          
+      - name: Build RPM package
+        run: |
+          cargo generate-rpm --target ${{ matrix.rust_target }} -p cognitod
+
+      - name: Rename packages
+        run: |
+          mkdir -p packages
+          # Get version from tag
+          VERSION=${GITHUB_REF#refs/tags/v}
+          
+          # DEB packages
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            cp target/${{ matrix.rust_target }}/debian/*.deb packages/cognitod_${VERSION}_amd64.deb
+          else
+            cp target/${{ matrix.rust_target }}/debian/*.deb packages/cognitod_${VERSION}_arm64.deb
+          fi
+          
+          # RPM packages
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            cp target/${{ matrix.rust_target }}/generate-rpm/*.rpm packages/cognitod-${VERSION}.x86_64.rpm
+          else
+            cp target/${{ matrix.rust_target }}/generate-rpm/*.rpm packages/cognitod-${VERSION}.aarch64.rpm
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.arch }}
+          path: packages/*
+
+  create-release:
+    name: Create GitHub Release
+    needs: build-packages
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-packages
+
+      - name: Consolidate packages
+        run: |
+          mkdir -p release-packages
+          find all-packages -name "*.deb" -exec cp {} release-packages/ \;
+          find all-packages -name "*.rpm" -exec cp {} release-packages/ \;
+          ls -lh release-packages/
+
+      - name: Create symlinks for latest
+        run: |
+          cd release-packages
+          VERSION=${GITHUB_REF#refs/tags/v}
+          
+          # Create 'latest' symlinks
+          ln -s cognitod_${VERSION}_amd64.deb cognitod_amd64.deb
+          ln -s cognitod_${VERSION}_arm64.deb cognitod_arm64.deb
+          ln -s cognitod-${VERSION}.x86_64.rpm cognitod.x86_64.rpm
+          ln -s cognitod-${VERSION}.aarch64.rpm cognitod.aarch64.rpm
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          cat > release_notes.md << 'EOF'
+          # Linnix ${{ github.ref_name }} - Initial Open Source Release 🎉
+          
+          **Release Date**: $(date +"%B %d, %Y")
+          
+          We're excited to announce the first open-source release of Linnix - eBPF-powered Linux observability with AI incident detection!
+          
+          ## 📥 Quick Install
+          
+          ### Docker (Recommended - < 5 Minutes)
+          
+          \`\`\`bash
+          git clone https://github.com/linnix-os/linnix.git
+          cd linnix
+          ./setup-llm.sh
+          \`\`\`
+          
+          ### Ubuntu/Debian
+          
+          \`\`\`bash
+          wget https://github.com/linnix-os/linnix/releases/latest/download/cognitod_amd64.deb
+          sudo dpkg -i cognitod_amd64.deb
+          sudo systemctl start cognitod
+          \`\`\`
+          
+          ### RHEL/CentOS/Fedora
+          
+          \`\`\`bash
+          wget https://github.com/linnix-os/linnix/releases/latest/download/cognitod.x86_64.rpm
+          sudo rpm -i cognitod.x86_64.rpm
+          sudo systemctl start cognitod
+          \`\`\`
+          
+          ### ARM64 Support
+          
+          \`\`\`bash
+          # Debian/Ubuntu ARM64
+          wget https://github.com/linnix-os/linnix/releases/latest/download/cognitod_arm64.deb
+          
+          # RHEL/CentOS ARM64
+          wget https://github.com/linnix-os/linnix/releases/latest/download/cognitod.aarch64.rpm
+          \`\`\`
+          
+          ## 🤖 AI Model
+          
+          Download the 3B parameter AI model from Hugging Face:
+          
+          \`\`\`bash
+          wget https://huggingface.co/parth21shah/linnix-3b-distilled/resolve/main/linnix-3b-distilled-q5_k_m.gguf -P /usr/share/linnix/models/
+          \`\`\`
+          
+          Or use the automated setup script (included in packages).
+          
+          ## ✨ What's New
+          
+          - eBPF-powered process monitoring (<1% CPU overhead)
+          - AI-powered incident detection (CPU spins, fork storms, OOM risks)
+          - Docker Compose one-command setup
+          - Prometheus metrics integration
+          - PagerDuty/Slack alerting
+          - Self-hostable AI model (Apache 2.0)
+          
+          ## 📦 Assets
+          
+          - \`cognitod_amd64.deb\` / \`cognitod_arm64.deb\` - Debian/Ubuntu packages
+          - \`cognitod.x86_64.rpm\` / \`cognitod.aarch64.rpm\` - RHEL/CentOS packages
+          - AI Model: [Hugging Face Hub](https://huggingface.co/parth21shah/linnix-3b-distilled) (2.1 GB)
+          
+          ## 📖 Documentation
+          
+          - [Quick Start Guide](https://github.com/linnix-os/linnix#quick-start)
+          - [Model Setup](https://github.com/linnix-os/linnix/tree/main/models)
+          - [Configuration](https://github.com/linnix-os/linnix/tree/main/configs)
+          
+          ## 🙏 Credits
+          
+          Built with [Aya](https://github.com/aya-rs/aya), [llama.cpp](https://github.com/ggerganov/llama.cpp), and [Tokio](https://tokio.rs).
+          
+          **Full release notes**: See [CHANGELOG.md](https://github.com/linnix-os/linnix/blob/main/CHANGELOG.md)
+          EOF
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release-packages/*
+          body_path: release_notes.md
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

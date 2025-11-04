@@ -1,0 +1,47 @@
+#!/bin/sh
+set -e
+
+# Create linnix user if it doesn't exist
+if ! getent passwd linnix > /dev/null; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin linnix
+fi
+
+# Create directories
+mkdir -p /var/lib/linnix
+mkdir -p /var/log/linnix
+mkdir -p /usr/share/linnix/models
+
+# Set ownership
+chown -R linnix:linnix /var/lib/linnix
+chown -R linnix:linnix /var/log/linnix
+chown -R linnix:linnix /usr/share/linnix
+
+# Reload systemd
+systemctl daemon-reload
+
+echo ""
+echo "╔════════════════════════════════════════════════════════════════╗"
+echo "║  Linnix cognitod installed successfully!                      ║"
+echo "╠════════════════════════════════════════════════════════════════╣"
+echo "║                                                                ║"
+echo "║  Next steps:                                                   ║"
+echo "║                                                                ║"
+echo "║  1. Download AI model (optional):                              ║"
+echo "║     sudo /usr/share/linnix/setup-llm.sh                        ║"
+echo "║                                                                ║"
+echo "║  2. Start cognitod:                                            ║"
+echo "║     sudo systemctl start cognitod                              ║"
+echo "║     sudo systemctl enable cognitod                             ║"
+echo "║                                                                ║"
+echo "║  3. Verify:                                                    ║"
+echo "║     curl http://localhost:3000/healthz                         ║"
+echo "║                                                                ║"
+echo "║  Configuration: /etc/linnix/linnix.toml                        ║"
+echo "║  Logs: journalctl -u cognitod -f                               ║"
+echo "║                                                                ║"
+echo "╚════════════════════════════════════════════════════════════════╝"
+echo ""
+
+#DEBHELPER#
+
+exit 0

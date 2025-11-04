@@ -49,3 +49,49 @@ reqwest-eventsource = "0.4"
 default = []
 fake-events = ["rand"]
 ilm-test = []
+
+# Metadata for cargo-deb and cargo-generate-rpm
+[package.metadata.deb]
+maintainer = "Linnix Team <support@linnix.io>"
+copyright = "2025, Linnix Team <support@linnix.io>"
+license-file = ["../LICENSE", "4"]
+extended-description = """\
+Linnix is an eBPF-powered Linux observability platform with AI-powered \
+incident detection. It captures process lifecycle events with lightweight \
+CPU/memory telemetry and uses machine learning to detect anomalies like \
+CPU spins, fork storms, and OOM risks."""
+depends = "$auto, systemd"
+section = "admin"
+priority = "optional"
+assets = [
+    ["target/release/cognitod", "usr/bin/", "755"],
+    ["target/release/linnix-cli", "usr/bin/", "755"],
+    ["configs/linnix.toml", "etc/linnix/", "644"],
+    ["configs/rules.yaml", "etc/linnix/", "644"],
+    ["configs/systemd/linnix-cognitod.service", "lib/systemd/system/cognitod.service", "644"],
+    ["setup-llm.sh", "usr/share/linnix/", "755"],
+    ["README.md", "usr/share/doc/cognitod/", "644"],
+]
+conf-files = [
+    "/etc/linnix/linnix.toml",
+    "/etc/linnix/rules.yaml",
+]
+maintainer-scripts = "cognitod/debian/"
+
+[package.metadata.deb.systemd-units]
+enable = false
+start = false
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/cognitod", dest = "/usr/bin/cognitod", mode = "755" },
+    { source = "target/release/linnix-cli", dest = "/usr/bin/linnix-cli", mode = "755" },
+    { source = "configs/linnix.toml", dest = "/etc/linnix/linnix.toml", mode = "644", config = true },
+    { source = "configs/rules.yaml", dest = "/etc/linnix/rules.yaml", mode = "644", config = true },
+    { source = "configs/systemd/linnix-cognitod.service", dest = "/usr/lib/systemd/system/cognitod.service", mode = "644" },
+    { source = "setup-llm.sh", dest = "/usr/share/linnix/setup-llm.sh", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/cognitod/README.md", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+systemd = "*"

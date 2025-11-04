@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "purge" ]; then
+    # Remove data directories on purge
+    rm -rf /var/lib/linnix
+    rm -rf /var/log/linnix
+    
+    # Remove user
+    if getent passwd linnix > /dev/null; then
+        userdel linnix || true
+    fi
+    
+    echo "Linnix data and configuration removed."
+fi
+
+#DEBHELPER#
+
+exit 0
