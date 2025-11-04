@@ -173,12 +173,10 @@ sudo cp target/release/linnix-reasoner /usr/local/bin/
 
 ## 📚 Documentation
 
-- [Getting Started](docs/getting-started.md) - Installation and first steps
-- [Architecture](docs/architecture.md) - System design and components
-- [API Reference](docs/api-reference.md) - HTTP endpoints and SSE
-- [LLM Integration](docs/llm-integration.md) - How to bring your own LLM
-- [Configuration](docs/configuration.md) - Config file reference
-- [Troubleshooting](docs/troubleshooting.md) - Common issues
+- [GitHub Releases](https://github.com/linnix-os/linnix/releases) - Release notes and downloads
+- [Hugging Face Model](https://huggingface.co/parth21shah/linnix-3b-distilled) - AI model documentation
+- [PERFORMANCE.md](PERFORMANCE.md) - Proving the <1% CPU overhead claim
+- [ROADMAP.md](ROADMAP.md) - Future development plans
 
 Full documentation: [docs.linnix.io](https://docs.linnix.io)
 
@@ -194,7 +192,7 @@ Cognitod exposes a REST API on port 3000:
 - `GET /insights` - AI-generated insights
 - `GET /alerts` - Active alerts from rules engine
 
-See [API Reference](docs/api-reference.md) for details.
+For API examples, see [cognitod/examples/](cognitod/examples/).
 
 ## 🤖 LLM Integration
 

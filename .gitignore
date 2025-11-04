@@ -97,6 +97,15 @@ debug_llm_prompt.sh
 show_process_format.sh
 test_process_output.sh
 test_reasoner_integration.sh
+demo_reasoner_with_processes.sh
+explain_ebpf_overhead.sh
+test_ebpf_overhead.sh
+
+# Release notes (use GitHub releases instead)
+RELEASE_NOTES_*.md
+
+# Internal documentation directory (most content is internal/proprietary)
+docs/
 
 # Environment files with secrets
 .env

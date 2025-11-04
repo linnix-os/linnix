@@ -115,6 +115,9 @@ curl -L -o models/tinyllama.gguf https://...
 ## Contributing
 
 Want to improve the models? See:
-- [Model Training Guide](../docs/model-training.md)
-- [Dataset Format](../datasets/README.md)
+## 📚 Resources
+
+- [Hugging Face Model Card](https://huggingface.co/parth21shah/linnix-3b-distilled)
+- [GitHub Releases](https://github.com/linnix-os/linnix/releases)
+- [Main README](../README.md)
 - [Contributing Guidelines](../CONTRIBUTING.md)
