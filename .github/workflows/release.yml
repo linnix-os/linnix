@@ -17,8 +17,13 @@ jobs:
         include:
           - arch: x86_64
             rust_target: x86_64-unknown-linux-gnu
-          - arch: aarch64
-            rust_target: aarch64-unknown-linux-gnu
+            deb_arch: amd64
+            rpm_arch: x86_64
+          # ARM64 support coming in v0.2.0 (requires QEMU/cross setup)
+          # - arch: aarch64
+          #   rust_target: aarch64-unknown-linux-gnu
+          #   deb_arch: arm64
+          #   rpm_arch: aarch64
     
     steps:
       - name: Checkout code
@@ -29,11 +34,10 @@ jobs:
         with:
           targets: ${{ matrix.rust_target }}
 
-      - name: Install cross-compilation tools
-        if: matrix.arch == 'aarch64'
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y pkg-config libssl-dev
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -84,18 +88,10 @@ jobs:
           VERSION=${GITHUB_REF#refs/tags/v}
           
           # DEB packages
-          if [ "${{ matrix.arch }}" = "x86_64" ]; then
-            cp target/${{ matrix.rust_target }}/debian/*.deb packages/cognitod_${VERSION}_amd64.deb
-          else
-            cp target/${{ matrix.rust_target }}/debian/*.deb packages/cognitod_${VERSION}_arm64.deb
-          fi
+          cp target/${{ matrix.rust_target }}/debian/*.deb packages/cognitod_${VERSION}_${{ matrix.deb_arch }}.deb
           
           # RPM packages
-          if [ "${{ matrix.arch }}" = "x86_64" ]; then
-            cp target/${{ matrix.rust_target }}/generate-rpm/*.rpm packages/cognitod-${VERSION}.x86_64.rpm
-          else
-            cp target/${{ matrix.rust_target }}/generate-rpm/*.rpm packages/cognitod-${VERSION}.aarch64.rpm
-          fi
+          cp target/${{ matrix.rust_target }}/generate-rpm/*.rpm packages/cognitod-${VERSION}.${{ matrix.rpm_arch }}.rpm
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -129,11 +125,9 @@ jobs:
           cd release-packages
           VERSION=${GITHUB_REF#refs/tags/v}
           
-          # Create 'latest' symlinks
+          # Create 'latest' symlinks for x86_64 only (ARM64 coming in v0.2.0)
           ln -s cognitod_${VERSION}_amd64.deb cognitod_amd64.deb
-          ln -s cognitod_${VERSION}_arm64.deb cognitod_arm64.deb
           ln -s cognitod-${VERSION}.x86_64.rpm cognitod.x86_64.rpm
-          ln -s cognitod-${VERSION}.aarch64.rpm cognitod.aarch64.rpm
 
       - name: Generate release notes
         id: release_notes
@@ -173,13 +167,7 @@ jobs:
           
           ### ARM64 Support
           
-          \`\`\`bash
-          # Debian/Ubuntu ARM64
-          wget https://github.com/linnix-os/linnix/releases/latest/download/cognitod_arm64.deb
-          
-          # RHEL/CentOS ARM64
-          wget https://github.com/linnix-os/linnix/releases/latest/download/cognitod.aarch64.rpm
-          \`\`\`
+          ARM64 packages coming in v0.2.0 (Q1 2026).
           
           ## 🤖 AI Model
           
