@@ -15,8 +15,7 @@ async fn stats_mode_fetches_status() {
         })
         .await;
 
-    Command::cargo_bin("linnix-cli")
-        .unwrap()
+    Command::new(assert_cmd::cargo::cargo_bin!("linnix-cli"))
         .args(["--url", &server.base_url(), "--stats"])
         .assert()
         .success()

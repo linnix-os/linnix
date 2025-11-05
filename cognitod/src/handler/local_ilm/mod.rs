@@ -206,18 +206,18 @@ async fn run_worker(
                     // Top CPU process (best effort from live snapshot)
                     let mut top_cpu: Option<(String, f32)> = None;
                     for proc in context.live_snapshot() {
-                        if let Some(cpu) = proc.cpu_percent() {
-                            if cpu > 0.0 {
-                                let name = {
-                                    let nul = proc.comm.iter().position(|b| *b == 0).unwrap_or(proc.comm.len());
-                                    let slice = &proc.comm[..nul];
-                                    let s = String::from_utf8_lossy(slice).trim().to_string();
-                                    if s.is_empty() { "unknown".to_string() } else { s }
-                                };
-                                match top_cpu {
-                                    Some((_, best)) if cpu <= best => {}
-                                    _ => top_cpu = Some((name, cpu)),
-                                }
+                        if let Some(cpu) = proc.cpu_percent()
+                            && cpu > 0.0
+                        {
+                            let name = {
+                                let nul = proc.comm.iter().position(|b| *b == 0).unwrap_or(proc.comm.len());
+                                let slice = &proc.comm[..nul];
+                                let s = String::from_utf8_lossy(slice).trim().to_string();
+                                if s.is_empty() { "unknown".to_string() } else { s }
+                            };
+                            match top_cpu {
+                                Some((_, best)) if cpu <= best => {}
+                                _ => top_cpu = Some((name, cpu)),
                             }
                         }
                     }
@@ -291,16 +291,18 @@ async fn run_worker(
                 let start = Instant::now();
                 match client.chat(&messages).await {
                     Ok(mut response) => {
-                        if cfg.tools_enabled {
-                            if let Some((tool_name, pid)) = detect_tool_request(&response) {
-                                let elapsed = start.elapsed();
-                                let timeout = client.timeout();
-                                if elapsed < timeout.saturating_sub(Duration::from_millis(20)) {
-                                    if let Some(tool_context) = execute_tool(tool_name.as_str(), pid) {
-                                        let followup_prompt = build_followup_prompt(
-                                            &telemetry_prompt,
-                                            &snippets_joined,
-                                            tool_name.as_str(),
+                        if cfg.tools_enabled
+                            && let Some((tool_name, pid)) = detect_tool_request(&response)
+                        {
+                            let elapsed = start.elapsed();
+                            let timeout = client.timeout();
+                            if elapsed < timeout.saturating_sub(Duration::from_millis(20))
+                                && let Some(tool_context) = execute_tool(tool_name.as_str(), pid)
+                            {
+                                let followup_prompt = build_followup_prompt(
+                                    &telemetry_prompt,
+                                    &snippets_joined,
+                                    tool_name.as_str(),
                                     pid,
                                     &tool_context,
                                     &response,
@@ -328,8 +330,6 @@ async fn run_worker(
                                             "[local-ilm] follow-up request failed: {err}"
                                         ));
                                         continue;
-                                    }
-                                }
                                     }
                                 }
                             }

@@ -15,8 +15,7 @@ async fn alerts_mode_streams() {
         })
         .await;
 
-    Command::cargo_bin("linnix-cli")
-        .unwrap()
+    Command::new(assert_cmd::cargo::cargo_bin!("linnix-cli"))
         .args(["--url", &server.base_url(), "--alerts", "--no-color"])
         .assert()
         .success()

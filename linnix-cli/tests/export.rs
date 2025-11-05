@@ -25,8 +25,7 @@ async fn export_generates_report() {
         })
         .await;
 
-    Command::cargo_bin("linnix-cli")
-        .unwrap()
+    Command::new(assert_cmd::cargo::cargo_bin!("linnix-cli"))
         .args([
             "--url",
             &server.base_url(),
