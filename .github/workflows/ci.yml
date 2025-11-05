@@ -72,6 +72,6 @@ jobs:
           components: rust-src, llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - name: Install bpf-linker
-        run: cargo install bpf-linker --no-default-features
+        run: cargo install bpf-linker --no-default-features --features llvm-19
       - name: Build eBPF artifacts
         run: cargo xtask build-ebpf
