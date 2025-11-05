@@ -1,5 +1,6 @@
-#![feature(let_chains)]
-#![feature(unsigned_is_multiple_of)]
+// Features stabilized in Rust 1.87.0+ - no longer need feature flags
+// #![feature(let_chains)]
+// #![feature(unsigned_is_multiple_of)]
 
 // Removed redundant import of ContextStore
 use anyhow::Context;
