@@ -1,6 +1,5 @@
-// Features required for nightly-2024-12-10 (used in Docker builds)
-#![feature(let_chains)]
-// Note: unsigned_is_multiple_of not used - we use modulo operator for compatibility
+// let_chains stabilized in Rust 1.82 (Jan 2025)
+// Both local stable and Docker stable support it without feature flags
 
 // Removed redundant import of ContextStore
 use anyhow::Context;

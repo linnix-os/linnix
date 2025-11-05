@@ -2,7 +2,7 @@
 # Produces small production image with eBPF artifacts
 
 # Stage 1: Build eBPF programs (requires nightly Rust)
-FROM rust:1.83-bookworm AS ebpf-builder
+FROM rust:1.90-bookworm AS ebpf-builder
 
 # Install eBPF build dependencies
 RUN apt-get update && apt-get install -y \
@@ -41,7 +41,7 @@ WORKDIR /build/linnix-ai-ebpf/linnix-ai-ebpf-ebpf
 RUN cargo +nightly-2024-12-10 build --release --target=bpfel-unknown-none -Z build-std=core
 
 # Stage 2: Build Rust userspace binaries
-FROM rust:1.83-bookworm AS rust-builder
+FROM rust:1.90-bookworm AS rust-builder
 
 WORKDIR /build
 

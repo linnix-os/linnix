@@ -1,6 +1,5 @@
-// let_chains was stabilized in Rust 1.88.0 (released Jan 2025)
-// Our local stable (1.90) and Docker nightly-2024-12-10 both support it
-// No feature flag needed
+// let_chains stabilized in Rust 1.82 (Jan 2025)
+// Both local stable and Docker stable support it without feature flags
 
 pub mod config;
 pub mod metrics;
