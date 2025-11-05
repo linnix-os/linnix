@@ -6,6 +6,7 @@ members = [
     "linnix-reasoner",
     "linnix-ai-ebpf/linnix-ai-ebpf-common",
     "linnix-ai-ebpf/linnix-ai-ebpf-ebpf",
+    "xtask",
 ]
 
 [workspace.package]
