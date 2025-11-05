@@ -107,6 +107,7 @@ struct ProcessEventSse {
     gid: u32,
     comm: String,
     event_type: u32,
+    event_type_name: String,
     ts_ns: u64,
     seq: u64,
     exit_time_ns: u64,
@@ -127,6 +128,13 @@ struct TopRssEntry {
 }
 
 #[derive(Serialize)]
+struct TopCpuEntry {
+    pid: u32,
+    comm: String,
+    cpu_percent: f32,
+}
+
+#[derive(Serialize)]
 struct StatusResponse {
     version: &'static str,
     uptime_s: u64,
@@ -141,6 +149,7 @@ struct StatusResponse {
     transport: &'static str,
     active_rules: usize,
     top_rss: Vec<TopRssEntry>,
+    top_cpu: Vec<TopCpuEntry>,
     probes: StatusProbeState,
     reasoner: ReasonerStatus,
 }
@@ -200,6 +209,16 @@ async fn status_handler(State(app_state): State<Arc<AppState>>) -> Json<StatusRe
             mem_percent: proc.mem_percent,
         })
         .collect();
+    let top_cpu = app_state
+        .context
+        .top_cpu_processes(5)
+        .into_iter()
+        .map(|proc| TopCpuEntry {
+            pid: proc.pid,
+            comm: proc.comm,
+            cpu_percent: proc.mem_percent,  // mem_percent field holds CPU value
+        })
+        .collect();
     let reasoner = ReasonerStatus {
         configured: reasoner_cfg.enabled,
         endpoint: if reasoner_cfg.endpoint.is_empty() {
@@ -234,6 +253,7 @@ async fn status_handler(State(app_state): State<Arc<AppState>>) -> Json<StatusRe
         transport: app_state.transport,
         active_rules: metrics.active_rules(),
         top_rss,
+        top_cpu,
         probes: StatusProbeState {
             rss_probe: app_state.probe_state.rss_probe.as_str().to_string(),
             btf: app_state.probe_state.btf_available,
@@ -515,6 +535,18 @@ pub async fn stream_events(
         async move {
             match msg {
                 Ok(event) => {
+                    let event_type_name = match event.event_type {
+                        0 => "exec",
+                        1 => "fork",
+                        2 => "exit",
+                        3 => "net",
+                        4 => "fileio",
+                        5 => "syscall",
+                        6 => "blockio",
+                        7 => "pagefault",
+                        _ => "unknown",
+                    }.to_string();
+                    
                     let sse_event = ProcessEventSse {
                         pid: event.pid,
                         ppid: event.ppid,
@@ -524,6 +556,7 @@ pub async fn stream_events(
                             .trim_end_matches('\0')
                             .to_string(),
                         event_type: event.event_type,
+                        event_type_name,
                         ts_ns: event.ts_ns,
                         seq: event.seq,
                         exit_time_ns: event.exit_time_ns,
@@ -722,6 +755,10 @@ pub async fn get_insights(
     let mut alerts = generate_alerts(ctx);
     alerts.truncate(5);  // Only include first 5 alerts to keep prompt short
 
+    // Get top processes by CPU and memory
+    let top_cpu = ctx.top_cpu_processes(5);
+    let top_rss = ctx.top_rss_processes(5);
+
     // Create a concise summary instead of full JSON dump
     let alert_summary = if alerts.is_empty() {
         "No active alerts".to_string()
@@ -732,19 +769,46 @@ pub async fn get_insights(
             .join("; ")
     };
 
+    // Build top CPU summary
+    let top_cpu_summary = if top_cpu.is_empty() {
+        "No CPU data available".to_string()
+    } else {
+        top_cpu.iter()
+            .map(|p| format!("{} ({:.1}%)", p.comm, p.mem_percent)) // mem_percent holds CPU value
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    // Build top memory summary
+    let top_mem_summary = if top_rss.is_empty() {
+        "No memory data available".to_string()
+    } else {
+        top_rss.iter()
+            .map(|p| format!("{} ({:.1}%)", p.comm, p.mem_percent))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
     let prompt = format!(
-        "System: CPU {}%, Mem {}%, Load [{:.2}, {:.2}, {:.2}]. Alerts: {}. Provide a one-paragraph assessment.",
+        "System Health Analysis:\n\
+         CPU: {:.1}% | Memory: {:.1}% | Load Avg: [{:.2}, {:.2}, {:.2}]\n\
+         Top CPU Consumers: {}\n\
+         Top Memory Consumers: {}\n\
+         Alerts: {}\n\n\
+         Analyze the system state and provide: 1) Overall health assessment, 2) Key risks or anomalies, 3) Recommended actions.",
         system.cpu_percent,
         system.mem_percent,
         system.load_avg[0],
         system.load_avg[1],
         system.load_avg[2],
+        top_cpu_summary,
+        top_mem_summary,
         alert_summary
     );
 
     // Call LLM - supports both local models and OpenAI
     // Default to local Linnix model if available
-    let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| "linnix-qwen-v1".to_string());
+    let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| "linnix-3b-distilled".to_string());
     let llm_endpoint = std::env::var("LLM_ENDPOINT")
         .unwrap_or_else(|_| "http://localhost:8090/v1/chat/completions".to_string());
     
@@ -805,11 +869,49 @@ pub async fn get_insights(
         })
         .to_string();
 
-    // Optionally, you could try to extract risks as a list if your prompt/LLM returns them.
-    // For now, just return the summary and an empty risks array.
+    // Build structured response with metrics and top processes
+    let top_cpu_data: Vec<serde_json::Value> = top_cpu.iter()
+        .map(|p| serde_json::json!({
+            "pid": p.pid,
+            "comm": p.comm,
+            "cpu_percent": format!("{:.1}", p.mem_percent) // mem_percent field holds CPU value
+        }))
+        .collect();
+
+    let top_rss_data: Vec<serde_json::Value> = top_rss.iter()
+        .map(|p| serde_json::json!({
+            "pid": p.pid,
+            "comm": p.comm,
+            "mem_percent": format!("{:.1}", p.mem_percent)
+        }))
+        .collect();
+
+    let alerts_data: Vec<serde_json::Value> = alerts.iter()
+        .map(|a| serde_json::json!({
+            "comm": a.comm,
+            "reason": a.reason,
+            "pid": a.pid
+        }))
+        .collect();
+
     let output = serde_json::json!({
         "summary": summary,
-        "risks": []
+        "metrics": {
+            "cpu_percent": format!("{:.1}", system.cpu_percent),
+            "mem_percent": format!("{:.1}", system.mem_percent),
+            "load_avg": [
+                format!("{:.2}", system.load_avg[0]),
+                format!("{:.2}", system.load_avg[1]),
+                format!("{:.2}", system.load_avg[2])
+            ]
+        },
+        "top_cpu": top_cpu_data,
+        "top_memory": top_rss_data,
+        "alerts": alerts_data,
+        "timestamp": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
     });
 
     Ok(Json(output))
@@ -1071,7 +1173,8 @@ pub async fn metrics_handler(State(app_state): State<Arc<AppState>>) -> Json<Met
     sys.refresh_all();
     let pid = Pid::from_u32(std::process::id());
     let (cpu_percent, rss) = if let Some(proc) = sys.process(pid) {
-        (proc.cpu_usage(), proc.memory() * 1024)
+        // proc.memory() returns bytes, convert to KB for the response
+        (proc.cpu_usage(), proc.memory() / 1024)
     } else {
         (0.0, 0)
     };

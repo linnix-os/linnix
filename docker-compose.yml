@@ -1,26 +1,48 @@
+# Linnix - eBPF-powered Linux observability with AI
+# 
+# Quick Start (5 minutes):
+#   ./setup-llm.sh
+#
+# Manual Start:
+#   docker-compose up -d
+#
+# Access:
+#   - Dashboard: http://localhost:8080
+#   - API: http://localhost:3000
+#   - LLM: http://localhost:8090
+
 version: '3.8'
 
 services:
   # Cognitod - eBPF monitoring daemon
   cognitod:
+    image: ghcr.io/linnix-os/cognitod:latest
+    # Fallback: build locally if image pull fails
     build:
       context: .
       dockerfile: Dockerfile
-    image: linnixos/cognitod:latest
     container_name: linnix-cognitod
     privileged: true
     network_mode: host
     pid: host
+    cap_add:
+      - SYS_ADMIN
+      - SYS_RESOURCE
+      - NET_ADMIN
+    security_opt:
+      - apparmor:unconfined
     volumes:
       # Required: Kernel BTF for dynamic offset resolution
       - /sys/kernel/btf:/sys/kernel/btf:ro
+      # Required: tracefs for eBPF tracepoints
+      - /sys/kernel/debug:/sys/kernel/debug:ro
       # Optional: Custom config
       - ./configs:/etc/linnix:ro
       # Optional: Persistent tag cache
       - linnix-data:/var/lib/linnix
     environment:
       - RUST_LOG=info
-      - LINNIX_CONFIG=/etc/linnix/linnix.toml
+      - LINNIX_CONFIG=/etc/linnix/linnix-local.toml
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/healthz"]
@@ -29,26 +51,23 @@ services:
       retries: 3
       start_period: 30s
 
-  # LLM Server - Serves 3B distilled model on CPU
+  # LLM Server - Linnix 3B distilled model for AI insights
   llama-server:
-    build:
-      context: ./docker/llama-cpp
-      dockerfile: Dockerfile
-    image: linnixos/llama-cpp:latest
+    image: ghcr.io/ggerganov/llama.cpp:server
     container_name: linnix-llm
     volumes:
-      - llama-models:/models
+      - ./models:/models:ro
     ports:
       - "8090:8090"
-    command: >
-      -m /models/linnix-3b-distilled-q5_k_m.gguf
-      --host 0.0.0.0
-      --port 8090
-      --ctx-size 4096
-      -t 8
-      --log-disable
-    environment:
-      - LLAMA_ARG_N_GPU_LAYERS=0  # CPU-only mode
+    command: [
+      "--host", "0.0.0.0",
+      "--port", "8090", 
+      "-m", "/models/linnix-3b-distilled-q5_k_m.gguf",
+      "--alias", "linnix-3b-distilled",
+      "--ctx-size", "4096",
+      "-t", "4",
+      "--log-disable"
+    ]
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8090/health"]
@@ -57,29 +76,26 @@ services:
       retries: 3
       start_period: 60s
 
-  # Linnix Reasoner - AI analysis service (optional, can run ad-hoc)
-  # Uncomment to run as persistent service
-  # reasoner:
-  #   image: linnixos/linnix-cli:latest
-  #   container_name: linnix-reasoner
-  #   command: linnix-reasoner --host http://cognitod:3000 --continuous
-  #   environment:
-  #     - LLM_ENDPOINT=http://llama-server:8090/v1/chat/completions
-  #     - LLM_MODEL=linnix-3b-distilled
-  #   depends_on:
-  #     cognitod:
-  #       condition: service_healthy
-  #     llama-server:
-  #       condition: service_healthy
-  #   restart: unless-stopped
+  # Web Dashboard - Simple UI for visualization
+  dashboard:
+    image: nginx:alpine
+    container_name: linnix-dashboard
+    network_mode: host
+    volumes:
+      - ./dashboard:/usr/share/nginx/html:ro
+      - ./dashboard/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - cognitod
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
 volumes:
   # Persistent storage for cognitod state
   linnix-data:
-    driver: local
-  
-  # LLM models (downloaded on first start)
-  llama-models:
     driver: local
 
 networks:

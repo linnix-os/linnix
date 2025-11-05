@@ -212,6 +212,48 @@ impl ContextStore {
         entries
     }
 
+    pub fn top_cpu_processes(&self, limit: usize) -> Vec<ProcessMemorySummary> {
+        use std::cmp::Ordering;
+
+        fn comm_to_string(comm: &[u8; 16]) -> String {
+            let nul = comm.iter().position(|b| *b == 0).unwrap_or(comm.len());
+            let slice = &comm[..nul];
+            let text = String::from_utf8_lossy(slice).trim().to_string();
+            if text.is_empty() {
+                "unknown".to_string()
+            } else {
+                text
+            }
+        }
+
+        let live = self.get_live_map();
+        let mut entries: Vec<ProcessMemorySummary> = live
+            .values()
+            .filter_map(|proc| {
+                let cpu = proc.cpu_percent()?;
+                if cpu <= 0.0 {
+                    return None;
+                }
+                Some(ProcessMemorySummary {
+                    pid: proc.pid,
+                    comm: comm_to_string(&proc.comm),
+                    mem_percent: cpu,  // Reusing struct field for CPU
+                })
+            })
+            .collect();
+        drop(live);
+
+        entries.sort_by(|a, b| {
+            b.mem_percent
+                .partial_cmp(&a.mem_percent)
+                .unwrap_or(Ordering::Equal)
+        });
+        if entries.len() > limit {
+            entries.truncate(limit);
+        }
+        entries
+    }
+
     /// Refresh and store a point‑in‑time `SystemSnapshot`.
     pub fn update_system_snapshot(&self) {
         let mut sys = System::new_all();

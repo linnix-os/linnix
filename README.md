@@ -21,21 +21,39 @@ Linnix captures every process fork, exec, and exit with lightweight CPU/memory t
 - **🔓 Open Source**: Apache-2.0 license, run anywhere
 - **🚀 Production-Ready**: Battle-tested on multi-node clusters
 
-## ⚡ Quick Start (< 5 Minutes)
+## ⚡ 5-Minute Quickstart
 
-### 🐳 **Docker with AI Model (Recommended)**
+### 🎯 **One-Command Setup (New!)**
 
 ```bash
-# Automated setup - downloads model and starts services
+# Complete eBPF monitoring with AI - ready in 5 minutes
 git clone https://github.com/linnix-os/linnix.git && cd linnix
 ./setup-llm.sh
 
-# Verify services are healthy
-curl http://localhost:3000/healthz  # cognitod
-curl http://localhost:8090/health   # LLM server
+# Then open: http://localhost:8080 (Web Dashboard)
+```
 
-# Get AI-powered insights
-curl http://localhost:3000/insights | jq
+**What you get instantly:**
+- ✅ **Web Dashboard**: Real-time visualization at `http://localhost:8080`
+- ✅ **eBPF Monitoring**: Every process event captured with <1% overhead
+- ✅ **AI Insights**: 3B model analyzes incidents every 30 seconds
+- ✅ **Live Metrics**: Process tree, CPU usage, system overview
+- ✅ **Zero Config**: Works out of the box, all data local
+
+### � **What You'll See**
+
+After running `./setup-llm.sh`, you'll have:
+
+1. **Web Dashboard** (`http://localhost:8080`) - Beautiful real-time UI
+2. **API Access** (`http://localhost:3000`) - REST endpoints for integration  
+3. **AI Analysis** - Automatic incident detection with explanations
+4. **Live Events** - Real-time process monitoring stream
+
+**Quick Health Check:**
+```bash
+curl http://localhost:3000/healthz  # eBPF daemon
+curl http://localhost:8090/health   # AI model  
+curl http://localhost:3000/insights | jq  # Get AI insights
 ```
 
 **What it does:**
