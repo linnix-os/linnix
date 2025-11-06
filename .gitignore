@@ -91,12 +91,19 @@ H200_*.md
 DOCKER_BUILD_SUCCESS.md
 DOCKER_QUICKSTART_SUMMARY.md
 HF_MODEL_CARD.md
+DEMOCRATIZATION_PLAN.md
+SIMPLIFICATION_PLAN.md
+
+# Internal prompts and guides
+.github/prompts/
+ultrathink.prompt.md
 
 # Debug/temporary scripts
 debug_llm_prompt.sh
 show_process_format.sh
 test_process_output.sh
 test_reasoner_integration.sh
+docker-push-manual.sh
 
 # Redundant scripts (consolidated into primary versions)
 setup-llm.sh          # Merged into quickstart.sh
