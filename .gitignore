@@ -159,3 +159,6 @@ scripts/demo_sequence.sh
 scripts/quick_demo_gif.sh
 scripts/record_demo_terminalizer.sh
 scripts/record_demo.sh
+scripts/generate_architecture_diagram.py
+scripts/generate_logo.py
+scripts/generate_og_image.py

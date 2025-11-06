@@ -1,0 +1,49 @@
+<?xml version="1.0" ?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1a202c;stop-opacity:1"/>
+      <stop offset="100%" style="stop-color:#2d3748;stop-opacity:1"/>
+    </linearGradient>
+    <linearGradient id="accentGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#48bb78;stop-opacity:1"/>
+      <stop offset="100%" style="stop-color:#38b2ac;stop-opacity:1"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="630" fill="url(#bgGrad)"/>
+  <polygon points="900,20 969.28,60.0 969.28,140.0 900,180 830.72,140.0 830.72,60.0" fill="none" stroke="#48bb78" stroke-width="3" opacity="0.1"/>
+  <polygon points="1050,200 1136.6,250.0 1136.6,350.0 1050,400 963.4,350.0 963.4,250.0" fill="none" stroke="#48bb78" stroke-width="3" opacity="0.08"/>
+  <polygon points="950,440 1001.96,470.0 1001.96,530.0 950,560 898.04,530.0 898.04,470.0" fill="none" stroke="#48bb78" stroke-width="3" opacity="0.12"/>
+  <g>
+    <g>
+      <rect x="60" y="80" width="80" height="80" fill="#2d3748" stroke="#48bb78" stroke-width="3" rx="12"/>
+      <text x="100" y="140" font-family="SF Mono, Monaco, monospace" font-size="48" font-weight="bold" fill="#48bb78" text-anchor="middle">L</text>
+    </g>
+    <text x="60" y="230" font-family="SF Mono, Monaco, monospace" font-size="64" font-weight="bold" fill="#e2e8f0">Linnix</text>
+    <text x="60" y="290" font-family="SF Mono, Monaco, monospace" font-size="32" fill="url(#accentGrad)" font-weight="600">eBPF-Powered Linux Observability</text>
+    <text x="60" y="360" font-family="SF Mono, Monaco, monospace" font-size="24" fill="#cbd5e0">⚡ &lt;1% CPU overhead with eBPF probes</text>
+    <text x="60" y="410" font-family="SF Mono, Monaco, monospace" font-size="24" fill="#cbd5e0">🧠 AI-powered incident detection</text>
+    <text x="60" y="460" font-family="SF Mono, Monaco, monospace" font-size="24" fill="#cbd5e0">💰 60-80% cheaper than Datadog</text>
+    <text x="60" y="510" font-family="SF Mono, Monaco, monospace" font-size="24" fill="#cbd5e0">🔓 Open source • Apache 2.0</text>
+  </g>
+  <g>
+    <rect x="0" y="570" width="1200" height="60" fill="#1a202c" opacity="0.9"/>
+    <text x="60" y="612" font-family="SF Mono, Monaco, monospace" font-size="28" fill="#48bb78" font-weight="bold">github.com/linnix-os/linnix</text>
+  </g>
+  <g>
+    <rect x="650" y="200" width="480" height="300" fill="#1a1a1a" stroke="#4a5568" stroke-width="2" rx="8"/>
+    <rect x="650" y="200" width="480" height="30" fill="#2d3748" rx="8"/>
+    <circle cx="670" cy="215" r="6" fill="#ff5f56"/>
+    <circle cx="690" cy="215" r="6" fill="#ffbd2e"/>
+    <circle cx="710" cy="215" r="6" fill="#27c93f"/>
+    <text x="670" y="260" font-family="SF Mono, Monaco, monospace" font-size="16" fill="#cbd5e0">$ curl http://localhost:3000/insights</text>
+    <text x="670" y="290" font-family="SF Mono, Monaco, monospace" font-size="16" fill="#48bb78">{</text>
+    <text x="670" y="315" font-family="SF Mono, Monaco, monospace" font-size="16" fill="#48bb78">  &quot;class&quot;: &quot;fork_storm&quot;,</text>
+    <text x="670" y="340" font-family="SF Mono, Monaco, monospace" font-size="16" fill="#48bb78">  &quot;confidence&quot;: 0.89,</text>
+    <text x="670" y="365" font-family="SF Mono, Monaco, monospace" font-size="16" fill="#fbbf24">  &quot;why&quot;: &quot;Detected 127 forks/sec&quot;,</text>
+    <text x="670" y="390" font-family="SF Mono, Monaco, monospace" font-size="16" fill="#48bb78">  &quot;actions&quot;: [</text>
+    <text x="670" y="415" font-family="SF Mono, Monaco, monospace" font-size="16" fill="#f687b3">    &quot;Add rate limit to cron&quot;</text>
+    <text x="670" y="440" font-family="SF Mono, Monaco, monospace" font-size="16" fill="#48bb78">  ]</text>
+    <text x="670" y="465" font-family="SF Mono, Monaco, monospace" font-size="16" fill="#48bb78">}</text>
+  </g>
+</svg>

@@ -1,0 +1,99 @@
+<?xml version="1.0" ?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="600" viewBox="0 0 1000 600">
+  <defs>
+    <style>
+        .box { fill: #2d3748; stroke: #4a5568; stroke-width: 2; }
+        .kernel-box { fill: #1a202c; stroke: #2d3748; stroke-width: 3; }
+        .text { fill: #e2e8f0; font-family: 'SF Mono', 'Monaco', 'Courier New', monospace; font-size: 16px; }
+        .title { fill: #48bb78; font-family: 'SF Mono', 'Monaco', 'Courier New', monospace; font-size: 18px; font-weight: bold; }
+        .subtitle { fill: #a0aec0; font-family: 'SF Mono', 'Monaco', 'Courier New', monospace; font-size: 12px; }
+        .arrow { fill: none; stroke: #48bb78; stroke-width: 3; marker-end: url(#arrowhead); }
+        .label { fill: #48bb78; font-family: 'SF Mono', 'Monaco', 'Courier New', monospace; font-size: 14px; }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <polygon points="0 0, 10 3, 0 6" fill="#48bb78"/>
+    </marker>
+  </defs>
+  <rect width="1000" height="600" fill="#1a202c"/>
+  <text x="500" y="40" class="title" text-anchor="middle" font-size="28">Linnix Architecture</text>
+  <text x="500" y="65" class="subtitle" text-anchor="middle">eBPF-powered observability with AI incident detection</text>
+  <g>
+    <rect x="50" y="120" width="900" height="100" class="kernel-box" rx="8"/>
+    <text x="500" y="150" class="title" text-anchor="middle">Kernel Space (eBPF)</text>
+    <g>
+      <rect x="150" y="170" width="100" height="35" class="box" rx="4"/>
+      <text x="200" y="193" class="text" text-anchor="middle" font-size="12">fork()</text>
+    </g>
+    <g>
+      <rect x="300" y="170" width="100" height="35" class="box" rx="4"/>
+      <text x="350" y="193" class="text" text-anchor="middle" font-size="12">exec()</text>
+    </g>
+    <g>
+      <rect x="450" y="170" width="100" height="35" class="box" rx="4"/>
+      <text x="500" y="193" class="text" text-anchor="middle" font-size="12">exit()</text>
+    </g>
+    <g>
+      <rect x="650" y="170" width="100" height="35" class="box" rx="4"/>
+      <text x="700" y="193" class="text" text-anchor="middle" font-size="12">CPU sample</text>
+    </g>
+    <g>
+      <rect x="800" y="170" width="100" height="35" class="box" rx="4"/>
+      <text x="850" y="193" class="text" text-anchor="middle" font-size="12">RSS track</text>
+    </g>
+  </g>
+  <line x1="500" y1="220" x2="500" y2="260" class="arrow"/>
+  <text x="510" y="245" class="label" font-size="12">perf buffers</text>
+  <g>
+    <rect x="200" y="270" width="600" height="120" class="box" rx="8"/>
+    <text x="500" y="300" class="title" text-anchor="middle">cognitod (User Space)</text>
+    <g>
+      <rect x="250" y="320" width="90" height="50" class="box" rx="4"/>
+      <text x="295" y="343" class="text" text-anchor="middle" font-size="11">Event</text>
+      <text x="295" y="357" class="text" text-anchor="middle" font-size="11">Processor</text>
+    </g>
+    <g>
+      <rect x="380" y="320" width="90" height="50" class="box" rx="4"/>
+      <text x="425" y="343" class="text" text-anchor="middle" font-size="11">Process</text>
+      <text x="425" y="357" class="text" text-anchor="middle" font-size="11">Tree</text>
+    </g>
+    <g>
+      <rect x="510" y="320" width="90" height="50" class="box" rx="4"/>
+      <text x="555" y="343" class="text" text-anchor="middle" font-size="11">Rules</text>
+      <text x="555" y="357" class="text" text-anchor="middle" font-size="11">Engine</text>
+    </g>
+    <g>
+      <rect x="640" y="320" width="90" height="50" class="box" rx="4"/>
+      <text x="685" y="343" class="text" text-anchor="middle" font-size="11">HTTP/SSE</text>
+      <text x="685" y="357" class="text" text-anchor="middle" font-size="11">API</text>
+    </g>
+  </g>
+  <line x1="300" y1="390" x2="300" y2="430" class="arrow"/>
+  <text x="310" y="415" class="label" font-size="11">Stream</text>
+  <line x1="500" y1="390" x2="500" y2="430" class="arrow"/>
+  <text x="510" y="415" class="label" font-size="11">Analyze</text>
+  <line x1="700" y1="390" x2="700" y2="430" class="arrow"/>
+  <text x="710" y="415" class="label" font-size="11">Monitor</text>
+  <g>
+    <rect x="230" y="440" width="120" height="60" class="box" rx="6" fill="#2c5282"/>
+    <text x="290" y="470" class="text" text-anchor="middle" font-size="13">CLI</text>
+    <text x="290" y="486" class="text" text-anchor="middle" font-size="13">Stream</text>
+  </g>
+  <g>
+    <rect x="450" y="440" width="120" height="60" class="box" rx="6" fill="#2c5282"/>
+    <text x="510" y="470" class="text" text-anchor="middle" font-size="13">AI Reasoner</text>
+    <text x="510" y="486" class="text" text-anchor="middle" font-size="13">(LLM)</text>
+  </g>
+  <g>
+    <rect x="670" y="440" width="120" height="60" class="box" rx="6" fill="#2c5282"/>
+    <text x="730" y="470" class="text" text-anchor="middle" font-size="13">Prometheus</text>
+    <text x="730" y="486" class="text" text-anchor="middle" font-size="13">Grafana</text>
+  </g>
+  <text x="150" y="560" class="subtitle" text-anchor="middle" font-size="11">&lt;1% CPU overhead</text>
+  <text x="70" y="560" fill="#48bb78" font-size="14">✓</text>
+  <text x="350" y="560" class="subtitle" text-anchor="middle" font-size="11">0 instrumentation</text>
+  <text x="270" y="560" fill="#48bb78" font-size="14">✓</text>
+  <text x="550" y="560" class="subtitle" text-anchor="middle" font-size="11">AI-powered insights</text>
+  <text x="470" y="560" fill="#48bb78" font-size="14">✓</text>
+  <text x="750" y="560" class="subtitle" text-anchor="middle" font-size="11">Apache 2.0 license</text>
+  <text x="670" y="560" fill="#48bb78" font-size="14">✓</text>
+</svg>
