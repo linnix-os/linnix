@@ -432,11 +432,11 @@ fn try_handle_exit(ctx: TracePointContext) -> u32 {
     }
 
     if pid != 0 {
-        let stats = unsafe { &TASK_STATS };
-        let _ = stats.remove(&pid);
+        let stats = unsafe { &raw const TASK_STATS };
+        let _ = unsafe { (*stats).remove(&pid) };
 
-        let faults = unsafe { &PAGE_FAULT_THROTTLE };
-        let _ = faults.remove(&pid);
+        let faults = unsafe { &raw const PAGE_FAULT_THROTTLE };
+        let _ = unsafe { (*faults).remove(&pid) };
     }
 
     0
