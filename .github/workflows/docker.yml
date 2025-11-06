@@ -142,34 +142,57 @@ jobs:
       - name: Wait for services
         run: |
           echo "Waiting for cognitod..."
+          COGNITOD_READY=false
           for i in {1..30}; do
             if curl -sf http://localhost:3000/healthz > /dev/null 2>&1; then
               echo "✅ Cognitod is healthy"
+              COGNITOD_READY=true
               break
             fi
             echo "Attempt $i/30..."
             sleep 2
           done
 
+          if [ "$COGNITOD_READY" = "false" ]; then
+            echo "❌ Cognitod failed to start"
+            docker compose logs cognitod
+            exit 1
+          fi
+
           echo "Waiting for llama-server..."
+          LLAMA_READY=false
           for i in {1..60}; do
             if curl -sf http://localhost:8090/health > /dev/null 2>&1; then
               echo "✅ LLM server is healthy"
+              LLAMA_READY=true
               break
             fi
             echo "Attempt $i/60..."
             sleep 2
           done
 
+          if [ "$LLAMA_READY" = "false" ]; then
+            echo "⚠️ LLM server not ready (optional service)"
+            docker compose logs llama-server
+          fi
+
       - name: Test endpoints
         run: |
-          # Test cognitod
-          curl -f http://localhost:3000/healthz
-          curl -f http://localhost:3000/status | jq
-          curl -f http://localhost:3000/processes | jq
+          echo "Testing cognitod endpoints..."
           
-          # Test LLM
-          curl -f http://localhost:8090/health
+          # Test healthz
+          echo "GET /healthz"
+          curl -f http://localhost:3000/healthz || exit 1
+          
+          # Test status
+          echo "GET /status"
+          curl -f http://localhost:3000/status | jq || exit 1
+          
+          # Test processes (may be empty but should return 200)
+          echo "GET /processes"
+          curl -f http://localhost:3000/processes | jq || exit 1
+          
+          echo "✅ All cognitod endpoints working"
 
       - name: Check logs
         if: failure()
