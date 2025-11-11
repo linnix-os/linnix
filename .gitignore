@@ -99,6 +99,9 @@ SIMPLIFICATION_PLAN.md
 .github/prompts/
 ultrathink.prompt.md
 
+# Claude Code Skills (personal development workflows)
+.claude/
+
 # Debug/temporary scripts
 debug_llm_prompt.sh
 show_process_format.sh
@@ -189,3 +192,14 @@ social_posts/PRE_POST_CHECKLIST.md
 social_posts/READY_TO_POST.md
 social_posts/reddit_posts.md
 social_posts/YOUTUBE_UPLOAD_GUIDE.md
+tools/tectonic
+tools/pandoc-3.5/bin/pandoc
+tools/pandoc-3.5/bin/pandoc-lua
+tools/pandoc-3.5/bin/pandoc-server
+tools/pandoc-3.5/share/man/man1/pandoc-lua.1.gz
+tools/pandoc-3.5/share/man/man1/pandoc-server.1.gz
+tools/pandoc-3.5/share/man/man1/pandoc.1.gz
+social_posts/PRE_LAUNCH_VERIFICATION_COMPLETE.md
+social_posts/r_devops_post.md
+social_posts/r_linux_post_improved.md
+social_posts/SHOW_HN_LAUNCH_PLAN.md
