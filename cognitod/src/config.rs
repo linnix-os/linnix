@@ -1,9 +1,40 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/linnix/linnix.toml";
 const ENV_CONFIG_PATH: &str = "LINNIX_CONFIG";
+
+/// Notification configuration for external alerting systems
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NotificationConfig {
+    /// Apprise notification configuration (supports 100+ services)
+    pub apprise: Option<AppriseConfig>,
+}
+
+/// Apprise notification configuration
+///
+/// Apprise provides a unified interface to send notifications to 100+ services
+/// including Slack, Discord, Teams, Telegram, SMS providers, and email.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppriseConfig {
+    /// List of Apprise service URLs
+    ///
+    /// Examples:
+    /// - Slack: "slack://xoxb-token/C0123456789"
+    /// - Discord: "discord://webhook_id/webhook_token"
+    /// - Email: "mailto://user:pass@smtp.gmail.com"
+    ///
+    /// See https://github.com/caronc/apprise for full list of supported services
+    pub urls: Vec<String>,
+
+    /// Minimum severity level to notify (optional)
+    ///
+    /// Valid values: "info", "low", "medium", "high"
+    /// Default: "info" (notify all alerts)
+    #[serde(default)]
+    pub min_severity: Option<String>,
+}
 
 #[derive(Debug, Deserialize, Clone, Default)]
 #[allow(dead_code)]
@@ -23,6 +54,8 @@ pub struct Config {
     pub reasoner: ReasonerConfig,
     #[serde(default)]
     pub probes: ProbesConfig,
+    #[serde(default)]
+    pub notifications: Option<NotificationConfig>,
 }
 
 impl Config {

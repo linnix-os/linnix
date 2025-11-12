@@ -27,3 +27,17 @@ timeout_ms = 30000
 [prometheus]
 # Prometheus metrics endpoint
 enabled = true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Notifications via Apprise (optional)
+# ─────────────────────────────────────────────────────────────────────────────
+# Apprise supports 100+ services: Slack, Discord, Teams, Telegram, SMS, Email, etc.
+# See https://github.com/caronc/apprise#supported-notifications for URL formats
+#
+# [notifications.apprise]
+# urls = [
+#     "slack://xoxb-YOUR-BOT-TOKEN/C0123456789",
+#     "discord://WEBHOOK_ID/WEBHOOK_TOKEN",
+#     "mailto://user:pass@smtp.gmail.com"
+# ]
+# min_severity = "medium"  # Options: info, low, medium, high (default: info)
