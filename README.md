@@ -259,7 +259,7 @@ sudo cp target/release/linnix-reasoner /usr/local/bin/
 
 Contributions welcome! The code is mostly in Rust using the Aya framework for eBPF.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+Have ideas or questions? Check out [GitHub Discussions](https://github.com/linnix-os/linnix/discussions) or see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 
 ## License
