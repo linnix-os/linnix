@@ -1,12 +1,5 @@
 # Demo rules optimized for scenario detection
-# Lower thresholds to trigger faster in demo environment
-
-- name: memory_leak_demo
-  detector: memory_growth
-  threshold: 50  # MB growth
-  duration: 10   # seconds
-  severity: high
-  cooldown: 30
+# Using actual supported detectors
 
 - name: fork_storm_demo
   detector: forks_per_sec
@@ -22,16 +15,16 @@
   severity: medium
   cooldown: 30
 
-- name: fd_leak_demo
-  detector: fd_growth
-  threshold: 100  # open FDs
-  duration: 10    # seconds
+- name: memory_leak_demo
+  detector: subtree_rss_mb
+  threshold: 100  # MB total RSS
+  duration: 5     # seconds
   severity: high
   cooldown: 30
 
 - name: cpu_spike_demo
-  detector: cpu_percent
-  threshold: 80
-  duration: 5
+  detector: subtree_cpu_pct
+  threshold: 50  # percent CPU
+  duration: 5    # seconds
   severity: medium
   cooldown: 30

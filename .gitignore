@@ -173,6 +173,7 @@ scripts/record_demo.sh
 scripts/generate_architecture_diagram.py
 scripts/generate_logo.py
 scripts/generate_og_image.py
+RECORDING_INSTRUCTIONS.md
 
 # YouTube video creation files
 videos/
@@ -247,3 +248,4 @@ youtube/quickstart-video/youtube/quickstart-video/EASIEST_PATH.md
 youtube/quickstart-video/youtube/quickstart-video/output/VIDEO_ASSEMBLY.md
 youtube/quickstart-video/youtube/quickstart-video/output/voiceover-script.txt
 youtube/quickstart-video/youtube/quickstart-video/output/audio/voiceover.mp3
+scenarios/demo/record-demo.sh
