@@ -82,14 +82,17 @@ This downloads a small model (linnix-3b, distilled for CPU inference) and starts
    └─────────┘    └──────────┘   └─────────────┘
 ```
 
-## What it catches
+## What It's Designed to Catch
 
-- Memory leaks 
-- Fork storms (cron job gone wrong)
-- File descriptor exhaustion (before the service crashed)
-- CPU thrashing (process stuck in a loop)
+The eBPF probes monitor:
+- Fork storms (rapid process spawning)
+- Memory allocation patterns (potential leaks)
+- File descriptor usage (exhaustion risk)
+- CPU thrashing (processes stuck in loops)
 
-Not magic - just pattern matching on eBPF events. The AI part helps explain what's happening in plain language.
+The rules engine can alert on these patterns. The AI reasoner (experimental) attempts to explain what's happening in natural language.
+
+**Current testing status:** Built and tested in local Docker environments. Rules engine works for basic pattern detection. AI reasoning is experimental and depends heavily on model quality. Not yet tested at scale or in production environments.
 
 ## Requirements
 
