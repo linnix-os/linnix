@@ -17,7 +17,7 @@ use sysinfo::System;
 use tokio::sync::{Mutex, broadcast};
 use tokio::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, PartialOrd)]
 pub enum Severity {
     Info,
     Low,

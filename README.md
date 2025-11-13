@@ -127,21 +127,36 @@ All tests passing as of last commit. CI runs these on every push.
 
 ## Demo Scenarios
 
-Want to see Linnix catch real issues? Run the demo scenarios that trigger actual failures:
+**Watch it in action:**
+
+[![asciicast](https://asciinema.org/a/iiVMjlLzJTrtjBgvCavDnTOOc.svg)](https://asciinema.org/a/iiVMjlLzJTrtjBgvCavDnTOOc)
+
+Linnix catching a fork bomb in real-time - **4 different alert types** from a single scenario.
+
+---
+
+Want to run it yourself? Try the demo scenarios that trigger actual failures:
 
 ```bash
-# Run all 3 scenarios: memory leak, fork bomb, FD exhaustion
-docker-compose -f docker-compose-demo.yml --profile demo up
+# Quick demo: Fork bomb detection
+./scenarios/demo/demo-script.sh
+
+# Or run individual scenarios:
+docker run --rm linnix-demo-fork-bomb
+docker run --rm --memory=200m linnix-demo-memory-leak
+docker run --rm --ulimit nofile=256:256 linnix-demo-fd-exhaustion
 ```
 
-**What you'll see:**
-- Memory leak detected 15 seconds before OOM killer
-- Fork storm caught at 48 forks/second
-- File descriptor exhaustion warned at 120/256 FDs
+**What Linnix catches:**
+- Fork storm (50+ forks/second)
+- Fork burst (60+ forks in 5 seconds)
+- Runaway process trees
+- Memory leaks before OOM
+- File descriptor exhaustion
 
-Each scenario runs in an isolated container and triggers real resource exhaustion. Linnix alerts before they cause failures.
+Each scenario runs in an isolated container and triggers real resource exhaustion. Linnix alerts **before they cause failures**.
 
-See [scenarios/README.md](scenarios/README.md) for details on each scenario and how to run them individually.
+See [scenarios/README.md](scenarios/README.md) and [DEMO_RESULTS.md](DEMO_RESULTS.md) for full details.
 
 ## Requirements
 
@@ -244,7 +259,7 @@ sudo cp target/release/linnix-reasoner /usr/local/bin/
 
 Contributions welcome! The code is mostly in Rust using the Aya framework for eBPF.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+Have ideas or questions? Check out [GitHub Discussions](https://github.com/linnix-os/linnix/discussions) or see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 
 ## License
