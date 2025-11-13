@@ -1,7 +1,7 @@
 # Linnix
 
 [![CI](https://github.com/linnix-os/linnix/actions/workflows/docker.yml/badge.svg)](https://github.com/linnix-os/linnix/actions/workflows/docker.yml)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-AGPL%203.0-blue.svg)](LICENSE)
 [![Docker Pulls](https://img.shields.io/docker/pulls/linnixos/cognitod?style=flat-square)](https://github.com/linnix-os/linnix/pkgs/container/cognitod)
 [![GitHub Stars](https://img.shields.io/github/stars/linnix-os/linnix?style=social)](https://github.com/linnix-os/linnix)
 
@@ -264,7 +264,7 @@ Have ideas or questions? Check out [GitHub Discussions](https://github.com/linni
 
 ## License
 
-Apache License 2.0 - see [LICENSE](LICENSE)
+GNU Affero General Public License v3.0 - see [LICENSE](LICENSE)
 
 eBPF programs are dual-licensed under GPL-2.0 OR MIT (eBPF requirement).
 

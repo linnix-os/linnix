@@ -9,7 +9,7 @@ reason = "httpmock is used in tests only; async-std is unmaintained but no repla
 # Only these SPDX licenses are allowed; everything else fails.
 allow = [
   "Apache-2.0",
-  "AGPL-3.0",
+  "AGPL-3.0-or-later",
   "BSD-2-Clause",
   "BSD-3-Clause",
   "ISC",
@@ -24,19 +24,19 @@ unused-allowed-license = "warn"
 
 [[licenses.exceptions]]
 name = "linnix-ai-ebpf-common"
-allow = ["AGPL-3.0"]
+allow = ["AGPL-3.0-or-later"]
 
 [[licenses.exceptions]]
 name = "linnix-reasoner"
-allow = ["AGPL-3.0"]
+allow = ["AGPL-3.0-or-later"]
 
 [[licenses.exceptions]]
 name = "cognitod"
-allow = ["AGPL-3.0"]
+allow = ["AGPL-3.0-or-later"]
 
 [[licenses.exceptions]]
 name = "xtask"
-allow = ["AGPL-3.0"]
+allow = ["AGPL-3.0-or-later"]
 
 [sources]
 unknown-git = "deny"

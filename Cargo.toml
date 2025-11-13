@@ -11,7 +11,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-license = "Apache-2.0"
+license = "AGPL-3.0-or-later"
 repository = "https://github.com/linnix-os/linnix"
 readme = "README.md"
 
