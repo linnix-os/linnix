@@ -15,11 +15,13 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{Value, json, to_string};
+use std::collections::VecDeque;
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
+use tokio::sync::RwLock;
 use tokio_stream::wrappers::{BroadcastStream, IntervalStream, errors::BroadcastStreamRecvError};
 
 use crate::ProcessEvent;
@@ -140,6 +142,92 @@ struct TopCpuEntry {
     pid: u32,
     comm: String,
     cpu_percent: f32,
+}
+
+// Alert timeline structures
+#[derive(Debug, Clone, Serialize)]
+struct AlertRecord {
+    id: String,
+    timestamp: u64,
+    severity: String,
+    rule: String,
+    message: String,
+    host: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AlertDetail {
+    id: String,
+    timestamp: u64,
+    severity: String,
+    rule: String,
+    message: String,
+    host: String,
+    explanation: String,
+    remediation: String,
+}
+
+// System metrics structure
+#[derive(Serialize)]
+struct SystemMetrics {
+    cpu_total_pct: f32,
+    memory_total_mb: u64,
+    memory_used_mb: u64,
+    processes_total: usize,
+    timestamp: u64,
+}
+
+// Alert history storage (ring buffer)
+pub struct AlertHistory {
+    records: RwLock<VecDeque<AlertRecord>>,
+    next_id: AtomicU64,
+    max_size: usize,
+}
+
+impl AlertHistory {
+    pub fn new(max_size: usize) -> Self {
+        Self {
+            records: RwLock::new(VecDeque::with_capacity(max_size)),
+            next_id: AtomicU64::new(1),
+            max_size,
+        }
+    }
+
+    pub async fn add_alert(&self, alert: Alert) {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let record = AlertRecord {
+            id: format!("alert-{}", id),
+            timestamp,
+            severity: alert.severity.as_str().to_string(),
+            rule: alert.rule,
+            message: alert.message,
+            host: alert.host,
+        };
+
+        let mut records = self.records.write().await;
+        if records.len() >= self.max_size {
+            records.pop_front();
+        }
+        records.push_back(record);
+    }
+
+    pub async fn get_all(&self) -> Vec<AlertRecord> {
+        self.records.read().await.iter().cloned().collect()
+    }
+
+    pub async fn get_by_id(&self, id: &str) -> Option<AlertRecord> {
+        self.records
+            .read()
+            .await
+            .iter()
+            .find(|r| r.id == id)
+            .cloned()
+    }
 }
 
 #[derive(Serialize)]
@@ -788,6 +876,120 @@ pub async fn system_snapshot(State(app_state): State<Arc<AppState>>) -> Json<Sys
     Json(snapshot)
 }
 
+// Query parameters for timeline endpoint
+#[derive(Deserialize)]
+struct TimelineQuery {
+    #[serde(default)]
+    start: Option<u64>,
+    #[serde(default)]
+    end: Option<u64>,
+    #[serde(default)]
+    severity: Option<String>,
+}
+
+// GET /api/timeline - Get alert history
+async fn get_timeline(
+    State(app_state): State<Arc<AppState>>,
+    Query(query): Query<TimelineQuery>,
+) -> Json<Vec<AlertRecord>> {
+    let mut alerts = app_state.alert_history.get_all().await;
+
+    // Filter by time range
+    if let Some(start) = query.start {
+        alerts.retain(|a| a.timestamp >= start);
+    }
+    if let Some(end) = query.end {
+        alerts.retain(|a| a.timestamp <= end);
+    }
+
+    // Filter by severity
+    if let Some(severity) = query.severity {
+        let severity_lower = severity.to_lowercase();
+        alerts.retain(|a| a.severity.to_lowercase() == severity_lower);
+    }
+
+    // Sort by timestamp descending (newest first)
+    alerts.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+    // Limit to 1000 results
+    alerts.truncate(1000);
+
+    Json(alerts)
+}
+
+// GET /api/alerts/:id - Get alert details by ID
+async fn get_alert_by_id(
+    State(app_state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Some(alert) = app_state.alert_history.get_by_id(&id).await {
+        // Create detailed response with additional fields
+        let detail = AlertDetail {
+            id: alert.id.clone(),
+            timestamp: alert.timestamp,
+            severity: alert.severity.clone(),
+            rule: alert.rule.clone(),
+            message: alert.message.clone(),
+            host: alert.host.clone(),
+            explanation: format!("Alert triggered by rule: {}", alert.rule),
+            remediation: generate_remediation(&alert.rule, &alert.message),
+        };
+        (StatusCode::OK, Json(detail)).into_response()
+    } else {
+        (StatusCode::NOT_FOUND, Json(json!({"error": "Alert not found"}))).into_response()
+    }
+}
+
+// Helper function to generate remediation suggestions
+fn generate_remediation(rule: &str, message: &str) -> String {
+    match rule {
+        r if r.contains("fork") => {
+            "Identify and terminate the process causing excessive forks. Use 'kill -9 <pid>' or set process limits with ulimit.".to_string()
+        }
+        r if r.contains("cpu") => {
+            "Investigate high CPU usage. Check process with 'top' or 'htop', consider restarting or throttling the process.".to_string()
+        }
+        r if r.contains("memory") || r.contains("rss") => {
+            "Monitor memory usage. Check for memory leaks, restart the process, or increase available memory.".to_string()
+        }
+        _ => {
+            format!("Review alert message: {}", message)
+        }
+    }
+}
+
+// GET /api/metrics/system - Get current system metrics
+async fn get_system_metrics(State(app_state): State<Arc<AppState>>) -> Json<SystemMetrics> {
+    let ctx = &app_state.context;
+    let snapshot = ctx.get_system_snapshot();
+
+    // Get CPU from system snapshot
+    let cpu_total_pct = snapshot.cpu_percent;
+
+    // Use sysinfo to get detailed system metrics
+    let mut sys = System::new_all();
+    sys.refresh_all();
+
+    let memory_total_mb = sys.total_memory() / 1024 / 1024;
+    let memory_used_mb = sys.used_memory() / 1024 / 1024;
+
+    // Get process count from context
+    let processes_total = ctx.live_snapshot().len();
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    Json(SystemMetrics {
+        cpu_total_pct,
+        memory_total_mb,
+        memory_used_mb,
+        processes_total,
+        timestamp,
+    })
+}
+
 fn generate_alerts(ctx: &ContextStore) -> Vec<ProcessAlert> {
     let processes = ctx.live_snapshot();
     let mut alerts = Vec::new();
@@ -1388,6 +1590,7 @@ pub struct AppState {
     pub probe_state: ProbeState,
     pub reasoner: ReasonerConfig,
     pub prometheus_enabled: bool,
+    pub alert_history: Arc<AlertHistory>,
 }
 
 pub fn all_routes(app_state: Arc<AppState>) -> Router {
@@ -1404,6 +1607,9 @@ pub fn all_routes(app_state: Arc<AppState>) -> Router {
         .route("/stream", get(stream_events))
         .route("/system", get(system_snapshot))
         .route("/alerts", get(stream_alerts))
+        .route("/timeline", get(get_timeline))
+        .route("/alerts/{id}", get(get_alert_by_id))
+        .route("/metrics/system", get(get_system_metrics))
         .route("/insights", get(get_insights))
         .route("/insights/recent", get(get_recent_insights))
         .route("/metrics", get(metrics_handler))

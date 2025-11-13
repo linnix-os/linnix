@@ -896,6 +896,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     use tokio::signal::unix::{SignalKind, signal};
 
     // --- Create AppState and pass to axum ---
+    // Create alert history storage
+    let alert_history = Arc::new(api::AlertHistory::new(1000));
+
+    // Subscribe to alerts and populate history
+    if let Some(ref tx) = alert_tx {
+        let mut alert_rx = tx.subscribe();
+        let history = Arc::clone(&alert_history);
+        tokio::spawn(async move {
+            while let Ok(alert) = alert_rx.recv().await {
+                history.add_alert(alert).await;
+            }
+        });
+    }
+
     let app_state = Arc::new(AppState {
         context: Arc::clone(&context),
         metrics: Arc::clone(&metrics),
@@ -906,6 +920,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         probe_state,
         reasoner: config.reasoner.clone(),
         prometheus_enabled: config.outputs.prometheus,
+        alert_history: Arc::clone(&alert_history),
     });
 
     let api = all_routes(app_state.clone());
