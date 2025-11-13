@@ -79,6 +79,14 @@ struct ProcessInfo {
     comm: String,
     event_type: EventKind,
     tags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_pct: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mem_pct: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    age_sec: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -278,15 +286,54 @@ async fn get_context_route(State(app_state): State<Arc<AppState>>) -> Json<Vec<P
                 .to_string(),
             event_type: e.event_type.into(),
             tags: e.tags.clone(),
+            cpu_pct: e.cpu_percent(),
+            mem_pct: e.mem_percent(),
+            age_sec: calculate_age_sec(e.ts_ns),
+            state: Some(process_state_str(e.event_type, e.exit_time_ns)),
         })
         .collect();
     Json(data)
 }
 
-async fn get_processes(State(app_state): State<Arc<AppState>>) -> Json<Vec<ProcessInfo>> {
+#[derive(Deserialize)]
+struct ProcessesQuery {
+    #[serde(default)]
+    filter: Option<String>,
+    #[serde(default)]
+    sort: Option<String>,
+}
+
+fn calculate_age_sec(ts_ns: u64) -> Option<u64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos() as u64;
+    if ts_ns > 0 && now > ts_ns {
+        Some((now - ts_ns) / 1_000_000_000)
+    } else {
+        None
+    }
+}
+
+fn process_state_str(event_type: u32, exit_time_ns: u64) -> String {
+    if exit_time_ns > 0 {
+        "exited".to_string()
+    } else {
+        match event_type {
+            0 => "exec".to_string(),
+            1 => "fork".to_string(),
+            _ => "running".to_string(),
+        }
+    }
+}
+
+async fn get_processes(
+    State(app_state): State<Arc<AppState>>,
+    Query(query): Query<ProcessesQuery>,
+) -> Json<Vec<ProcessInfo>> {
     let ctx = &app_state.context;
     let snapshots = ctx.live_snapshot();
-    let data: Vec<ProcessInfo> = snapshots
+    let mut data: Vec<ProcessInfo> = snapshots
         .into_iter()
         .map(|e| ProcessInfo {
             pid: e.pid,
@@ -298,8 +345,46 @@ async fn get_processes(State(app_state): State<Arc<AppState>>) -> Json<Vec<Proce
                 .to_string(),
             event_type: e.event_type.into(),
             tags: e.tags.clone(),
+            cpu_pct: e.cpu_percent(),
+            mem_pct: e.mem_percent(),
+            age_sec: calculate_age_sec(e.ts_ns),
+            state: Some(process_state_str(e.event_type, e.exit_time_ns)),
         })
         .collect();
+
+    // Apply filtering if specified
+    if let Some(filter) = query.filter {
+        // Simple filter: cpu_pct>10 or mem_pct>50
+        if let Some(threshold_str) = filter.strip_prefix("cpu_pct>") {
+            if let Ok(threshold) = threshold_str.parse::<f32>() {
+                data.retain(|p| p.cpu_pct.unwrap_or(0.0) > threshold);
+            }
+        } else if let Some(threshold_str) = filter.strip_prefix("mem_pct>") {
+            if let Ok(threshold) = threshold_str.parse::<f32>() {
+                data.retain(|p| p.mem_pct.unwrap_or(0.0) > threshold);
+            }
+        }
+    }
+
+    // Apply sorting if specified
+    if let Some(sort) = query.sort {
+        if sort == "cpu_pct:desc" {
+            data.sort_by(|a, b| {
+                b.cpu_pct
+                    .unwrap_or(0.0)
+                    .partial_cmp(&a.cpu_pct.unwrap_or(0.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        } else if sort == "mem_pct:desc" {
+            data.sort_by(|a, b| {
+                b.mem_pct
+                    .unwrap_or(0.0)
+                    .partial_cmp(&a.mem_pct.unwrap_or(0.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+    }
+
     Json(data)
 }
 
@@ -319,6 +404,10 @@ async fn get_process_by_pid(
                 .to_string(),
             event_type: e.event_type.into(),
             tags: e.tags.clone(),
+            cpu_pct: e.cpu_percent(),
+            mem_pct: e.mem_percent(),
+            age_sec: calculate_age_sec(e.ts_ns),
+            state: Some(process_state_str(e.event_type, e.exit_time_ns)),
         };
         (axum::http::StatusCode::OK, Json(info)).into_response()
     } else {
@@ -349,6 +438,10 @@ async fn get_by_ppid(
                 .to_string(),
             event_type: e.event_type.into(),
             tags: e.tags.clone(),
+            cpu_pct: e.cpu_percent(),
+            mem_pct: e.mem_percent(),
+            age_sec: calculate_age_sec(e.ts_ns),
+            state: Some(process_state_str(e.event_type, e.exit_time_ns)),
         })
         .collect();
     Json(matches)
@@ -642,6 +735,49 @@ pub async fn stream_alerts(
     // Merge alerts with keepalives and box the stream type
     let combined: BoxStream<Result<Event, std::convert::Infallible>> =
         futures_util::stream::select(alert_stream, keepalive).boxed();
+
+    Sse::new(combined)
+}
+
+pub async fn stream_processes_live(
+    State(app_state): State<Arc<AppState>>,
+) -> Sse<BoxStream<'static, Result<Event, std::convert::Infallible>>> {
+    let ctx = Arc::clone(&app_state.context);
+
+    // Send process list every 2 seconds
+    let process_stream = IntervalStream::new(tokio::time::interval(Duration::from_secs(2)))
+        .map(move |_| {
+            let snapshots = ctx.live_snapshot();
+            let data: Vec<ProcessInfo> = snapshots
+                .into_iter()
+                .map(|e| ProcessInfo {
+                    pid: e.pid,
+                    ppid: e.ppid,
+                    uid: e.uid,
+                    gid: e.gid,
+                    comm: String::from_utf8_lossy(&e.comm)
+                        .trim_end_matches('\0')
+                        .to_string(),
+                    event_type: e.event_type.into(),
+                    tags: e.tags.clone(),
+                    cpu_pct: e.cpu_percent(),
+                    mem_pct: e.mem_percent(),
+                    age_sec: calculate_age_sec(e.ts_ns),
+                    state: Some(process_state_str(e.event_type, e.exit_time_ns)),
+                })
+                .collect();
+
+            let json = to_string(&json!({ "event": "update", "processes": data })).unwrap();
+            Ok(Event::default().event("processes").data(json))
+        });
+
+    // Heartbeat every 10s
+    let keepalive = IntervalStream::new(tokio::time::interval(Duration::from_secs(10)))
+        .map(|_| Ok(Event::default().comment("keep-alive")));
+
+    // Merge process updates with keepalives
+    let combined: BoxStream<Result<Event, std::convert::Infallible>> =
+        futures_util::stream::select(process_stream, keepalive).boxed();
 
     Sse::new(combined)
 }
@@ -1260,6 +1396,7 @@ pub fn all_routes(app_state: Arc<AppState>) -> Router {
     let mut router = Router::new()
         .route("/context", get(get_context_route))
         .route("/processes", get(get_processes))
+        .route("/processes/live", get(stream_processes_live))
         .route("/processes/{pid}", get(get_process_by_pid))
         .route("/ppid/{ppid}", get(get_by_ppid))
         .route("/graph/{pid}", get(get_graph))
