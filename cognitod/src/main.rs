@@ -716,24 +716,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // Spawn Apprise notifier if configured
-    if let Some(notif_config) = config.notifications {
-        if let Some(apprise_config) = notif_config.apprise {
-            if let Some(alert_tx) = &alert_tx {
-                let apprise_rx = alert_tx.subscribe();
-                let url_count = apprise_config.urls.len();
+    if let Some(notif_config) = config.notifications
+        && let Some(apprise_config) = notif_config.apprise
+    {
+        if let Some(alert_tx) = &alert_tx {
+            let apprise_rx = alert_tx.subscribe();
+            let url_count = apprise_config.urls.len();
 
-                tokio::spawn(async move {
-                    let notifier = notifications::AppriseNotifier::new(apprise_config, apprise_rx);
-                    notifier.run().await;
-                });
+            tokio::spawn(async move {
+                let notifier = notifications::AppriseNotifier::new(apprise_config, apprise_rx);
+                notifier.run().await;
+            });
 
-                info!(
-                    "[cognitod] Apprise notifier started with {} URL(s)",
-                    url_count
-                );
-            } else {
-                warn!("[cognitod] Apprise notifications requested but no alert handler is active");
-            }
+            info!(
+                "[cognitod] Apprise notifier started with {} URL(s)",
+                url_count
+            );
+        } else {
+            warn!("[cognitod] Apprise notifications requested but no alert handler is active");
         }
     }
 
