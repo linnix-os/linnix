@@ -18,12 +18,7 @@ pub struct AppriseNotifier {
 impl AppriseNotifier {
     /// Create a new Apprise notifier
     pub fn new(config: AppriseConfig, rx: broadcast::Receiver<Alert>) -> Self {
-        let min_severity = parse_severity(
-            config
-                .min_severity
-                .as_deref()
-                .unwrap_or("info"),
-        );
+        let min_severity = parse_severity(config.min_severity.as_deref().unwrap_or("info"));
 
         Self {
             urls: config.urls,
@@ -78,7 +73,11 @@ impl AppriseNotifier {
 
     /// Send a single alert via Apprise CLI
     async fn notify(&self, alert: &Alert) -> Result<()> {
-        let title = format!("[{}] {}", alert.severity.as_str().to_uppercase(), alert.rule);
+        let title = format!(
+            "[{}] {}",
+            alert.severity.as_str().to_uppercase(),
+            alert.rule
+        );
         let body = format!("Host: {}\n\n{}", alert.host, alert.message);
 
         debug!("Sending notification: '{}'", title);

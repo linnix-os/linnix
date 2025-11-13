@@ -723,14 +723,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let url_count = apprise_config.urls.len();
 
                 tokio::spawn(async move {
-                    let notifier = notifications::AppriseNotifier::new(
-                        apprise_config,
-                        apprise_rx,
-                    );
+                    let notifier = notifications::AppriseNotifier::new(apprise_config, apprise_rx);
                     notifier.run().await;
                 });
 
-                info!("[cognitod] Apprise notifier started with {} URL(s)", url_count);
+                info!(
+                    "[cognitod] Apprise notifier started with {} URL(s)",
+                    url_count
+                );
             } else {
                 warn!("[cognitod] Apprise notifications requested but no alert handler is active");
             }
