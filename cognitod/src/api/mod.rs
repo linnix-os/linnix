@@ -20,7 +20,7 @@ use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tokio_stream::wrappers::{BroadcastStream, IntervalStream, errors::BroadcastStreamRecvError};
 
@@ -833,8 +833,8 @@ pub async fn stream_processes_live(
     let ctx = Arc::clone(&app_state.context);
 
     // Send process list every 2 seconds
-    let process_stream = IntervalStream::new(tokio::time::interval(Duration::from_secs(2)))
-        .map(move |_| {
+    let process_stream =
+        IntervalStream::new(tokio::time::interval(Duration::from_secs(2))).map(move |_| {
             let snapshots = ctx.live_snapshot();
             let data: Vec<ProcessInfo> = snapshots
                 .into_iter()
@@ -936,7 +936,11 @@ async fn get_alert_by_id(
         };
         (StatusCode::OK, Json(detail)).into_response()
     } else {
-        (StatusCode::NOT_FOUND, Json(json!({"error": "Alert not found"}))).into_response()
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Alert not found"})),
+        )
+            .into_response()
     }
 }
 
