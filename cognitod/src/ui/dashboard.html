@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Linnix Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <script src="https://unpkg.com/alpinejs@3.13.3/dist/cdn.min.js" defer></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <style>
+        [x-cloak] { display: none !important; }
+        .alert-critical { @apply bg-red-100 border-red-400 text-red-800; }
+        .alert-warning { @apply bg-yellow-100 border-yellow-400 text-yellow-800; }
+        .alert-info { @apply bg-blue-100 border-blue-400 text-blue-800; }
+    </style>
+</head>
+<body class="bg-gray-50" x-data="dashboard()" x-init="init()">
+    <!-- Header -->
+    <header class="bg-white shadow">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
+            <div class="flex justify-between items-center">
+                <div class="flex items-center space-x-4">
+                    <h1 class="text-2xl font-bold text-gray-900">Linnix</h1>
+                    <span class="text-sm text-gray-500">eBPF Process Monitor</span>
+                </div>
+                <div class="flex items-center space-x-4">
+                    <div class="flex items-center space-x-2">
+                        <div class="h-2 w-2 rounded-full bg-green-500" x-show="connected"></div>
+                        <div class="h-2 w-2 rounded-full bg-red-500 animate-pulse" x-show="!connected" x-cloak></div>
+                        <span class="text-sm text-gray-600" x-text="connected ? 'Connected' : 'Disconnected'"></span>
+                    </div>
+                    <span class="text-sm text-gray-500" x-text="systemInfo.hostname"></span>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
+        <!-- System Metrics -->
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+            <div class="bg-white rounded-lg shadow p-4">
+                <div class="text-sm font-medium text-gray-500">CPU Usage</div>
+                <div class="mt-2 flex items-baseline">
+                    <div class="text-2xl font-semibold text-gray-900" x-text="systemMetrics.cpu_pct.toFixed(1) + '%'"></div>
+                </div>
+                <div class="mt-2 w-full bg-gray-200 rounded-full h-2">
+                    <div class="bg-blue-600 h-2 rounded-full transition-all duration-300" :style="`width: ${systemMetrics.cpu_pct}%`"></div>
+                </div>
+            </div>
+
+            <div class="bg-white rounded-lg shadow p-4">
+                <div class="text-sm font-medium text-gray-500">Memory</div>
+                <div class="mt-2 flex items-baseline">
+                    <div class="text-2xl font-semibold text-gray-900" x-text="(systemMetrics.mem_used_mb / 1024).toFixed(1) + ' GB'"></div>
+                    <div class="ml-2 text-sm text-gray-500" x-text="'/ ' + (systemMetrics.mem_total_mb / 1024).toFixed(1) + ' GB'"></div>
+                </div>
+                <div class="mt-2 w-full bg-gray-200 rounded-full h-2">
+                    <div class="bg-green-600 h-2 rounded-full transition-all duration-300" :style="`width: ${(systemMetrics.mem_used_mb / systemMetrics.mem_total_mb * 100)}%`"></div>
+                </div>
+            </div>
+
+            <div class="bg-white rounded-lg shadow p-4">
+                <div class="text-sm font-medium text-gray-500">Processes</div>
+                <div class="mt-2 text-2xl font-semibold text-gray-900" x-text="processCount"></div>
+                <div class="mt-1 text-sm text-gray-500">active</div>
+            </div>
+
+            <div class="bg-white rounded-lg shadow p-4">
+                <div class="text-sm font-medium text-gray-500">Active Alerts</div>
+                <div class="mt-2 text-2xl font-semibold" :class="alertCount > 0 ? 'text-red-600' : 'text-gray-900'" x-text="alertCount"></div>
+                <div class="mt-1 text-sm text-gray-500">incidents</div>
+            </div>
+        </div>
+
+        <!-- Alert Timeline -->
+        <div class="bg-white rounded-lg shadow mb-6" x-show="timeline.length > 0" x-cloak>
+            <div class="px-4 py-3 border-b border-gray-200">
+                <h2 class="text-lg font-semibold text-gray-900">Recent Alerts</h2>
+            </div>
+            <div class="p-4">
+                <div class="space-y-3">
+                    <template x-for="alert in timeline" :key="alert.id">
+                        <div class="border-l-4 p-3 rounded"
+                             :class="alert.severity === 'critical' ? 'alert-critical' : alert.severity === 'warning' ? 'alert-warning' : 'alert-info'">
+                            <div class="flex justify-between items-start">
+                                <div class="flex-1">
+                                    <div class="flex items-center space-x-2">
+                                        <span class="font-semibold" x-text="alert.alert_type"></span>
+                                        <span class="text-xs px-2 py-1 rounded uppercase font-medium"
+                                              :class="alert.severity === 'critical' ? 'bg-red-200' : alert.severity === 'warning' ? 'bg-yellow-200' : 'bg-blue-200'"
+                                              x-text="alert.severity"></span>
+                                    </div>
+                                    <p class="mt-1 text-sm" x-text="alert.message"></p>
+                                    <div class="mt-1 text-xs text-gray-600">
+                                        PID <span x-text="alert.pid"></span>
+                                        <span x-show="alert.process_name">- <span x-text="alert.process_name"></span></span>
+                                    </div>
+                                </div>
+                                <div class="text-xs text-gray-500" x-text="formatTimestamp(alert.timestamp)"></div>
+                            </div>
+                        </div>
+                    </template>
+                </div>
+            </div>
+        </div>
+
+        <!-- Process Table -->
+        <div class="bg-white rounded-lg shadow">
+            <div class="px-4 py-3 border-b border-gray-200 flex justify-between items-center">
+                <h2 class="text-lg font-semibold text-gray-900">Live Processes</h2>
+                <div class="flex space-x-2">
+                    <select class="text-sm border-gray-300 rounded-md" x-model="sortBy" @change="sortProcesses()">
+                        <option value="cpu_pct">CPU %</option>
+                        <option value="mem_mb">Memory</option>
+                        <option value="age_sec">Age</option>
+                        <option value="pid">PID</option>
+                    </select>
+                    <button @click="sortOrder = sortOrder === 'desc' ? 'asc' : 'desc'; sortProcesses()"
+                            class="px-3 py-1 text-sm bg-gray-100 rounded hover:bg-gray-200">
+                        <span x-show="sortOrder === 'desc'">↓</span>
+                        <span x-show="sortOrder === 'asc'" x-cloak>↑</span>
+                    </button>
+                </div>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">PID</th>
+                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Command</th>
+                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">CPU %</th>
+                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Memory</th>
+                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">State</th>
+                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Age</th>
+                        </tr>
+                    </thead>
+                    <tbody class="bg-white divide-y divide-gray-200">
+                        <template x-for="proc in displayedProcesses" :key="proc.pid">
+                            <tr class="hover:bg-gray-50">
+                                <td class="px-4 py-3 whitespace-nowrap text-sm font-medium text-gray-900" x-text="proc.pid"></td>
+                                <td class="px-4 py-3 text-sm text-gray-900">
+                                    <div class="max-w-xs truncate" x-text="proc.command || proc.comm || '-'"></div>
+                                </td>
+                                <td class="px-4 py-3 whitespace-nowrap text-sm">
+                                    <span x-text="proc.cpu_pct ? proc.cpu_pct.toFixed(1) + '%' : '0.0%'"></span>
+                                </td>
+                                <td class="px-4 py-3 whitespace-nowrap text-sm" x-text="proc.mem_mb ? proc.mem_mb.toFixed(1) + ' MB' : '-'"></td>
+                                <td class="px-4 py-3 whitespace-nowrap text-sm">
+                                    <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full"
+                                          :class="proc.state === 'Running' ? 'bg-green-100 text-green-800' : 'bg-gray-100 text-gray-800'"
+                                          x-text="proc.state || 'Unknown'"></span>
+                                </td>
+                                <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500" x-text="formatAge(proc.age_sec)"></td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        function dashboard() {
+            return {
+                connected: false,
+                systemInfo: { hostname: 'Loading...' },
+                systemMetrics: { cpu_pct: 0, mem_used_mb: 0, mem_total_mb: 1, load_avg_1: 0, load_avg_5: 0, load_avg_15: 0 },
+                processes: [],
+                displayedProcesses: [],
+                timeline: [],
+                processCount: 0,
+                alertCount: 0,
+                sortBy: 'cpu_pct',
+                sortOrder: 'desc',
+                eventSource: null,
+
+                init() {
+                    this.loadInitialData();
+                    this.connectSSE();
+                    this.pollMetrics();
+                },
+
+                async loadInitialData() {
+                    try {
+                        // Load system info
+                        const systemResp = await fetch('/system');
+                        const system = await systemResp.json();
+                        this.systemInfo = system;
+
+                        // Load processes
+                        const procResp = await fetch('/processes');
+                        this.processes = await procResp.json();
+                        this.processCount = this.processes.length;
+                        this.sortProcesses();
+
+                        // Load timeline
+                        const timelineResp = await fetch('/timeline');
+                        this.timeline = await timelineResp.json();
+                        this.alertCount = this.timeline.filter(a => a.severity === 'critical' || a.severity === 'warning').length;
+
+                        // Load metrics
+                        await this.updateMetrics();
+                    } catch (error) {
+                        console.error('Failed to load initial data:', error);
+                    }
+                },
+
+                connectSSE() {
+                    this.eventSource = new EventSource('/processes/live');
+
+                    this.eventSource.onopen = () => {
+                        this.connected = true;
+                        console.log('SSE connected');
+                    };
+
+                    this.eventSource.onerror = (error) => {
+                        this.connected = false;
+                        console.error('SSE error:', error);
+                        setTimeout(() => this.connectSSE(), 5000);
+                    };
+
+                    this.eventSource.addEventListener('process_update', (event) => {
+                        const proc = JSON.parse(event.data);
+                        this.updateProcess(proc);
+                    });
+
+                    this.eventSource.addEventListener('alert', (event) => {
+                        const alert = JSON.parse(event.data);
+                        this.addAlert(alert);
+                    });
+                },
+
+                updateProcess(proc) {
+                    const idx = this.processes.findIndex(p => p.pid === proc.pid);
+                    if (idx >= 0) {
+                        this.processes[idx] = proc;
+                    } else {
+                        this.processes.push(proc);
+                    }
+                    this.processCount = this.processes.length;
+                    this.sortProcesses();
+                },
+
+                addAlert(alert) {
+                    this.timeline.unshift(alert);
+                    if (this.timeline.length > 50) {
+                        this.timeline = this.timeline.slice(0, 50);
+                    }
+                    this.alertCount = this.timeline.filter(a => a.severity === 'critical' || a.severity === 'warning').length;
+                },
+
+                async updateMetrics() {
+                    try {
+                        const resp = await fetch('/metrics/system');
+                        this.systemMetrics = await resp.json();
+                    } catch (error) {
+                        console.error('Failed to update metrics:', error);
+                    }
+                },
+
+                pollMetrics() {
+                    setInterval(() => this.updateMetrics(), 2000);
+                },
+
+                sortProcesses() {
+                    const sorted = [...this.processes].sort((a, b) => {
+                        let aVal = a[this.sortBy] || 0;
+                        let bVal = b[this.sortBy] || 0;
+                        return this.sortOrder === 'desc' ? bVal - aVal : aVal - bVal;
+                    });
+                    this.displayedProcesses = sorted.slice(0, 100);
+                },
+
+                formatAge(seconds) {
+                    if (!seconds) return '-';
+                    if (seconds < 60) return `${seconds}s`;
+                    if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+                    if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+                    return `${Math.floor(seconds / 86400)}d`;
+                },
+
+                formatTimestamp(ts) {
+                    const date = new Date(ts);
+                    return date.toLocaleTimeString();
+                }
+            };
+        }
+    </script>
+</body>
+</html>

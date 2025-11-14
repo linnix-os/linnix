@@ -1601,6 +1601,8 @@ pub fn all_routes(app_state: Arc<AppState>) -> Router {
     let prometheus_enabled = app_state.prometheus_enabled;
 
     let mut router = Router::new()
+        .route("/", get(crate::ui::dashboard_handler))
+        .route("/dashboard", get(crate::ui::dashboard_handler))
         .route("/context", get(get_context_route))
         .route("/processes", get(get_processes))
         .route("/processes/live", get(stream_processes_live))

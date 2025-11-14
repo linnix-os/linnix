@@ -42,6 +42,7 @@ mod metrics;
 mod notifications;
 mod routes;
 mod types;
+mod ui;
 
 #[repr(transparent)]
 #[derive(Copy, Clone)]
