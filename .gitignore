@@ -249,3 +249,15 @@ youtube/quickstart-video/youtube/quickstart-video/output/VIDEO_ASSEMBLY.md
 youtube/quickstart-video/youtube/quickstart-video/output/voiceover-script.txt
 youtube/quickstart-video/youtube/quickstart-video/output/audio/voiceover.mp3
 scenarios/demo/record-demo.sh
+ALERT_ARCHITECTURE.txt
+ALERT_CODE_SNIPPETS.md
+ALERT_INTEGRATION_ANALYSIS.md
+ALERT_INTEGRATION_INDEX.md
+ALERT_INTEGRATION_SUMMARY.txt
+APPRISE_INTEGRATION_PLAN.md
+APPRISE_RESPONSE.md
+UI_DASHBOARD_PLAN.md
+UI_DASHBOARD_TEST_PLAN.md
+UI_DASHBOARD_TEST_RESULTS.md
+youtube/quickstart-video/output/final-video.mp3
+youtube/quickstart-video/output/final-video1.mp4
