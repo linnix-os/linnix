@@ -146,7 +146,7 @@ struct TopCpuEntry {
 
 // Alert timeline structures
 #[derive(Debug, Clone, Serialize)]
-struct AlertRecord {
+pub(crate) struct AlertRecord {
     id: String,
     timestamp: u64,
     severity: String,
@@ -447,10 +447,10 @@ async fn get_processes(
             if let Ok(threshold) = threshold_str.parse::<f32>() {
                 data.retain(|p| p.cpu_pct.unwrap_or(0.0) > threshold);
             }
-        } else if let Some(threshold_str) = filter.strip_prefix("mem_pct>") {
-            if let Ok(threshold) = threshold_str.parse::<f32>() {
-                data.retain(|p| p.mem_pct.unwrap_or(0.0) > threshold);
-            }
+        } else if let Some(threshold_str) = filter.strip_prefix("mem_pct>")
+            && let Ok(threshold) = threshold_str.parse::<f32>()
+        {
+            data.retain(|p| p.mem_pct.unwrap_or(0.0) > threshold);
         }
     }
 
@@ -1767,6 +1767,7 @@ mod tests {
             probe_state: ProbeState::disabled(),
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: false,
+            alert_history: Arc::new(AlertHistory::new(16)),
         });
         let Json(resp) = super::status_handler(State(app_state)).await;
         let val = serde_json::to_value(resp).unwrap();
@@ -1810,6 +1811,7 @@ mod tests {
             },
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: false,
+            alert_history: Arc::new(AlertHistory::new(16)),
         });
 
         let Json(resp) = super::metrics_handler(State(app_state)).await;
@@ -1851,6 +1853,7 @@ mod tests {
             probe_state: ProbeState::disabled(),
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: false,
+            alert_history: Arc::new(AlertHistory::new(16)),
         });
         let router = super::all_routes(Arc::clone(&app_state));
         let response = router
@@ -1880,6 +1883,7 @@ mod tests {
             probe_state: ProbeState::disabled(),
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: true,
+            alert_history: Arc::new(AlertHistory::new(16)),
         });
         let router = super::all_routes(Arc::clone(&app_state));
         let response = router
