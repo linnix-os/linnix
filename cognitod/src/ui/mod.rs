@@ -2,7 +2,6 @@
 ///
 /// Serves a single-page application with real-time process monitoring,
 /// alert visualization, and system metrics.
-
 use axum::response::{Html, IntoResponse};
 
 /// Embedded dashboard HTML
