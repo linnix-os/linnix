@@ -114,6 +114,11 @@ install_dependencies() {
 
     case $OS in
         ubuntu|debian)
+            # Disable interactive prompts
+            export DEBIAN_FRONTEND=noninteractive
+            export NEEDRESTART_MODE=a
+            export NEEDRESTART_SUSPEND=1
+
             apt-get update -qq
             apt-get install -y -qq \
                 curl \
