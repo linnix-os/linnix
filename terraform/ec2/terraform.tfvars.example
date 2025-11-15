@@ -1,0 +1,61 @@
+# Example Terraform variables file for Linnix deployment
+# Copy this file to terraform.tfvars and customize for your environment
+
+# AWS Configuration
+aws_region = "us-east-1"
+project_name = "linnix-production"
+
+# EC2 Instance
+instance_type = "t3.medium"  # Options: t3.small, t3.medium, t3.large, c6a.xlarge, m6a.xlarge
+key_name = "my-ssh-keypair"  # Your existing AWS EC2 key pair name
+
+# Network Configuration
+vpc_id = "vpc-0123456789abcdef0"
+subnet_id = "subnet-0123456789abcdef0"
+
+# Security - Restrict access to your IP
+admin_cidr_blocks = ["YOUR.IP.ADDRESS/32"]      # SSH access
+api_cidr_blocks = ["YOUR.IP.ADDRESS/32"]        # API/Dashboard access
+prometheus_cidr_blocks = ["YOUR.IP.ADDRESS/32"] # Prometheus metrics
+
+# Public IP Configuration
+associate_public_ip = true
+allocate_elastic_ip = false  # Set to true for persistent IP
+
+# Storage
+root_volume_size = 20       # GB (minimum 20, use 50+ for LLM)
+enable_encryption = true    # EBS encryption
+
+# Linnix Configuration
+linnix_port = 3000
+enable_prometheus = true
+install_llm = false  # Set to true for AI-powered insights (requires more memory)
+
+# OS Selection
+use_amazon_linux = false  # Set to true for Amazon Linux 2023, false for Ubuntu 22.04
+
+# GitHub Repository
+github_repo = "linnix-os/linnix"
+
+# CloudWatch Integration
+enable_cloudwatch_logs = true
+log_retention_days = 7  # Options: 1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365
+enable_cloudwatch_alarms = true
+enable_detailed_monitoring = false  # Set to true for 1-minute metrics (additional cost)
+
+# Notifications
+# Create SNS topic first: aws sns create-topic --name linnix-alerts
+alarm_sns_topic_arn = ""  # Optional: SNS topic ARN for alarm notifications
+
+# DNS Configuration (Optional)
+route53_zone_id = ""               # Optional: Route53 hosted zone ID
+route53_record_name = ""           # Optional: DNS name (e.g., linnix.example.com)
+
+# Resource Tags
+tags = {
+  Project     = "Linnix"
+  Environment = "production"
+  ManagedBy   = "Terraform"
+  Team        = "DevOps"
+  CostCenter  = "Engineering"
+}

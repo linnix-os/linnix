@@ -144,6 +144,7 @@ docs/images/README.md
 !docs/COMPARISON.md
 !docs/HOW_IT_WORKS.md
 !docs/FAQ.md
+!docs/AWS_EC2_DEPLOYMENT.md
 
 # Environment files with secrets
 .env
