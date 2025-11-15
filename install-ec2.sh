@@ -221,16 +221,14 @@ install_linnix_binaries() {
 
         git clone "https://github.com/${GITHUB_REPO}.git" .
 
-        # Build eBPF programs
+        # Build eBPF programs using xtask
         log info "Building eBPF programs..."
-        cd linnix-ai-ebpf/linnix-ai-ebpf-ebpf
-        cargo build --release --target=bpfel-unknown-none
+        cargo xtask build-ebpf --release
 
         # Copy eBPF artifacts
         cp target/bpfel-unknown-none/release/linnix-ai-ebpf-ebpf "$SHARE_DIR/"
 
         # Build userspace binaries
-        cd "$TEMP_DIR"
         log info "Building userspace binaries..."
         cargo build --release -p cognitod
         cargo build --release -p linnix-cli
