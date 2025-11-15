@@ -170,21 +170,39 @@ install_rust() {
 
     log info "Installing Rust toolchain..."
 
+    local rust_installed=false
     if command -v rustc &> /dev/null; then
         log info "Rust already installed: $(rustc --version)"
-        return
-    fi
-
-    # Install as non-root user if SUDO_USER is available
-    if [ -n "$SUDO_USER" ]; then
-        sudo -u "$SUDO_USER" bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
-        export PATH="/home/$SUDO_USER/.cargo/bin:$PATH"
+        rust_installed=true
     else
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-        export PATH="$HOME/.cargo/bin:$PATH"
+        # Install as non-root user if SUDO_USER is available
+        if [ -n "$SUDO_USER" ]; then
+            sudo -u "$SUDO_USER" bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
+            export PATH="/home/$SUDO_USER/.cargo/bin:$PATH"
+        else
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            export PATH="$HOME/.cargo/bin:$PATH"
+        fi
     fi
 
-    log success "Rust toolchain installed"
+    # Install eBPF build requirements
+    log info "Installing eBPF build dependencies..."
+
+    # Install nightly toolchain for eBPF
+    if [ -n "$SUDO_USER" ]; then
+        sudo -u "$SUDO_USER" bash -c "
+            export PATH=\"/home/$SUDO_USER/.cargo/bin:\$PATH\"
+            rustup install nightly-2024-12-10
+            rustup component add rust-src --toolchain nightly-2024-12-10
+            cargo install bpf-linker --version 0.9.13 --locked
+        "
+    else
+        rustup install nightly-2024-12-10
+        rustup component add rust-src --toolchain nightly-2024-12-10
+        cargo install bpf-linker --version 0.9.13 --locked
+    fi
+
+    log success "Rust toolchain and eBPF dependencies installed"
 }
 
 # Download or build Linnix binaries
