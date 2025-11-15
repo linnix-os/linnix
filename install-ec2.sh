@@ -193,11 +193,10 @@ install_rust() {
     # Install eBPF build requirements
     log info "Installing eBPF build dependencies..."
 
-    # Install nightly toolchain for eBPF
+    # Install nightly toolchain for eBPF (use login shell to persist rustup settings)
     if [ -n "$SUDO_USER" ]; then
-        sudo -u "$SUDO_USER" bash -c "
-            export PATH=\"/home/$SUDO_USER/.cargo/bin:\$PATH\"
-            . \"/home/$SUDO_USER/.cargo/env\"
+        sudo -u "$SUDO_USER" bash -lc "
+            . \"\$HOME/.cargo/env\"
             rustup default stable
             rustup install nightly-2024-12-10
             rustup component add rust-src --toolchain nightly-2024-12-10
@@ -235,11 +234,10 @@ install_linnix_binaries() {
             # Change ownership of temp dir to sudo user
             chown -R "$SUDO_USER:$SUDO_USER" "$TEMP_DIR"
 
-            # Run build commands as sudo user
-            sudo -u "$SUDO_USER" bash -c "
+            # Run build commands as sudo user (use login shell for rustup environment)
+            sudo -u "$SUDO_USER" bash -lc "
                 cd '$TEMP_DIR'
-                export PATH=\"/home/$SUDO_USER/.cargo/bin:\$PATH\"
-                . \"/home/$SUDO_USER/.cargo/env\"
+                . \"\$HOME/.cargo/env\"
 
                 # Build eBPF programs using xtask
                 echo '[INFO] Building eBPF programs...'
