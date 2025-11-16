@@ -4,16 +4,22 @@ This branch contains complete AWS EC2 deployment tooling for Linnix.
 
 ## 📦 What's Included
 
-### 1. One-Command Installation Script
-**File:** [install-ec2.sh](install-ec2.sh)
+### 1. One-Command Installation Scripts
 
+**Cognitod Installation:** [install-ec2.sh](install-ec2.sh)
 ```bash
-# Quick install
+# Install eBPF monitoring daemon
 curl -fsSL https://raw.githubusercontent.com/linnix-os/linnix/main/install-ec2.sh | sudo bash
-
-# With options
-sudo ./install-ec2.sh --with-llm --port 3000
 ```
+
+**LLM Installation (Optional):** [install-llm-native.sh](install-llm-native.sh)
+```bash
+# Install AI-powered insights (requires 16GB disk, 4GB+ RAM)
+wget https://raw.githubusercontent.com/linnix-os/linnix/main/install-llm-native.sh
+sudo ./install-llm-native.sh
+```
+
+See [LLM_INSTALLATION.md](LLM_INSTALLATION.md) for detailed LLM setup guide.
 
 ### 2. Complete Documentation
 **File:** [docs/AWS_EC2_DEPLOYMENT.md](docs/AWS_EC2_DEPLOYMENT.md)
@@ -55,13 +61,16 @@ packer build linnix-ami.pkr.hcl
 
 ## 📋 Instance Recommendations
 
-| Use Case | Instance Type | Memory | Monthly Cost |
-|----------|--------------|--------|--------------|
-| Development/Testing | t3.small | 2 GB | ~$15 |
-| Small Production | t3.medium | 4 GB | ~$30 |
-| Production | t3.large | 8 GB | ~$60 |
-| High Performance | c6a.xlarge | 8 GB | ~$120 |
-| With LLM Support | m6a.xlarge | 16 GB | ~$140 |
+| Use Case | Instance Type | vCPU | Memory | Storage | Monthly Cost |
+|----------|--------------|------|--------|---------|--------------|
+| Development/Testing | t3.small | 2 | 2 GB | 20 GB | ~$15 |
+| Small Production | t3.medium | 2 | 4 GB | 20 GB | ~$30 |
+| Production | t3.large | 2 | 8 GB | 20 GB | ~$60 |
+| High Performance | c6a.xlarge | 4 | 8 GB | 20 GB | ~$120 |
+| **With LLM (Recommended)** | **m6a.large** | **2** | **8 GB** | **16+ GB** | **~$70** |
+| With LLM (High Load) | m6a.xlarge | 4 | 16 GB | 16+ GB | ~$140 |
+
+**Note:** LLM support requires minimum 16GB disk (model is 2.1GB) and 4GB+ RAM. For production LLM deployments, use m6a.large or larger.
 
 ## 🔧 Quick Start Examples
 
@@ -70,8 +79,16 @@ packer build linnix-ami.pkr.hcl
 # SSH into instance
 ssh ubuntu@YOUR_INSTANCE_IP
 
-# Install
+# Install cognitod (eBPF monitoring)
 curl -fsSL https://raw.githubusercontent.com/linnix-os/linnix/main/install-ec2.sh | sudo bash
+
+# (Optional) Install LLM for AI insights
+wget https://raw.githubusercontent.com/linnix-os/linnix/main/install-llm-native.sh
+sudo ./install-llm-native.sh
+
+# Enable LLM in config (if installed)
+sudo sed -i 's/^enabled = false/enabled = true/' /etc/linnix/linnix.toml
+sudo systemctl restart linnix-cognitod
 
 # Access dashboard
 # Open http://YOUR_INSTANCE_IP:3000/
@@ -142,10 +159,37 @@ sudo journalctl -u linnix-cognitod -n 50
 sudo systemctl status linnix-cognitod
 
 # Test locally
-curl http://localhost:3000/api/healthz
+curl http://localhost:3000/healthz
 
 # Check security group
 aws ec2 describe-security-groups --group-ids sg-xxxxx
+```
+
+### LLM Issues
+```bash
+# Check LLM service
+sudo systemctl status linnix-llm.service
+sudo journalctl -u linnix-llm.service -n 50
+
+# Verify model file (should be ~2.1GB)
+ls -lh /var/lib/linnix/models/linnix-3b-distilled-q5_k_m.gguf
+
+# Test LLM health
+curl http://localhost:8090/health
+
+# Check insights
+curl http://localhost:3000/insights
+curl http://localhost:3000/metrics | grep ilm
+```
+
+### Disk Space Full
+```bash
+# Check disk usage
+df -h
+
+# Resize EBS volume in AWS Console, then:
+sudo growpart /dev/nvme0n1 1
+sudo resize2fs /dev/nvme0n1p1
 ```
 
 ### High CPU Usage
@@ -159,9 +203,11 @@ sudo systemctl restart linnix-cognitod
 ## 📚 Documentation Links
 
 - **Main Documentation:** [docs/AWS_EC2_DEPLOYMENT.md](docs/AWS_EC2_DEPLOYMENT.md)
+- **LLM Installation Guide:** [LLM_INSTALLATION.md](LLM_INSTALLATION.md)
+- **Cognitod Install Script:** [install-ec2.sh](install-ec2.sh)
+- **LLM Install Script:** [install-llm-native.sh](install-llm-native.sh)
 - **Terraform README:** [terraform/ec2/README.md](terraform/ec2/README.md)
 - **Packer README:** [packer/README.md](packer/README.md)
-- **Installation Script:** [install-ec2.sh](install-ec2.sh)
 
 ## 🎯 Next Steps After Deployment
 

@@ -78,9 +78,6 @@ sudo ./install-ec2.sh
 ### Installation Options
 
 ```bash
-# Install with LLM support (requires 4GB+ RAM)
-sudo ./install-ec2.sh --with-llm
-
 # Install for development (builds from source)
 sudo ./install-ec2.sh --dev
 
@@ -91,19 +88,53 @@ sudo ./install-ec2.sh --port 8080
 sudo ./install-ec2.sh --skip-systemd
 ```
 
-### What the Script Does
+### LLM Installation (Separate Script)
+
+For AI-powered insights, install the LLM server after installing cognitod:
+
+```bash
+# Download and run LLM installation script
+wget https://raw.githubusercontent.com/linnix-os/linnix/main/install-llm-native.sh
+sudo ./install-llm-native.sh
+```
+
+**Requirements:**
+- Minimum 16 GB disk space (5 GB for model + build artifacts)
+- Minimum 4 GB RAM
+- At least t3.medium instance recommended
+
+See [LLM_INSTALLATION.md](../LLM_INSTALLATION.md) for detailed guide.
+
+### What the install-ec2.sh Script Does
 
 1. ✅ Detects OS and validates kernel version (>= 5.8)
-2. ✅ Installs system dependencies (libelf, kernel headers)
+2. ✅ Installs system dependencies (libelf, kernel headers, OpenSSL)
 3. ✅ Downloads or builds Linnix binaries
+   - Installs Rust toolchain with eBPF support (nightly-2024-12-10)
+   - Installs rust-src component and bpf-linker
+   - Builds eBPF programs using `cargo xtask build-ebpf`
 4. ✅ Installs eBPF programs to `/usr/local/share/linnix/`
 5. ✅ Creates configuration files in `/etc/linnix/`
 6. ✅ Sets up systemd service with proper capabilities
-7. ✅ Configures firewall (if active)
+7. ✅ Configures cognitod to listen on 0.0.0.0:3000 for external access
 8. ✅ Starts and enables the service
 9. ✅ Verifies installation
 
-**Installation Time:** 3-5 minutes (or 15-20 minutes if building from source)
+**Installation Time:** 3-5 minutes (pre-built) or 10-15 minutes (build from source)
+
+### What the install-llm-native.sh Script Does
+
+1. ✅ Checks disk space (requires 5 GB minimum)
+2. ✅ Installs build dependencies (CMake, curl, git)
+3. ✅ Clones and builds llama.cpp from source with CMake
+4. ✅ Downloads Linnix 3B distilled model (2.1 GB) from Hugging Face
+5. ✅ Creates systemd service for LLM inference server on port 8090
+6. ✅ Configures resource limits (4GB RAM, 400% CPU)
+7. ✅ Cleans up build artifacts to save disk space
+8. ✅ Starts and enables the LLM service
+9. ✅ Verifies LLM server health
+
+**Installation Time:** 10-15 minutes (includes building llama.cpp and downloading 2.1 GB model)
 
 ---
 
@@ -307,10 +338,22 @@ sudo systemctl status linnix-cognitod
 ### Recommended EC2 Settings
 
 **Storage:**
-- Root volume: 20 GB gp3 (minimum)
-- For LLM support: 50 GB gp3
+- Root volume: 20 GB gp3 (minimum for cognitod only)
+- For LLM support: **30 GB gp3 minimum** (16 GB recommended to avoid disk space issues)
+  - Model file: 2.1 GB
+  - llama.cpp build artifacts: ~1-2 GB (cleaned up after build)
+  - System and logs: 1-2 GB
+  - Safety buffer: 10+ GB
 - IOPS: 3000 (default for gp3)
 - Throughput: 125 MB/s (default for gp3)
+
+**Note:** If you run out of disk space, you can resize your EBS volume:
+```bash
+# In AWS Console: Modify volume size (e.g., 8 GB → 16 GB)
+# Then on the instance:
+sudo growpart /dev/nvme0n1 1
+sudo resize2fs /dev/nvme0n1p1
+```
 
 **Network:**
 - Enhanced networking: Enabled (default for modern instance types)
@@ -353,7 +396,10 @@ curl -fsSL https://raw.githubusercontent.com/linnix-os/linnix/main/install-ec2.s
 |------|----------|------|--------|---------|
 | SSH | TCP | 22 | Your IP | SSH access |
 | Custom TCP | TCP | 3000 | Your IP / VPC CIDR | Linnix API/Dashboard |
+| Custom TCP | TCP | 8090 | Localhost only | LLM Server (internal) |
 | Custom TCP | TCP | 9090 | Your IP (optional) | Prometheus metrics |
+
+**Note:** Port 8090 (LLM server) should typically only be accessible from localhost. The cognitod service connects to it internally via `http://127.0.0.1:8090`.
 
 **Security Best Practices:**
 1. **Restrict SSH:** Only allow from your IP or bastion host
@@ -412,7 +458,9 @@ sample_interval_ms = 1000  # Adjust sampling rate
 listen_addr = "0.0.0.0:3000"  # API server binding
 
 [reasoner]
-enabled = false  # Enable if you have LLM setup
+enabled = true  # Enable if you have LLM installed via install-llm-native.sh
+endpoint = "http://127.0.0.1:8090/v1/chat/completions"
+model = "linnix-3b-distilled"
 
 [prometheus]
 enabled = true  # Enable Prometheus metrics
@@ -522,8 +570,14 @@ For production deployments:
 ### View Real-Time Logs
 
 ```bash
-# Follow service logs
+# Follow cognitod logs
 sudo journalctl -u linnix-cognitod -f
+
+# Follow LLM service logs (if installed)
+sudo journalctl -u linnix-llm.service -f
+
+# Follow both services together
+sudo journalctl -u linnix-cognitod -u linnix-llm.service -f
 
 # Show last 100 lines
 sudo journalctl -u linnix-cognitod -n 100
@@ -564,17 +618,50 @@ curl http://localhost:3000/api/metrics | jq
 ### Health Checks
 
 ```bash
-# Create health check script
+# Create comprehensive health check script
 cat > /usr/local/bin/linnix-health-check.sh << 'EOF'
 #!/bin/bash
-RESPONSE=$(curl -s -w "%{http_code}" http://localhost:3000/api/healthz -o /dev/null)
-if [ "$RESPONSE" -eq 200 ]; then
-  echo "Healthy"
-  exit 0
+
+echo "=== Linnix Health Check ==="
+
+# Check cognitod service
+if systemctl is-active --quiet linnix-cognitod; then
+  echo "✓ Cognitod service: Running"
 else
-  echo "Unhealthy (HTTP $RESPONSE)"
+  echo "✗ Cognitod service: Stopped"
   exit 1
 fi
+
+# Check cognitod API
+RESPONSE=$(curl -s -w "%{http_code}" http://localhost:3000/healthz -o /dev/null)
+if [ "$RESPONSE" -eq 200 ]; then
+  echo "✓ Cognitod API: Healthy (HTTP 200)"
+else
+  echo "✗ Cognitod API: Unhealthy (HTTP $RESPONSE)"
+  exit 1
+fi
+
+# Check LLM service (if installed)
+if systemctl list-units --full --all | grep -q "linnix-llm.service"; then
+  if systemctl is-active --quiet linnix-llm.service; then
+    echo "✓ LLM service: Running"
+
+    # Check LLM health endpoint
+    LLM_RESPONSE=$(curl -s -w "%{http_code}" http://localhost:8090/health -o /dev/null)
+    if [ "$LLM_RESPONSE" -eq 200 ]; then
+      echo "✓ LLM API: Healthy (HTTP 200)"
+    else
+      echo "⚠ LLM API: Unhealthy (HTTP $LLM_RESPONSE)"
+    fi
+  else
+    echo "✗ LLM service: Stopped"
+  fi
+else
+  echo "ℹ LLM service: Not installed"
+fi
+
+echo "=== Health check complete ==="
+exit 0
 EOF
 
 sudo chmod +x /usr/local/bin/linnix-health-check.sh
@@ -685,6 +772,89 @@ sudo reboot
 # Upgrade kernel (Amazon Linux 2023)
 sudo dnf update kernel
 sudo reboot
+```
+
+### LLM Installation Issues
+
+**Disk space full during model download:**
+```bash
+# Check available space
+df -h
+
+# Clean up
+sudo apt-get clean
+sudo journalctl --vacuum-size=100M
+
+# Or resize EBS volume (see storage recommendations above)
+```
+
+**LLM service won't start:**
+```bash
+# Check logs
+sudo journalctl -u linnix-llm.service -n 50
+
+# Common issues:
+# 1. Model file missing or corrupted
+ls -lh /var/lib/linnix/models/linnix-3b-distilled-q5_k_m.gguf
+# Should be ~2.1 GB
+
+# 2. Re-download model if corrupted
+sudo rm /var/lib/linnix/models/linnix-3b-distilled-q5_k_m.gguf
+sudo wget --continue -P /var/lib/linnix/models \
+  https://huggingface.co/parth21shah/linnix-3b-distilled/resolve/main/linnix-3b-distilled-q5_k_m.gguf
+
+# 3. Restart service
+sudo systemctl restart linnix-llm.service
+```
+
+**No AI insights being generated:**
+```bash
+# 1. Verify LLM service is healthy
+curl http://localhost:8090/health
+# Should return {"status":"ok"}
+
+# 2. Check reasoner is enabled in config
+grep -A 3 "^\[reasoner\]" /etc/linnix/linnix.toml
+# Should show: enabled = true
+
+# 3. Verify model name matches
+curl http://localhost:8090/v1/models
+# Should list "linnix-3b-distilled"
+
+# 4. Check offline mode is disabled
+grep "^offline" /etc/linnix/linnix.toml
+# Should show: offline = false
+
+# 5. Restart cognitod after config changes
+sudo systemctl restart linnix-cognitod
+
+# 6. Check metrics for ILM activity
+curl http://localhost:3000/metrics | grep ilm
+# Should show ilm_enabled:true and ilm_windows > 0
+
+# 7. Wait for insights (requires system activity)
+# Insights are generated every 30-60 seconds if EPS >= 20
+curl http://localhost:3000/insights
+```
+
+**llama.cpp build fails:**
+```bash
+# Ensure CMake is installed (version 3.10+)
+cmake --version
+
+# Ubuntu/Debian: Install cmake
+sudo apt-get install -y cmake
+
+# Amazon Linux: Use cmake3
+sudo yum install -y cmake3
+sudo ln -s /usr/bin/cmake3 /usr/bin/cmake
+
+# Ensure libcurl is installed
+sudo apt-get install -y libcurl4-openssl-dev  # Ubuntu/Debian
+sudo yum install -y libcurl-devel              # Amazon Linux
+
+# Re-run installation
+sudo ./install-llm-native.sh
 ```
 
 ---
