@@ -64,6 +64,25 @@ else
     exit 1
 fi
 
+# Check disk space (need at least 5GB for model + build artifacts)
+REQUIRED_SPACE_MB=5120  # 5GB in MB
+AVAILABLE_SPACE_MB=$(df -BM /var/lib/linnix 2>/dev/null | awk 'NR==2 {print $4}' | sed 's/M//' || df -BM / | awk 'NR==2 {print $4}' | sed 's/M//')
+
+if [ "$AVAILABLE_SPACE_MB" -lt "$REQUIRED_SPACE_MB" ]; then
+    print_error "Insufficient disk space!"
+    echo "  Required: 5GB"
+    echo "  Available: ${AVAILABLE_SPACE_MB}MB"
+    echo ""
+    echo "Please free up space or resize your disk:"
+    echo "  - Clean apt cache: sudo apt-get clean"
+    echo "  - Remove old logs: sudo journalctl --vacuum-size=100M"
+    echo "  - Resize EBS volume (AWS): Increase volume size in console, then run:"
+    echo "      sudo growpart /dev/nvme0n1 1"
+    echo "      sudo resize2fs /dev/nvme0n1p1"
+    exit 1
+fi
+print_step "Disk space check passed (${AVAILABLE_SPACE_MB}MB available)"
+
 # Install build dependencies
 print_info "Installing build dependencies..."
 if [[ "$OS_ID" == "ubuntu" ]] || [[ "$OS_ID" == "debian" ]]; then
@@ -97,9 +116,20 @@ print_step "Build dependencies installed"
 # Clone and build llama.cpp
 print_info "Building llama.cpp from source..."
 if [ -d "$LLAMA_DIR" ]; then
-    print_info "llama.cpp already exists, pulling latest changes..."
+    print_info "llama.cpp directory exists, checking if it's a git repository..."
     cd "$LLAMA_DIR"
-    git pull
+
+    # Check if it's a valid git repo
+    if git rev-parse --git-dir > /dev/null 2>&1; then
+        print_info "Pulling latest changes..."
+        git pull
+    else
+        print_info "Not a git repository, removing and re-cloning..."
+        cd /
+        rm -rf "$LLAMA_DIR"
+        git clone https://github.com/ggerganov/llama.cpp.git "$LLAMA_DIR"
+        cd "$LLAMA_DIR"
+    fi
 else
     git clone https://github.com/ggerganov/llama.cpp.git "$LLAMA_DIR"
     cd "$LLAMA_DIR"
@@ -133,6 +163,11 @@ fi
 
 # Copy binary to main llama.cpp directory for easier access
 cp "$LLAMA_DIR/build/bin/llama-server" "$LLAMA_DIR/llama-server"
+
+# Clean up build artifacts to save disk space (saves ~500MB-1GB)
+print_info "Cleaning up build artifacts to save disk space..."
+rm -rf "$LLAMA_DIR/build"
+rm -rf "$LLAMA_DIR/.git"
 
 print_step "llama.cpp built successfully"
 
