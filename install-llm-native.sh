@@ -74,6 +74,7 @@ if [[ "$OS_ID" == "ubuntu" ]] || [[ "$OS_ID" == "debian" ]]; then
         git \
         cmake \
         curl \
+        libcurl4-openssl-dev \
         wget
 elif [[ "$OS_ID" == "amzn" ]]; then
     yum groupinstall -y "Development Tools"
@@ -81,6 +82,7 @@ elif [[ "$OS_ID" == "amzn" ]]; then
         git \
         cmake3 \
         curl \
+        libcurl-devel \
         wget
     # Create cmake symlink for Amazon Linux
     if [ ! -f /usr/bin/cmake ]; then
