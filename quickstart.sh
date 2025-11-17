@@ -21,6 +21,20 @@ echo "║                                                            ║"
 echo "╚════════════════════════════════════════════════════════════╝"
 echo ""
 
+# Parse args
+AUTO_DEMO=0
+for arg in "$@"; do
+    case "$arg" in
+        --autodemo|-d)
+            AUTO_DEMO=1
+            ;;
+        --help|-h)
+            echo "Usage: $0 [--autodemo|-d]";
+            exit 0
+            ;;
+    esac
+done
+
 # Step 1: Check prerequisites
 echo -e "${BLUE}[1/6]${NC} Checking prerequisites..."
 
@@ -301,6 +315,45 @@ done
 echo ""
 echo -e "${BLUE}[6/6]${NC} Testing AI analysis..."
 
+# If requested, run an autodemo / fake-events generator so users see activity
+if [ "$AUTO_DEMO" -eq 1 ]; then
+    echo -e "${BLUE}⏱️  Autodemo enabled: starting demo scripts...${NC}"
+    mkdir -p ./logs
+    DEMO_RUN=""
+    # Look for demo scripts in repo root and scripts/ directory
+    CANDIDATES=("./scenarios/demo/demo-script.sh" "./demo_phase1_local.sh" "./demo_reasoner_with_processes.sh" "./scripts/demo_phase1_local.sh" "./scripts/demo_reasoner_with_processes.sh")
+    for c in "${CANDIDATES[@]}"; do
+        if [ -x "$c" ]; then
+            DEMO_RUN="$c"
+            break
+        elif [ -f "$c" ]; then
+            chmod +x "$c" || true
+            DEMO_RUN="$c"
+            break
+        fi
+    done
+    # As a last-resort fallback, check scripts/ directory for any demo_*.sh
+    if [ -z "$DEMO_RUN" ]; then
+        for c in ./scripts/demo_*.sh; do
+            if [ -f "$c" ]; then
+                chmod +x "$c" || true
+                DEMO_RUN="$c"
+                break
+            fi
+        done
+    fi
+
+    if [ -n "$DEMO_RUN" ]; then
+        echo "   Running demo: $DEMO_RUN (logs -> ./logs/autodemo.log)"
+        nohup bash -c "$DEMO_RUN" > ./logs/autodemo.log 2>&1 &
+        sleep 2
+        echo "   Demo started (background). Tail logs with: tail -f ./logs/autodemo.log"
+    else
+        echo -e "${YELLOW}   No demo scripts found in repo. You can run one of the demo scripts manually:${NC}"
+        echo "     ./demo_phase1_local.sh  or  ./demo_reasoner_with_processes.sh"
+    fi
+fi
+
 # Test linnix-reasoner
 if command -v cargo &> /dev/null; then
     echo ""
@@ -334,6 +387,7 @@ echo "   • View logs:        $COMPOSE_CMD logs -f"
 echo "   • Get AI insights:  curl http://localhost:3000/insights"
 echo "   • Stream events:    curl http://localhost:3000/stream"
 echo "   • Stop services:    $COMPOSE_CMD down"
+echo "   • Run demo on start: $0 --autodemo"
 echo ""
 echo -e "${GREEN}Next Steps:${NC}"
 echo "   1. Open http://localhost:3000/status in browser"
