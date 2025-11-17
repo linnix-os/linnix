@@ -82,6 +82,6 @@ Great first contributions often include:
 
 ## Licensing
 
-By contributing, you agree that your work is licensed under the repository’s Apache-2.0 license (and GPL-2.0 OR MIT for eBPF programs). Please ensure you have permission to contribute any code or assets you submit.
+By contributing, you agree that your work is licensed under the repository’s AGPL-3.0 license (and GPL-2.0 OR MIT for eBPF programs). Please ensure you have permission to contribute any code or assets you submit.
 
 Thanks again for helping build the future of AI-assisted observability! 🚀

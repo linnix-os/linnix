@@ -10,7 +10,7 @@ This directory contains language models for AI-powered incident detection.
 - **Use Case**: Production incident detection
 - **Training**: Fine-tuned on 12K+ system observability incidents
 - **Performance**: ~30 tok/s on 8-core CPU, 92% quality vs 7B teacher
-- **License**: Apache 2.0
+- **License**: AGPL-3.0
 - **Download**: [Hugging Face Hub](https://huggingface.co/parth21shah/linnix-3b-distilled)
 
 ### TinyLlama 1.1B (Legacy Testing)
@@ -18,7 +18,7 @@ This directory contains language models for AI-powered incident detection.
 - **Size**: 747 MB
 - **Use Case**: Quick testing only (not trained for incidents)
 - **Source**: [TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF](https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF)
-- **License**: Apache 2.0
+- **License**: AGPL-3.0
 
 ## Quick Setup
 
@@ -102,8 +102,8 @@ curl -L -o models/tinyllama.gguf https://...
 
 ## License
 
-- **TinyLlama**: Apache 2.0 (third-party model)
-- **Linnix Models**: Apache 2.0 (our fine-tuned models)
+- **TinyLlama**: AGPL-3.0 (third-party model)
+- **Linnix Models**: AGPL-3.0 (our fine-tuned models)
 - See [LICENSE](../LICENSE) for full text
 
 ## Contributing

@@ -310,7 +310,7 @@ See [CONTRIBUTING.md](../CONTRIBUTING.md) for development setup.
 
 ## License
 
-Apache-2.0 (open source)
+AGPL-3.0 (open source)
 
 ---
 
