@@ -23,6 +23,7 @@ endpoint = "http://127.0.0.1:8090/v1/chat/completions"
 model = "/models/linnix-3b-distilled-q5_k_m.gguf"
 window_seconds = 30
 timeout_ms = 30000
+min_eps_to_enable = 0
 
 [prometheus]
 # Prometheus metrics endpoint

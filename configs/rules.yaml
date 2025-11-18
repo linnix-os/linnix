@@ -1,21 +1,30 @@
-- name: fork_storm
+# Demo rules optimized for scenario detection
+# Using actual supported detectors
+
+- name: fork_storm_demo
+  detector: forks_per_sec
+  threshold: 10  # forks per second
+  duration: 2    # seconds
   severity: high
+  cooldown: 30
+
+- name: fork_burst_demo
   detector: fork_burst
+  threshold: 30  # total forks
   window_seconds: 5
-  threshold: 100
-  cooldown: 60
-
-- name: short_job_flood
   severity: medium
-  detector: short_job_flood
-  window_seconds: 10
-  threshold: 50
-  max_exec_duration_ms: 1000
-  cooldown: 120
+  cooldown: 30
 
-- name: runaway_tree
+- name: memory_leak_demo
+  detector: subtree_rss_mb
+  threshold: 50   # MB total RSS (lower to ensure quick detection)
+  duration: 2     # seconds
   severity: high
-  detector: runaway_tree
-  window_seconds: 10
-  threshold: 30
-  cooldown: 120
+  cooldown: 30
+
+- name: cpu_spike_demo
+  detector: subtree_cpu_pct
+  threshold: 50  # percent CPU
+  duration: 5    # seconds
+  severity: medium
+  cooldown: 30

@@ -94,6 +94,14 @@ docker-compose logs llama-server
 - Verify disk space (needs 2GB)
 - Retry: `./setup-llm.sh --force-download`
 
+**Docker Compose can't talk to Docker (`http+docker` error)?**
+- Pin Python Requests to a Compose-compatible version:  
+  ```bash
+  python3 -m pip install --user 'requests<2.32'
+  python3 -m pip install --user requests-unixsocket
+  ```
+- Re-run `./setup-llm.sh`
+
 ## What's Next?
 
 1. **Explore the Dashboard**: Click around, watch the real-time updates

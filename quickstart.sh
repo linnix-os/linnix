@@ -4,396 +4,284 @@
 
 set -e
 
-# Colors for output
+# --- Configuration ---
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Banner
-echo ""
-echo "╔════════════════════════════════════════════════════════════╗"
-echo "║                                                            ║"
-echo "║   🚀  Linnix Quick Start                                   ║"
-echo "║   eBPF Monitoring + AI Incident Detection                 ║"
-echo "║                                                            ║"
-echo "╚════════════════════════════════════════════════════════════╝"
-echo ""
+# --- Globals ---
+COMPOSE_CMD=""
+AUTO_DEMO=1
+ACTION="start"
 
-# Parse args
-AUTO_DEMO=0
-for arg in "$@"; do
-    case "$arg" in
-        --autodemo|-d)
-            AUTO_DEMO=1
-            ;;
-        --help|-h)
-            echo "Usage: $0 [--autodemo|-d]";
-            exit 0
-            ;;
-    esac
-done
+# --- Functions ---
 
-# Step 1: Check prerequisites
-echo -e "${BLUE}[1/6]${NC} Checking prerequisites..."
+# Cleanup temporary files on exit
+cleanup() {
+  # Add any temp files here if needed in the future
+  :
+}
 
-# Check Docker
-if ! command -v docker &> /dev/null; then
-    echo -e "${RED}❌ Docker not found${NC}"
-    echo "   Install Docker: https://docs.docker.com/get-docker/"
-    exit 1
-fi
-
-# Check Docker Compose
-if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null 2>&1; then
-    echo -e "${RED}❌ Docker Compose not found${NC}"
-    echo "   Install Docker Compose: https://docs.docker.com/compose/install/"
-    exit 1
-fi
-
-# Determine compose command
-if docker compose version &> /dev/null 2>&1; then
-    COMPOSE_CMD="docker compose"
-else
-    COMPOSE_CMD="docker-compose"
-fi
-
-echo -e "${GREEN}✅ Docker and Compose installed${NC}"
-
-# Ensure docker-compose (v1) can talk to the local Docker socket
-if [ "$COMPOSE_CMD" = "docker-compose" ]; then
-    echo "   Detected docker-compose v1 (Python CLI)"
-    if ! command -v python3 > /dev/null 2>&1; then
-        echo -e "${YELLOW}⚠️  python3 not found. Install python3 to let docker-compose talk to Docker (${NC}sudo apt install python3${YELLOW}).${NC}"
-        exit 1
-    fi
-
-    if ! python3 -m pip --version > /dev/null 2>&1; then
-        echo -e "${RED}❌ pip for python3 not found.${NC}"
-        echo "   Install pip: sudo apt install python3-pip"
-        exit 1
-    fi
-
-    if python3 - <<'PY' > /dev/null 2>&1
-import re
-import sys
-from itertools import zip_longest
-try:
-    import requests
-except ModuleNotFoundError:
-    sys.exit(1)
-
-def needs_pin(current, ceiling="2.32.0"):
-    def parse(v):
-        nums = [int(x) for x in re.findall(r'\d+', v)]
-        return nums
-
-    cur = parse(current)
-    cap = parse(ceiling)
-    for a, b in zip_longest(cur, cap, fillvalue=0):
-        if a > b:
-            return True
-        if a < b:
-            return False
-    return True  # equal
-
-sys.exit(0 if needs_pin(requests.__version__) else 1)
-PY
-    then
-        echo -e "${YELLOW}   ⚠️ requests >= 2.32 detected (Compose v1 incompatibility). Pinning to <2.32...${NC}"
-        if python3 -m pip install --user 'requests<2.32' > /dev/null; then
-            echo -e "${GREEN}   ✅ requests pinned to a Compose-compatible version${NC}"
-        else
-            echo -e "${RED}❌ Failed to pin requests automatically.${NC}"
-            echo "   Try: python3 -m pip install --user 'requests<2.32'"
-            exit 1
-        fi
-    else
-        echo -e "${GREEN}   ✅ requests version compatible${NC}"
-    fi
-
-    if python3 - <<'PY' > /dev/null 2>&1
-import importlib
-import sys
-sys.exit(0 if importlib.util.find_spec("requests_unixsocket") else 1)
-PY
-    then
-        echo -e "${GREEN}   ✅ requests-unixsocket already installed${NC}"
-    else
-        echo -e "${YELLOW}   📦 Installing requests-unixsocket so docker-compose can reach Docker...${NC}"
-        if python3 -m pip install --user requests-unixsocket; then
-            echo -e "${GREEN}   ✅ Installed requests-unixsocket${NC}"
-        else
-            echo -e "${RED}❌ Failed to install requests-unixsocket automatically.${NC}"
-            echo "   Try: python3 -m pip install --user requests-unixsocket"
-            exit 1
-        fi
-    fi
-fi
-
-# Check if running as root or in docker group
-if ! docker ps &> /dev/null; then
-    echo -e "${YELLOW}⚠️  Docker requires elevated permissions${NC}"
-    echo "   Either run with sudo or add your user to docker group:"
-    echo "   $ sudo usermod -aG docker \$USER && newgrp docker"
-    exit 1
-fi
-
-# Check kernel version for eBPF
-KERNEL_VERSION=$(uname -r | cut -d. -f1)
-if [ "$KERNEL_VERSION" -lt 5 ]; then
-    echo -e "${YELLOW}⚠️  Kernel version $(uname -r) detected${NC}"
-    echo "   eBPF works best on Linux 5.0+. You may experience limited functionality."
-    read -p "   Continue anyway? (y/N) " -n 1 -r
+# Display a banner for the script
+banner() {
     echo ""
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    echo "╔════════════════════════════════════════════════════════════╗"
+    echo "║                                                            ║"
+    echo "║   🚀  Linnix Quick Start                                   ║"
+    echo "║   eBPF Monitoring + AI Incident Detection                 ║"
+    echo "║                                                            ║"
+    echo "╚════════════════════════════════════════════════════════════╝"
+    echo ""
+}
+
+# Parse command-line arguments
+parse_args() {
+    for arg in "$@"; do
+        case "$arg" in
+            --autodemo|-d)
+                AUTO_DEMO=1
+                ;;
+            --no-autodemo|--no-demo)
+                AUTO_DEMO=0
+                ;;
+            stop|down)
+                ACTION="stop"
+                ;;
+            --help|-h)
+                echo "Usage: $0 [start|stop|--autodemo|-d|--no-autodemo|--help|-h]"
+                echo "  start (default):    Start services and run quickstart."
+                echo "  stop:               Stop all running Linnix services."
+                echo "  --autodemo, -d:     Ensure the auto-demo runs after setup (default)."
+                echo "  --no-autodemo:      Skip running the auto-demo workload."
+                exit 0
+                ;;
+        esac
+    done
+}
+
+# Check for all necessary prerequisites
+check_prerequisites() {
+    echo -e "${BLUE}[1/5]${NC} Checking prerequisites..."
+
+    # Check Docker
+    if ! command -v docker &> /dev/null; then
+        echo -e "${RED}❌ Docker not found. Please install it: https://docs.docker.com/get-docker/${NC}"
         exit 1
     fi
-else
-    echo -e "${GREEN}✅ Kernel $(uname -r) supports eBPF${NC}"
-fi
 
+    # Check Docker Compose
+    if docker compose version &> /dev/null; then
+        COMPOSE_CMD="docker compose"
+    elif command -v docker-compose &> /dev/null; then
+        COMPOSE_CMD="docker-compose"
+        echo -e "${YELLOW}⚠️  Detected legacy 'docker-compose' (V1). Upgrade to 'docker compose' (V2) for better stability.${NC}"
+    else
+        echo -e "${RED}❌ Docker Compose not found. Please install it: https://docs.docker.com/compose/install/${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}✅ Docker and Docker Compose are installed.${NC}"
 
-if [ ! -d "/sys/kernel/btf" ]; then
-    echo -e "${YELLOW}⚠️  BTF not found at /sys/kernel/btf${NC}"
-    echo "   Cognitod will run in degraded mode (no per-process CPU/mem metrics)"
-    echo "   To enable BTF: Upgrade kernel or install linux-headers"
-else
-    echo -e "${GREEN}✅ BTF available for dynamic telemetry${NC}"
-fi
+    # Check Docker permissions
+    if ! docker ps &> /dev/null; then
+        echo -e "${RED}❌ Docker permissions error. Your user cannot connect to the Docker daemon.${NC}"
+        echo "   Fix by running: sudo usermod -aG docker $USER && newgrp docker"
+        exit 1
+    fi
+    echo -e "${GREEN}✅ Docker permissions are correct.${NC}"
 
-# Step 2: Download demo model
-echo ""
-echo -e "${BLUE}[2/6]${NC} Checking for demo model..."
+    # Check kernel version and BTF support
+    local kernel_version
+    kernel_version=$(uname -r)
+    if [[ "$(echo "$kernel_version" | cut -d. -f1)" -lt 5 ]]; then
+        echo -e "${YELLOW}⚠️  Kernel version $kernel_version is older than 5.0. eBPF features may be limited.${NC}"
+    else
+        echo -e "${GREEN}✅ Kernel version $kernel_version supports eBPF.${NC}"
+    fi
 
-MODEL_PATH="./models/linnix-3b-distilled-q5_k_m.gguf"
-MODEL_SIZE="2.1GB"
+    if [ ! -d "/sys/kernel/btf" ]; then
+        echo -e "${YELLOW}⚠️  BTF not found. Linnix will run in degraded mode (no per-process CPU/mem metrics).${NC}"
+        echo "   To enable BTF, consider upgrading your kernel or installing linux-headers."
+    else
+        echo -e "${GREEN}✅ BTF is available for dynamic telemetry.${NC}"
+    fi
+}
 
-if [ -f "$MODEL_PATH" ]; then
-    echo -e "${GREEN}✅ Model already downloaded${NC}"
-else
-    mkdir -p ./models
-    echo -e "${YELLOW}📥 Demo model not found. Will be downloaded on first container start.${NC}"
-    echo "   Size: $MODEL_SIZE (may take 2-5 minutes)"
-    echo "   Alternatively, download manually:"
-    echo "   $ wget https://github.com/linnix-os/linnix/releases/download/v0.1.0/linnix-3b-distilled-q5_k_m.gguf -P ./models"
-fi
+# Check for the LLM model file
+check_model() {
+    echo -e "\n${BLUE}[2/5]${NC} Checking for demo model..."
+    local model_path="./models/linnix-3b-distilled-q5_k_m.gguf"
+    if [ -f "$model_path" ]; then
+        echo -e "${GREEN}✅ Model already downloaded.${NC}"
+    else
+        mkdir -p ./models
+        echo -e "${YELLOW}📥 Demo model not found. It will be downloaded when containers start (2.1GB).${NC}"
+    fi
+}
 
-# Step 3: Create default config if missing
-echo ""
-echo -e "${BLUE}[3/6]${NC} Setting up configuration..."
-
-mkdir -p ./configs
-
-if [ ! -f "./configs/linnix.toml" ]; then
-    cat > ./configs/linnix.toml << 'EOF'
+# Create a default configuration if one doesn't exist
+setup_config() {
+    echo -e "\n${BLUE}[3/5]${NC} Setting up configuration..."
+    mkdir -p ./configs
+    if [ ! -f "./configs/linnix.toml" ]; then
+        cat > ./configs/linnix.toml << 'EOF'
 # Linnix Configuration
-# Documentation: https://docs.linnix.io/configuration
-
 [runtime]
-# Offline mode: disable external HTTP requests (Slack, PagerDuty, etc.)
 offline = false
-
 [telemetry]
-# Sample interval for CPU/memory metrics (milliseconds)
 sample_interval_ms = 1000
-
-# Event retention window (seconds)
 retention_seconds = 60
-
 [probes]
-# Page fault tracing (high overhead - disabled by default)
 enable_page_faults = false
-
 [reasoner]
-# AI-powered incident detection
 enabled = true
 endpoint = "http://llama-server:8090/v1/chat/completions"
 model = "linnix-3b-distilled"
 window_seconds = 30
 timeout_ms = 30000
-
+min_eps_to_enable = 0
 [prometheus]
-# Prometheus metrics endpoint
 enabled = true
 EOF
-    echo -e "${GREEN}✅ Created default config at ./configs/linnix.toml${NC}"
-else
-    echo -e "${GREEN}✅ Using existing config${NC}"
-fi
+        echo -e "${GREEN}✅ Created default config at ./configs/linnix.toml${NC}"
+    else
+        echo -e "${GREEN}✅ Using existing config file.${NC}"
+    fi
 
-# Step 4: Pull/build Docker images
-echo ""
-echo -e "${BLUE}[4/6]${NC} Starting Docker containers..."
-echo "   This will:"
-echo "   - Pull cognitod and llama-cpp images (or build if needed)"
-echo "   - Download demo model (2.1GB) if not present"
-echo "   - Start monitoring services"
-echo ""
-
-$COMPOSE_CMD up -d || {
-    echo -e "${YELLOW}⚠️  Compose failed on first attempt; attempting recovery...${NC}"
-    LAST_ERR=$(mktemp)
-    if ! $COMPOSE_CMD up -d 2>"$LAST_ERR"; then
-        if grep -q "ContainerConfig" "$LAST_ERR" || grep -q "KeyError" "$LAST_ERR"; then
-            echo -e "   Detected ContainerConfig KeyError from docker-compose. Trying to remove LLM image and retry..."
-            if sudo docker image rm -f ghcr.io/ggerganov/llama.cpp:server > /dev/null 2>&1; then
-                echo "   Removed stale LLM image"
-            fi
-            if $COMPOSE_CMD up -d; then
-                echo -e "${GREEN}✅ Compose started after removing LLM image${NC}"
-                rm -f "$LAST_ERR"
-            else
-                echo -e "${YELLOW}⚠️  Compose still failing. Falling back to manual LLM start and partial compose.${NC}"
-                LLM_MODEL_PATH="$(pwd)/models/linnix-3b-distilled-q5_k_m.gguf"
-                echo "   Starting llama-server manually (docker run)..."
-                sudo docker run -d --name linnix-llm --restart unless-stopped \
-                    -v "$(pwd)/models:/models:ro" -p 8090:8090 ghcr.io/ggerganov/llama.cpp:server \
-                    --host 0.0.0.0 --port 8090 -m /models/$(basename "$LLM_MODEL_PATH") \
-                    --alias linnix-3b-distilled --ctx-size 4096 -t 4 --log-disable || true
-                sleep 2
-                echo "   Bringing up remaining services (cognitod, dashboard) via compose..."
-                if $COMPOSE_CMD up -d cognitod dashboard; then
-                    echo -e "${GREEN}✅ Remaining services started${NC}"
-                else
-                    echo -e "${RED}❌ Failed to start remaining services via compose.${NC}"
-                    echo "   Inspect compose output or try 'docker compose up -d' if available."
-                    echo "   Last compose error:";
-                    sed -n '1,200p' "$LAST_ERR" || true
-                    rm -f "$LAST_ERR"
-                    exit 1
-                fi
-            fi
+    local demo_rules_src="./demo-rules.yaml"
+    local rules_dest="./configs/rules.yaml"
+    if [ -f "$demo_rules_src" ]; then
+        if [ -f "$rules_dest" ] && cmp -s "$demo_rules_src" "$rules_dest" >/dev/null 2>&1; then
+            echo -e "${GREEN}✅ Demo rules already applied at $rules_dest.${NC}"
         else
-            echo -e "${RED}❌ docker-compose failed with an unexpected error.${NC}"
-            echo "   Last compose output:";
-            sed -n '1,200p' "$LAST_ERR" || true
-            rm -f "$LAST_ERR"
+            cp "$demo_rules_src" "$rules_dest"
+            echo -e "${GREEN}✅ Applied demo rules from $demo_rules_src → $rules_dest.${NC}"
+        fi
+    else
+        echo -e "${YELLOW}⚠️  Demo rules file $demo_rules_src not found. Skipping rules sync.${NC}"
+    fi
+}
+
+# Start all Docker containers
+start_services() {
+    echo -e "\n${BLUE}[4/5]${NC} Starting Docker containers..."
+    echo "   This will pull required images and start all services."
+    if ! $COMPOSE_CMD up -d; then
+        echo -e "${RED}❌ Docker Compose failed to start.${NC}"
+        echo "   Please check the logs for errors:"
+        $COMPOSE_CMD logs --tail=50
+        exit 1
+    fi
+}
+
+# Wait for services to become healthy
+wait_for_health() {
+    echo -e "\n${BLUE}[5/5]${NC} Waiting for services to become healthy..."
+    
+    # Wait for cognitod
+    echo -n "   Cognitod: "
+    for i in {1..30}; do
+        if curl -sf http://localhost:3000/healthz > /dev/null; then
+            echo -e "${GREEN}✅ Running${NC}"
+            break
+        fi
+        echo -n "." && sleep 1
+        if [ $i -eq 30 ]; then
+            echo -e "${RED}❌ Timeout. Check logs: $COMPOSE_CMD logs cognitod${NC}"
             exit 1
+        fi
+    done
+
+    # Wait for llama-server
+    echo -n "   LLM Server: "
+    for i in {1..180}; do # Increased timeout for model download
+        if curl -sf http://localhost:8090/health > /dev/null; then
+            echo -e "${GREEN}✅ Running${NC}"
+            break
+        fi
+        echo -n "." && sleep 1
+        if [ $i -eq 180 ]; then
+            echo -e "${RED}❌ Timeout. Check logs: $COMPOSE_CMD logs llama-server${NC}"
+            exit 1
+        fi
+    done
+}
+
+# Run the automated demo workload
+run_demo() {
+    if [ "$AUTO_DEMO" -eq 1 ]; then
+        echo -e "\n${BLUE}⏱️  Auto-demo enabled, starting workload...${NC}"
+        local demo_script="./scenarios/demo/demo-script.sh"
+        if [ -f "$demo_script" ]; then
+            mkdir -p ./logs
+            nohup bash "$demo_script" > ./logs/autodemo.log 2>&1 &
+            echo "   Demo started in the background. Logs: tail -f ./logs/autodemo.log"
+        else
+            echo -e "${YELLOW}   Demo script not found at $demo_script. Skipping.${NC}"
         fi
     fi
 }
 
-# Step 5: Wait for services to be healthy
-echo ""
-echo -e "${BLUE}[5/6]${NC} Waiting for services to start..."
-
-# Wait for cognitod
-echo -n "   Cognitod: "
-for i in {1..30}; do
-    if curl -sf http://localhost:3000/healthz > /dev/null 2>&1; then
-        echo -e "${GREEN}✅ Running${NC}"
-        break
-    fi
-    echo -n "."
-    sleep 1
-    if [ $i -eq 30 ]; then
-        echo -e "${RED}❌ Timeout${NC}"
-        echo "   Check logs: $COMPOSE_CMD logs cognitod"
-        exit 1
-    fi
-done
-
-# Wait for llama-server (may take longer due to model download)
-echo -n "   LLM Server: "
-for i in {1..120}; do
-    if curl -sf http://localhost:8090/health > /dev/null 2>&1; then
-        echo -e "${GREEN}✅ Running${NC}"
-        break
-    fi
-    echo -n "."
-    sleep 1
-    if [ $i -eq 120 ]; then
-        echo -e "${RED}❌ Timeout${NC}"
-        echo "   Check logs: $COMPOSE_CMD logs llama-server"
-        exit 1
-    fi
-done
-
-# Step 6: Success!
-echo ""
-echo -e "${BLUE}[6/6]${NC} Testing AI analysis..."
-
-# If requested, run an autodemo / fake-events generator so users see activity
-if [ "$AUTO_DEMO" -eq 1 ]; then
-    echo -e "${BLUE}⏱️  Autodemo enabled: starting demo scripts...${NC}"
-    mkdir -p ./logs
-    DEMO_RUN=""
-    # Look for demo scripts in repo root and scripts/ directory
-    CANDIDATES=("./scenarios/demo/demo-script.sh" "./demo_phase1_local.sh" "./demo_reasoner_with_processes.sh" "./scripts/demo_phase1_local.sh" "./scripts/demo_reasoner_with_processes.sh")
-    for c in "${CANDIDATES[@]}"; do
-        if [ -x "$c" ]; then
-            DEMO_RUN="$c"
-            break
-        elif [ -f "$c" ]; then
-            chmod +x "$c" || true
-            DEMO_RUN="$c"
-            break
-        fi
-    done
-    # As a last-resort fallback, check scripts/ directory for any demo_*.sh
-    if [ -z "$DEMO_RUN" ]; then
-        for c in ./scripts/demo_*.sh; do
-            if [ -f "$c" ]; then
-                chmod +x "$c" || true
-                DEMO_RUN="$c"
-                break
-            fi
-        done
-    fi
-
-    if [ -n "$DEMO_RUN" ]; then
-        echo "   Running demo: $DEMO_RUN (logs -> ./logs/autodemo.log)"
-        nohup bash -c "$DEMO_RUN" > ./logs/autodemo.log 2>&1 &
-        sleep 2
-        echo "   Demo started (background). Tail logs with: tail -f ./logs/autodemo.log"
-    else
-        echo -e "${YELLOW}   No demo scripts found in repo. You can run one of the demo scripts manually:${NC}"
-        echo "     ./demo_phase1_local.sh  or  ./demo_reasoner_with_processes.sh"
-    fi
-fi
-
-# Test linnix-reasoner
-if command -v cargo &> /dev/null; then
+# Display a summary of commands and next steps
+show_summary() {
     echo ""
-    echo "Running AI analysis (this may take 10-15 seconds)..."
-    export LLM_ENDPOINT="http://localhost:8090/v1/chat/completions"
-    export LLM_MODEL="linnix-3b-distilled"
-    cargo run --release -p linnix-reasoner 2>/dev/null || {
-        echo -e "${YELLOW}⚠️  Rust not installed. Run reasoner with Docker:${NC}"
-        echo "   $ docker run --rm --network=host linnixos/linnix-cli linnix-reasoner"
-    }
-else
-    echo -e "${YELLOW}⚠️  Rust not installed. Skipping reasoner test.${NC}"
-fi
+    echo "╔════════════════════════════════════════════════════════════╗"
+    echo "║                                                            ║"
+    echo "║   🎉  Linnix is running!                                   ║"
+    echo "║                                                            ║"
+    echo "╚════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo -e "${GREEN}Services:${NC}"
+    echo "   • Dashboard & API:        http://localhost:3000"
+    echo "   • LLM Server:               http://localhost:8090"
+    echo "   • Prometheus Metrics:       http://localhost:3000/metrics/prometheus"
+    echo ""
+    echo -e "${GREEN}Quick Commands:${NC}"
+    echo "   • View status:              $COMPOSE_CMD ps"
+    echo "   • View logs:                $COMPOSE_CMD logs -f"
+    echo "   • Get AI insights:          curl http://localhost:3000/insights | jq"
+    echo "   • Stream raw events:        curl -N http://localhost:3000/stream"
+    echo "   • Stop services:            ./quickstart.sh stop"
+    echo ""
+}
 
-# Success message
-echo ""
-echo "╔════════════════════════════════════════════════════════════╗"
-echo "║                                                            ║"
-echo "║   🎉  Linnix is running!                                   ║"
-echo "║                                                            ║"
-echo "╚════════════════════════════════════════════════════════════╝"
-echo ""
-echo -e "${GREEN}Services:${NC}"
-echo "   • Cognitod (monitoring):    http://localhost:3000"
-echo "   • LLM Server:               http://localhost:8090"
-echo "   • Prometheus metrics:       http://localhost:3000/metrics/prometheus"
-echo ""
-echo -e "${GREEN}Quick Commands:${NC}"
-echo "   • View status:      $COMPOSE_CMD ps"
-echo "   • View logs:        $COMPOSE_CMD logs -f"
-echo "   • Get AI insights:  curl http://localhost:3000/insights"
-echo "   • Stream events:    curl http://localhost:3000/stream"
-echo "   • Stop services:    $COMPOSE_CMD down"
-echo "   • Run demo on start: $0 --autodemo"
-echo ""
-echo -e "${GREEN}Next Steps:${NC}"
-echo "   1. Open http://localhost:3000/status in browser"
-echo "   2. Try: curl http://localhost:3000/insights | jq"
-echo "   3. Install CLI: cargo install --path linnix-cli"
-echo "   4. Read docs: https://docs.linnix.io"
-echo ""
-echo -e "${BLUE}Time to first insight: $(date +%s) seconds${NC}"
-echo ""
+# Stop and remove all services
+stop_services() {
+    echo -e "${BLUE}Stopping all Linnix services...${NC}"
+    if ! $COMPOSE_CMD down; then
+        echo -e "${RED}❌ Failed to stop services. Please check Docker.${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}✅ Services stopped and removed.${NC}"
+}
+
+# --- Main Execution ---
+main() {
+    trap cleanup EXIT
+    
+    parse_args "$@"
+    
+    # Determine compose command early for stop action
+    if docker compose version &> /dev/null; then
+        COMPOSE_CMD="docker compose"
+    else
+        COMPOSE_CMD="docker-compose"
+    fi
+
+    if [ "$ACTION" = "stop" ]; then
+        stop_services
+        exit 0
+    fi
+
+    banner
+    check_prerequisites
+    check_model
+    setup_config
+    start_services
+    wait_for_health
+    run_demo
+    show_summary
+}
+
+main "$@"
