@@ -74,6 +74,7 @@ videos/
 .env
 .env.*
 .env.local
+!.env*.example
 
 # Database
 *.db
