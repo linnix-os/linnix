@@ -17,8 +17,8 @@
 
 - name: memory_leak_demo
   detector: subtree_rss_mb
-  threshold: 100  # MB total RSS
-  duration: 5     # seconds
+  threshold: 50   # MB total RSS (lower to ensure quick detection)
+  duration: 2     # seconds
   severity: high
   cooldown: 30
 
