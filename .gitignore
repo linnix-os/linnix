@@ -1,5 +1,6 @@
 # Rust build artifacts
 /target/
+**/target/
 **/*.rs.bk
 *.pdb
 
@@ -21,6 +22,7 @@ Thumbs.db
 *.log
 *.log.*
 nohup.out
+logs/
 
 # Enterprise/Training artifacts (keep in linnix-enterprise repo)
 h200-distilled-model/
@@ -56,101 +58,22 @@ env/
 .ipynb_checkpoints/
 notebooks/*.ipynb  # Move training notebooks to enterprise
 
-# Training/Enterprise documentation
-H200_DISTILLATION_SUCCESS_REPORT.md
-docs/colab-gpu-setup.md
-docs/upload-lora-to-runpod.md
-docs/README-PERFORMANCE.md
-docs/distillation-guide.md
-scripts/connect_runpod_vscode.sh
-scripts/convert_7b_to_gguf.sh
-scripts/merge_lora_on_runpod.py
-scripts/migrate_to_larger_pod.sh
-scripts/migrate_to_enterprise.sh
-scripts/runpod_ssh_setup.sh
-scripts/runpod_upgrade_analysis.sh
-scripts/setup_colab_endpoint.sh
-scripts/test_gguf_performance.sh
-scripts/upload_finetuned_to_runpod.sh
-scripts/deploy_distilled_model.sh
-test_gguf_model.py
-test_h200_model.py
-benchmark_distilled_model.sh
-serve_distilled_model.sh
-.env.distilled
-
-# Internal documentation (development notes, not for release)
-ROADMAP.md
-MIGRATION_PLAN.md
-MIGRATION_EXECUTION_REPORT.md
-FEATURE_DISTRIBUTION.md
-DISTILLED_MODEL_INTEGRATION.md
-PROCESS_NAMES_ENHANCEMENT.md
-QUICKSTART_PROCESS_NAMES.md
-DOCKER_TEST*.md
-H200_*.md
-DOCKER_BUILD_SUCCESS.md
-DOCKER_QUICKSTART_SUMMARY.md
-HF_MODEL_CARD.md
-DEMOCRATIZATION_PLAN.md
-SIMPLIFICATION_PLAN.md
-PERFORMANCE.md
-
-# Internal prompts and guides
-.github/prompts/
-ultrathink.prompt.md
-
-# Claude Code Skills (personal development workflows)
+# Workflow files (internal development/marketing materials)
+_workflow/
 .claude/
 
-# Debug/temporary scripts
-debug_llm_prompt.sh
-show_process_format.sh
-test_process_output.sh
-test_reasoner_integration.sh
-docker-push-manual.sh
+# Videos and media
+videos/
 
-# Redundant scripts (consolidated into primary versions)
-setup-llm.sh          # Merged into quickstart.sh
-test-setup.sh         # Replaced by quick-test.sh
-build-image.sh        # Replaced by build-and-push-images.sh
-build-ghcr.sh         # Replaced by build-and-push-images.sh
-push-ghcr.sh          # Replaced by build-and-push-images.sh
-# Internal development scripts
-demo_reasoner_with_processes.sh
-explain_ebpf_overhead.sh
-test_ebpf_overhead.sh
-scripts/connect_runpod_vscode.sh
-scripts/convert_7b_to_gguf.sh
-scripts/deploy_distilled_model.sh
-scripts/merge_lora_on_runpod.py
-scripts/migrate_to_enterprise.sh
-scripts/migrate_to_larger_pod.sh
-scripts/runpod_ssh_setup.sh
-scripts/runpod_upgrade_analysis.sh
-scripts/setup_colab_endpoint.sh
-scripts/test_gguf_performance.sh
-scripts/upload_finetuned_to_runpod.sh
+# Backup files
+*.backup
+*.bak
+*~
 
-# Release notes (use GitHub releases instead)
-RELEASE_NOTES_*.md
-
-# Internal documentation directory (most content is internal/proprietary)
-docs/*
-# BUT keep public images
-!docs/images/
-docs/images/README.md
-# Allow selected public docs
-!docs/COMPARISON.md
-!docs/HOW_IT_WORKS.md
-!docs/FAQ.md
-!docs/AWS_EC2_DEPLOYMENT.md
-
-# Environment files with secrets
+# Environment files (user-specific configuration)
 .env
+.env.*
 .env.local
-.env.*.local
-!.env.distilled  # Keep demo config
 
 # Database
 *.db
@@ -163,118 +86,14 @@ notebooks/
 # Model files (download separately)
 models/*.gguf
 models/*.bin
-LAUNCH_PLAN.md
-LAUNCH_ANNOUNCEMENT.md
-linnix-demo.cast
-scripts/convert_demo_to_gif.sh
-scripts/demo_sequence.sh
-scripts/quick_demo_gif.sh
-scripts/record_demo_terminalizer.sh
-scripts/record_demo.sh
-scripts/generate_architecture_diagram.py
-scripts/generate_logo.py
-scripts/generate_og_image.py
-RECORDING_INSTRUCTIONS.md
 
-# YouTube video creation files
-videos/
-scripts/generate_youtube_thumbnail.py
-scripts/record_demo_video.sh
-scripts/demo_video_sequence.sh
-scripts/convert_demo_to_mp4.sh
-scripts/youtube_description.txt
-docs/VIDEO_CREATION_GUIDE.md
-docs/GITHUB_SETUP.md
-docs/SHOW_HN_POST.md
-README.md.backup
-BROKEN_LINKS_REPORT.md
-scripts/fix_broken_links.sh
-social_posts/linkedin_post_FINAL.txt
-social_posts/linkedin_post.md
-social_posts/PRE_POST_CHECKLIST.md
-social_posts/READY_TO_POST.md
-social_posts/reddit_posts.md
-social_posts/YOUTUBE_UPLOAD_GUIDE.md
-tools/tectonic
-tools/pandoc-3.5/bin/pandoc
-tools/pandoc-3.5/bin/pandoc-lua
-tools/pandoc-3.5/bin/pandoc-server
-tools/pandoc-3.5/share/man/man1/pandoc-lua.1.gz
-tools/pandoc-3.5/share/man/man1/pandoc-server.1.gz
-tools/pandoc-3.5/share/man/man1/pandoc.1.gz
-social_posts/PRE_LAUNCH_VERIFICATION_COMPLETE.md
-social_posts/r_devops_post.md
-social_posts/r_linux_post_improved.md
-social_posts/SHOW_HN_LAUNCH_PLAN.md
-DISTRIBUTION_STRATEGY.md
-FIXED_DOCKER_COMMANDS.md
-HN_POST_CLEAN.md
-HN_POST_FINAL.md
-HN_POST_PG_STYLE.md
-HN_POST_READY.md
-HN_RESPONSE_VIBE_CODE.md
-MONETIZATION_STRATEGY.md
-NEXT_STEPS_TO_1000.md
-READY_TO_LAUNCH.md
-SELFHOSTED_FEATURES.md
-youtube/quickstart-video/assemble-video.sh
-youtube/quickstart-video/auto-generate.sh
-youtube/quickstart-video/DEMO_COMMANDS.md
-youtube/quickstart-video/EASIEST_PATH.md
-youtube/quickstart-video/FINAL_STEPS.md
-youtube/quickstart-video/generate-voiceover.sh
-youtube/quickstart-video/improve-voiceover.md
-youtube/quickstart-video/MAKE_VIDEO_NOW.md
-youtube/quickstart-video/README_FINAL.md
-youtube/quickstart-video/README_VIDEO_COMPLETE.md
-youtube/quickstart-video/README.md
-youtube/quickstart-video/RECORD_NOW.md
-youtube/quickstart-video/record-demo.sh
-youtube/quickstart-video/RECORDING_GUIDE.md
-youtube/quickstart-video/SCRIPT.md
-youtube/quickstart-video/START_HERE.md
-youtube/quickstart-video/THUMBNAIL_DESIGN.md
-youtube/quickstart-video/UPLOAD_NOW.md
-youtube/quickstart-video/YOUTUBE_DESCRIPTION_FINAL.md
-youtube/quickstart-video/YOUTUBE_DESCRIPTION.md
-youtube/quickstart-video/output/final-video-original.mp4
-youtube/quickstart-video/output/final-video.mp4
-youtube/quickstart-video/output/VIDEO_ASSEMBLY.md
-youtube/quickstart-video/output/voiceover-script.txt
-youtube/quickstart-video/output/audio/voiceover_new_fast.m4a
-youtube/quickstart-video/output/audio/voiceover_new.mp3
-youtube/quickstart-video/output/audio/voiceover.mp3
-youtube/quickstart-video/youtube/quickstart-video/auto-generate.sh
-youtube/quickstart-video/youtube/quickstart-video/EASIEST_PATH.md
-youtube/quickstart-video/youtube/quickstart-video/output/VIDEO_ASSEMBLY.md
-youtube/quickstart-video/youtube/quickstart-video/output/voiceover-script.txt
-youtube/quickstart-video/youtube/quickstart-video/output/audio/voiceover.mp3
-scenarios/demo/record-demo.sh
-ALERT_ARCHITECTURE.txt
-ALERT_CODE_SNIPPETS.md
-ALERT_INTEGRATION_ANALYSIS.md
-ALERT_INTEGRATION_INDEX.md
-ALERT_INTEGRATION_SUMMARY.txt
-APPRISE_INTEGRATION_PLAN.md
-APPRISE_RESPONSE.md
-UI_DASHBOARD_PLAN.md
-UI_DASHBOARD_TEST_PLAN.md
-UI_DASHBOARD_TEST_RESULTS.md
-youtube/quickstart-video/output/final-video.mp3
-youtube/quickstart-video/output/final-video1.mp4
-PHASE2_SUMMARY.md
-ssh/linnix-ssh.pem
-AI_SLOP_CLEANUP_SUMMARY.md
-fix-license-inconsistency.sh
-linnix-opensource.code-workspace
-NEWSLETTER_SUBMISSIONS.md
-NO_BRAINER_IMPLEMENTATION.md
-PR_DESCRIPTION.md
-README_NEW.md
-README_OLD.md
-REDDIT_POSTS_FIXED.md
-SOCIAL_MEDIA_POSTS.md
-TESTIMONIAL_OUTREACH.md
-TUTORIAL_ARTICLE.md
-TWITTER_THREAD_OPTIONS.md
-TWITTER_THREAD_SLOP_FREE.md
+# Internal documentation directory (most content is internal/proprietary)
+docs/*
+# BUT keep public images
+!docs/images/
+docs/images/README.md
+# Allow selected public docs
+!docs/COMPARISON.md
+!docs/HOW_IT_WORKS.md
+!docs/FAQ.md
+!docs/AWS_EC2_DEPLOYMENT.md
