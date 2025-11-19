@@ -76,24 +76,13 @@ impl ContextStore {
             let mut live = self.get_live_map();
             match event.event_type {
                 0 => {
-                    // Exec: enrich tags before inserting
-                    if event.tags.is_empty()
-                        && let Some(mut tags) = derive_cgroup_tags(event.pid)
-                    {
-                        event.tags.append(&mut tags);
-                    }
+                    // Exec
                     event.set_exit_time(None);
                     live.insert(event.pid, event.clone());
                 }
                 1 => {
+                    // Fork
                     event.set_exit_time(None);
-                    // Fork: only compute tags if we're inserting this PID for the first time
-                    if !live.contains_key(&event.pid)
-                        && event.tags.is_empty()
-                        && let Some(mut tags) = derive_cgroup_tags(event.pid)
-                    {
-                        event.tags.append(&mut tags);
-                    }
                     live.entry(event.pid).or_insert_with(|| event.clone());
                 }
                 2 => {
@@ -330,74 +319,6 @@ impl ContextStore {
             }
         }
     }
-}
-
-/// Extract lightweight container/cgroup tags for a PID from /proc/<pid>/cgroup.
-/// Best-effort and zero-cost on failure; returns Some(nonempty) on success.
-fn derive_cgroup_tags(pid: u32) -> Option<Vec<String>> {
-    use std::fs;
-    let path = format!("/proc/{pid}/cgroup");
-    let Ok(contents) = fs::read_to_string(&path) else {
-        return None;
-    };
-    let mut tags: Vec<String> = Vec::new();
-
-    // Collect all cgroup path components; format: "hier:id:path"
-    for line in contents.lines() {
-        let path_part = line.split(':').nth(2).unwrap_or("");
-        if path_part.is_empty() {
-            continue;
-        }
-        for comp in path_part.split('/') {
-            if comp.is_empty() {
-                continue;
-            }
-            let lc = comp.to_lowercase();
-            // Systemd slices
-            if lc.ends_with(".slice") {
-                tags.push(format!("slice:{}", comp));
-            }
-            // Docker/systemd scope container IDs: docker-<id>.scope or cri-containerd-<id>.scope
-            for pref in ["docker-", "crio-", "cri-containerd-"] {
-                if lc.starts_with(pref) && lc.ends_with(".scope") {
-                    let id = comp.trim_start_matches(pref).trim_end_matches(".scope");
-                    let short = id.chars().take(12).collect::<String>();
-                    if short.chars().all(|c| c.is_ascii_hexdigit()) && short.len() >= 8 {
-                        tags.push(format!("container:{}", short));
-                    }
-                }
-            }
-            // containerd v2 layout: .../k8s.io/<container-id>
-            if lc.len() >= 12 && lc.chars().take(12).all(|c| c.is_ascii_hexdigit()) {
-                let short = lc.chars().take(12).collect::<String>();
-                tags.push(format!("container:{}", short));
-            }
-            // Kubernetes pod UID markers: "pod<uid>" variants
-            if let Some(idx) = lc.find("pod") {
-                let uid = &lc[idx + 3..];
-                let uid_short = uid
-                    .chars()
-                    .filter(|c| c.is_ascii_hexdigit() || *c == '-')
-                    .take(20)
-                    .collect::<String>();
-                if !uid_short.is_empty() {
-                    tags.push(format!("k8s_pod:{}", uid_short));
-                }
-            }
-        }
-        // Remember last component as generic cgroup tag
-        if let Some(last) = path_part.rsplit('/').find(|c| !c.is_empty()) {
-            tags.push(format!("cgroup:{}", last));
-        }
-    }
-
-    // De-duplicate while preserving order
-    if tags.is_empty() {
-        return None;
-    }
-    let mut seen = std::collections::HashSet::new();
-    tags.retain(|t| seen.insert(t.clone()));
-    Some(tags)
 }
 
 #[cfg(test)]

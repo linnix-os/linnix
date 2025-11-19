@@ -8,9 +8,9 @@ use aya::maps::{
     MapData,
     perf::{PerfEventArray, PerfEventArrayBuffer},
 };
-use aya::programs::{BtfTracePoint, KProbe, TracePoint};
+use aya::programs::{KProbe, TracePoint};
 use aya::util::online_cpus;
-use aya::{Btf, Ebpf, EbpfLoader};
+use aya::{Ebpf, EbpfLoader};
 use aya_log::EbpfLogger;
 use caps::{CapSet, Capability};
 use log::{info, warn};
@@ -36,7 +36,6 @@ mod context;
 #[cfg(feature = "fake-events")]
 mod fake_events;
 mod handler;
-mod inference;
 mod insights;
 mod metrics;
 mod notifications;
@@ -55,7 +54,7 @@ struct BpfRuntimeGuards {
     _logger: Option<EbpfLogger>,
 }
 
-const INSIGHT_STORE_CAPACITY: usize = 256;
+const INSIGHT_STORE_CAPACITY: usize = 50;
 
 fn attach_kprobe_internal(bpf: &mut Ebpf, program: &str, symbol: &str) -> anyhow::Result<()> {
     let probe: &mut KProbe = bpf
@@ -94,34 +93,6 @@ fn attach_tracepoint_optional(bpf: &mut Ebpf, program: &str, category: &str, nam
     }
 }
 
-fn attach_btf_tracepoint_optional(
-    bpf: &mut Ebpf,
-    program: &str,
-    tracepoint: &str,
-    btf: Option<&Btf>,
-) {
-    let Some(btf) = btf else {
-        warn!(
-            "[cognitod] skipping BTF tracepoint {tracepoint} ({program}) – system BTF unavailable"
-        );
-        return;
-    };
-
-    let result = (|| -> anyhow::Result<()> {
-        let tp: &mut BtfTracePoint = bpf
-            .program_mut(program)
-            .ok_or_else(|| anyhow::anyhow!("{program} program not found"))?
-            .try_into()?;
-        tp.load(tracepoint, btf)?;
-        tp.attach()?;
-        Ok(())
-    })();
-
-    if let Err(err) = result {
-        warn!("[cognitod] optional BTF tracepoint {tracepoint} ({program}) not attached: {err:?}");
-    }
-}
-
 use crate::alerts::RuleEngine;
 use crate::api::{AppState, all_routes};
 use crate::bpf_config::{CoreRssMode, derive_telemetry_config};
@@ -129,12 +100,43 @@ use crate::config::{Config, OfflineGuard};
 #[cfg(feature = "fake-events")]
 use crate::fake_events::DemoProfile;
 use crate::handler::{HandlerList, JsonlHandler, LocalIlmHandlerRag};
-use crate::inference::summarizer::{load_tag_cache_from_disk, save_tag_cache_to_disk};
 use crate::metrics::Metrics;
 use crate::runtime::probes::{ProbeState, RssProbeMode};
 use clap::Parser;
 use serde_json::json;
 use std::{fs, path::Path};
+
+/// Spawn background tasks for metrics collection and logging.
+fn spawn_metrics_tasks(metrics: Arc<Metrics>) {
+    // Roll up events/s every second
+    {
+        let metrics_clone = Arc::clone(&metrics);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                metrics_clone.rollup();
+            }
+        });
+    }
+
+    // Log metrics summary every 10 seconds
+    {
+        let metrics_clone = Arc::clone(&metrics);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                log::info!(
+                    "metrics: events/s={} rb_overflows={} rate_limited={}",
+                    metrics_clone.events_per_sec(),
+                    metrics_clone.rb_overflows(),
+                    metrics_clone.rate_limited_events()
+                );
+            }
+        });
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "cognitod")]
@@ -157,74 +159,76 @@ struct Args {
     demo: Option<DemoProfile>,
 }
 
-/// Locate and read an eBPF object from common install/build paths.
-fn read_bpf_object(
-    env_var: Option<&str>,
-    candidates: &[&str],
-    err_hint: &str,
-) -> anyhow::Result<(Vec<u8>, String)> {
-    if let Some(var) = env_var
-        && let Ok(path) = std::env::var(var)
-    {
-        let data = fs::read(&path)?;
+/// Generate search paths for BPF objects in canonical order:
+/// 1. Installed location (/usr/local/share/linnix/)
+/// 2. Release build (target/bpfel-unknown-none/release/)
+/// 3. Legacy build (target/bpf/)
+///
+/// Each with relative path variants (., .., ../..) for development flexibility.
+fn bpf_search_paths(base_name: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+
+    // Canonical install location (production)
+    paths.push(format!("/usr/local/share/linnix/{}", base_name));
+    paths.push(format!("/usr/local/share/linnix/{}.o", base_name));
+
+    // Development build paths (release target)
+    for prefix in &["target", "./target", "../target", "../../target"] {
+        paths.push(format!(
+            "{}/bpfel-unknown-none/release/{}",
+            prefix, base_name
+        ));
+    }
+
+    // Legacy build paths (kept for backward compatibility)
+    for prefix in &["target", "./target", "../target", "../../target"] {
+        paths.push(format!("{}/bpf/{}.o", prefix, base_name));
+    }
+
+    paths
+}
+
+/// Locate and read an eBPF object with clear precedence:
+/// 1. Environment variable (if provided) - overrides all
+/// 2. Generated search paths - canonical install → dev builds → legacy
+fn read_bpf_object(env_var: &str, base_name: &str) -> anyhow::Result<(Vec<u8>, String)> {
+    // Priority 1: Environment variable override
+    if let Ok(path) = std::env::var(env_var) {
+        let data = fs::read(&path)
+            .with_context(|| format!("{} points to {}, but failed to read", env_var, path))?;
         return Ok((data, path));
     }
 
-    for candidate in candidates {
+    // Priority 2: Search canonical locations
+    let candidates = bpf_search_paths(base_name);
+    for candidate in &candidates {
         if Path::new(candidate).exists() {
             return Ok((fs::read(candidate)?, candidate.to_string()));
         }
     }
 
-    anyhow::bail!("{}", err_hint);
+    // Not found - provide helpful error with search locations
+    anyhow::bail!(
+        "BPF object '{}' not found. Searched:\n  {}\n\nSet {} to specify custom location, or install to /usr/local/share/linnix/",
+        base_name,
+        candidates.join("\n  "),
+        env_var
+    )
 }
 
 /// Locate and read the primary eBPF object.
 fn read_bpf_bytes() -> anyhow::Result<(Vec<u8>, String)> {
-    const CANDIDATES: [&str; 10] = [
-        "/usr/local/share/linnix/linnix-ai-ebpf-ebpf",
-        "/usr/local/share/linnix/linnix-ai-ebpf-ebpf.o",
-        "target/bpfel-unknown-none/release/linnix-ai-ebpf-ebpf",
-        "./target/bpfel-unknown-none/release/linnix-ai-ebpf-ebpf",
-        "../target/bpfel-unknown-none/release/linnix-ai-ebpf-ebpf",
-        "../../target/bpfel-unknown-none/release/linnix-ai-ebpf-ebpf",
-        "target/bpf/linnix-ai-ebpf-ebpf.o",
-        "./target/bpf/linnix-ai-ebpf-ebpf.o",
-        "../target/bpf/linnix-ai-ebpf-ebpf.o",
-        "../../target/bpf/linnix-ai-ebpf-ebpf.o",
-    ];
-    read_bpf_object(
-        Some("LINNIX_BPF_PATH"),
-        &CANDIDATES,
-        "BPF object not found. Set LINNIX_BPF_PATH or install to /usr/local/share/linnix/",
-    )
+    read_bpf_object("LINNIX_BPF_PATH", "linnix-ai-ebpf-ebpf")
 }
 
 /// Locate and read the rss_trace fallback object.
 fn read_rss_trace_bytes() -> anyhow::Result<(Vec<u8>, String)> {
-    const CANDIDATES: [&str; 10] = [
-        "/usr/local/share/linnix/rss_trace",
-        "/usr/local/share/linnix/rss_trace.o",
-        "target/bpfel-unknown-none/release/rss_trace",
-        "./target/bpfel-unknown-none/release/rss_trace",
-        "../target/bpfel-unknown-none/release/rss_trace",
-        "../../target/bpfel-unknown-none/release/rss_trace",
-        "target/bpf/rss_trace.o",
-        "./target/bpf/rss_trace.o",
-        "../target/bpf/rss_trace.o",
-        "../../target/bpf/rss_trace.o",
-    ];
-    read_bpf_object(
-        Some("LINNIX_RSS_TRACE_BPF_PATH"),
-        &CANDIDATES,
-        "rss_trace BPF object not found. Set LINNIX_RSS_TRACE_BPF_PATH or install to /usr/local/share/linnix/",
-    )
+    read_bpf_object("LINNIX_RSS_TRACE_BPF_PATH", "rss_trace")
 }
 
 fn init_ebpf(
     bpf_bytes: &[u8],
     telemetry_cfg: TelemetryConfig,
-    enable_page_faults: bool,
 ) -> anyhow::Result<(BpfRuntimeGuards, Vec<PerfEventArrayBuffer<MapData>>)> {
     let telemetry = TelemetryConfigPod(telemetry_cfg);
     let mut loader = EbpfLoader::new();
@@ -277,33 +281,6 @@ fn init_ebpf(
         "block",
         "block_rq_complete",
     );
-
-    let btf = match Btf::from_sys_fs() {
-        Ok(btf) => Some(btf),
-        Err(err) => {
-            warn!("[cognitod] failed to load system BTF: {err:?}");
-            None
-        }
-    };
-
-    // PageFault tracing is optional and controlled by config (high overhead)
-    if enable_page_faults {
-        info!("[cognitod] PageFault tracing ENABLED (debug mode - high overhead)");
-        attach_btf_tracepoint_optional(
-            &mut bpf,
-            "trace_page_fault_user",
-            "page_fault_user",
-            btf.as_ref(),
-        );
-        attach_btf_tracepoint_optional(
-            &mut bpf,
-            "trace_page_fault_kernel",
-            "page_fault_kernel",
-            btf.as_ref(),
-        );
-    } else {
-        info!("[cognitod] PageFault tracing DISABLED (production mode for <1% CPU overhead)");
-    }
 
     info!("[cognitod] Program attached. Setting up perf buffers...");
 
@@ -364,7 +341,9 @@ fn check_capabilities() -> anyhow::Result<()> {
     eprintln!("\nFix:");
     eprintln!("  sudo setcap cap_bpf,cap_perfmon=ep $(which cognitod)");
     eprintln!("\nOr use Docker:");
-    eprintln!("  docker run --cap-add=BPF --cap-add=PERFMON --cap-drop=ALL ghcr.io/linnix-os/cognitod:latest");
+    eprintln!(
+        "  docker run --cap-add=BPF --cap-add=PERFMON --cap-drop=ALL ghcr.io/linnix-os/cognitod:latest"
+    );
     eprintln!("\nRequires: Linux 5.8+ with BTF support (/sys/kernel/btf/vmlinux)");
     eprintln!("Docs: https://docs.linnix.io/installation\n");
 
@@ -374,13 +353,16 @@ fn check_capabilities() -> anyhow::Result<()> {
 fn check_kernel_version(min_major: u32, min_minor: u32) -> anyhow::Result<()> {
     let release = fs::read_to_string("/proc/sys/kernel/osrelease")
         .context("failed to read /proc/sys/kernel/osrelease")?;
-    let version = parse_kernel_version(&release)
-        .context("unable to parse kernel release string")?;
+    let version =
+        parse_kernel_version(&release).context("unable to parse kernel release string")?;
 
     if version < (min_major, min_minor) {
         anyhow::bail!(
             "kernel {}.{} lacks required eBPF support (need >= {}.{})",
-            version.0, version.1, min_major, min_minor
+            version.0,
+            version.1,
+            min_major,
+            min_minor
         );
     }
     Ok(())
@@ -417,44 +399,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     ensure_environment()?;
 
-    // Load tag cache from disk as early as possible
-    load_tag_cache_from_disk();
-
     // Load configuration
     let config = Config::load();
     let offline_guard = Arc::new(OfflineGuard::new(config.runtime.offline));
 
-    // --- Initialize Metrics ---
+    // Initialize metrics and spawn background reporting tasks
     let metrics = Arc::new(Metrics::new());
-
-    // roll up events/s every second
-    {
-        let metrics_clone = Arc::clone(&metrics);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                interval.tick().await;
-                metrics_clone.rollup();
-            }
-        });
-    }
-
-    // log metrics every 10 seconds
-    {
-        let metrics_clone = Arc::clone(&metrics);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(10));
-            loop {
-                interval.tick().await;
-                log::info!(
-                    "metrics: events/s={} rb_overflows={} rate_limited={}",
-                    metrics_clone.events_per_sec(),
-                    metrics_clone.rb_overflows(),
-                    metrics_clone.rate_limited_events()
-                );
-            }
-        });
-    }
+    spawn_metrics_tasks(Arc::clone(&metrics));
 
     // --- Prepare kernel instrumentation with graceful fallback ---
     let mut perf_buffers: Vec<PerfEventArrayBuffer<MapData>> = Vec::new();
@@ -478,7 +429,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let telemetry_cfg = result.config;
                 let (bpf_bytes, chosen_path) = read_bpf_bytes()?;
                 println!("[cognitod] Using BPF object: {chosen_path}");
-                match init_ebpf(&bpf_bytes, telemetry_cfg, config.probes.enable_page_faults) {
+                match init_ebpf(&bpf_bytes, telemetry_cfg) {
                     Ok((guards, buffers)) => {
                         transport = "perf";
                         perf_buffers = buffers;
@@ -883,14 +834,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
     }
 
-    // Periodically save tag cache to disk
-    tokio::spawn(async {
-        loop {
-            save_tag_cache_to_disk();
-            sleep(Duration::from_secs(30)).await; // Save every 30 seconds
-        }
-    });
-
     use tokio::net::TcpListener;
     use tokio::signal::unix::{SignalKind, signal};
 
@@ -935,8 +878,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     tokio::spawn(async {
         let mut sigterm = signal(SignalKind::terminate()).unwrap();
         sigterm.recv().await;
-        println!("[cognitod] SIGTERM received, saving tag cache...");
-        save_tag_cache_to_disk();
+        println!("[cognitod] SIGTERM received, shutting down...");
         std::process::exit(0);
     });
 
@@ -953,6 +895,64 @@ async fn main() -> Result<(), Box<dyn Error>> {
     {
         println!("[cognitod] Graceful shutdown timed out, forcing exit.");
     }
-    save_tag_cache_to_disk();
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bpf_search_paths_canonical_order() {
+        let paths = bpf_search_paths("test-bpf");
+
+        // Should start with production install locations
+        assert_eq!(paths[0], "/usr/local/share/linnix/test-bpf");
+        assert_eq!(paths[1], "/usr/local/share/linnix/test-bpf.o");
+
+        // Then development release builds (with relative path variants)
+        assert_eq!(paths[2], "target/bpfel-unknown-none/release/test-bpf");
+        assert_eq!(paths[3], "./target/bpfel-unknown-none/release/test-bpf");
+        assert_eq!(paths[4], "../target/bpfel-unknown-none/release/test-bpf");
+        assert_eq!(paths[5], "../../target/bpfel-unknown-none/release/test-bpf");
+
+        // Finally legacy build paths
+        assert_eq!(paths[6], "target/bpf/test-bpf.o");
+        assert_eq!(paths[7], "./target/bpf/test-bpf.o");
+        assert_eq!(paths[8], "../target/bpf/test-bpf.o");
+        assert_eq!(paths[9], "../../target/bpf/test-bpf.o");
+
+        // Total should match old implementation (10 paths)
+        assert_eq!(
+            paths.len(),
+            10,
+            "Should maintain same number of search locations"
+        );
+    }
+
+    #[test]
+    fn bpf_search_paths_maintains_backward_compatibility() {
+        // Verify that all paths from the old CANDIDATES arrays are still covered
+        let old_main_paths = [
+            "/usr/local/share/linnix/linnix-ai-ebpf-ebpf",
+            "/usr/local/share/linnix/linnix-ai-ebpf-ebpf.o",
+            "target/bpfel-unknown-none/release/linnix-ai-ebpf-ebpf",
+            "./target/bpfel-unknown-none/release/linnix-ai-ebpf-ebpf",
+            "../target/bpfel-unknown-none/release/linnix-ai-ebpf-ebpf",
+            "../../target/bpfel-unknown-none/release/linnix-ai-ebpf-ebpf",
+            "target/bpf/linnix-ai-ebpf-ebpf.o",
+            "./target/bpf/linnix-ai-ebpf-ebpf.o",
+            "../target/bpf/linnix-ai-ebpf-ebpf.o",
+            "../../target/bpf/linnix-ai-ebpf-ebpf.o",
+        ];
+
+        let new_paths = bpf_search_paths("linnix-ai-ebpf-ebpf");
+
+        for (idx, old_path) in old_main_paths.iter().enumerate() {
+            assert_eq!(
+                &new_paths[idx], old_path,
+                "Path order must be identical to preserve deployment compatibility"
+            );
+        }
+    }
 }

@@ -16,7 +16,6 @@ pub struct SystemSnapshot {
 pub struct ProcessAlert {
     pub pid: u32,
     pub comm: String,
-    pub tags: Vec<String>,
     pub cpu_percent: Option<f32>,
     pub mem_percent: Option<f32>,
     pub event_type: u32,

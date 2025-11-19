@@ -191,16 +191,12 @@ pub enum EventType {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ProcessEventExt {
     pub base: ProcessEvent,
-    pub tags: std::vec::Vec<std::string::String>,
 }
 
 #[cfg(all(feature = "user", not(target_os = "none")))]
 impl ProcessEventExt {
     pub fn new(base: ProcessEvent) -> Self {
-        Self {
-            base,
-            tags: std::vec::Vec::new(),
-        }
+        Self { base }
     }
 
     pub fn exit_time(&self) -> Option<u64> {

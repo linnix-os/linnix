@@ -169,7 +169,14 @@ async fn demo_cpu_spike(handlers: Arc<HandlerList>, _cap: u64) {
     // Keep high CPU for duration threshold
     for i in 1..8 {
         sleep(Duration::from_secs(1)).await;
-        let update = build_event(pid, 0, EventType::Exec, i, Some(70.0 + (i as f32 * 2.0)), Some(5.0));
+        let update = build_event(
+            pid,
+            0,
+            EventType::Exec,
+            i,
+            Some(70.0 + (i as f32 * 2.0)),
+            Some(5.0),
+        );
         handlers.on_event(&update).await;
     }
 }
@@ -184,7 +191,7 @@ async fn demo_memory_leak(handlers: Arc<HandlerList>, _cap: u64) {
     // Grow memory from 5% to 60% over ~8 seconds
     for i in 1..10 {
         sleep(Duration::from_millis(800)).await;
-        let mem_pct = 5.0 + (i as f32 * 6.0);  // +6% per iteration
+        let mem_pct = 5.0 + (i as f32 * 6.0); // +6% per iteration
         let update = build_event(pid, 0, EventType::Exec, i, Some(10.0), Some(mem_pct));
         handlers.on_event(&update).await;
     }

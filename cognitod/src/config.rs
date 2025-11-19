@@ -250,11 +250,11 @@ fn default_reasoner_kb_dir() -> Option<PathBuf> {
 }
 
 fn default_reasoner_kb_max_docs() -> usize {
-    200
+    10
 }
 
 fn default_reasoner_kb_max_doc_bytes() -> usize {
-    200_000
+    5_000
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -292,23 +292,9 @@ impl OfflineGuard {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct ProbesConfig {
-    /// Enable page fault tracing (high overhead, for debugging only)
-    #[serde(default = "default_enable_page_faults")]
-    pub enable_page_faults: bool,
-}
-
-impl Default for ProbesConfig {
-    fn default() -> Self {
-        Self {
-            enable_page_faults: default_enable_page_faults(),
-        }
-    }
-}
-
-fn default_enable_page_faults() -> bool {
-    false // Disabled by default for production - too high frequency
+    // Configuration for probe settings (reserved for future use)
 }
 
 #[cfg(test)]
@@ -350,8 +336,8 @@ prometheus = false
         assert_eq!(cfg.reasoner.min_eps_to_enable, 20);
         assert_eq!(cfg.reasoner.topk_kb, 3);
         assert!(cfg.reasoner.tools_enabled);
-        assert_eq!(cfg.reasoner.kb.max_docs, 200);
-        assert_eq!(cfg.reasoner.kb.max_doc_bytes, 200_000);
+        assert_eq!(cfg.reasoner.kb.max_docs, 10);
+        assert_eq!(cfg.reasoner.kb.max_doc_bytes, 5_000);
         assert_eq!(
             cfg.reasoner.kb.dir.as_deref(),
             Some(std::path::Path::new("/etc/linnix/kb"))
