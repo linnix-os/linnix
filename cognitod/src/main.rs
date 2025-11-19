@@ -163,6 +163,7 @@ struct Args {
 /// 1. Installed location (/usr/local/share/linnix/)
 /// 2. Release build (target/bpfel-unknown-none/release/)
 /// 3. Legacy build (target/bpf/)
+///
 /// Each with relative path variants (., .., ../..) for development flexibility.
 fn bpf_search_paths(base_name: &str) -> Vec<String> {
     let mut paths = Vec::new();
@@ -173,7 +174,10 @@ fn bpf_search_paths(base_name: &str) -> Vec<String> {
 
     // Development build paths (release target)
     for prefix in &["target", "./target", "../target", "../../target"] {
-        paths.push(format!("{}/bpfel-unknown-none/release/{}", prefix, base_name));
+        paths.push(format!(
+            "{}/bpfel-unknown-none/release/{}",
+            prefix, base_name
+        ));
     }
 
     // Legacy build paths (kept for backward compatibility)
@@ -187,10 +191,7 @@ fn bpf_search_paths(base_name: &str) -> Vec<String> {
 /// Locate and read an eBPF object with clear precedence:
 /// 1. Environment variable (if provided) - overrides all
 /// 2. Generated search paths - canonical install → dev builds → legacy
-fn read_bpf_object(
-    env_var: &str,
-    base_name: &str,
-) -> anyhow::Result<(Vec<u8>, String)> {
+fn read_bpf_object(env_var: &str, base_name: &str) -> anyhow::Result<(Vec<u8>, String)> {
     // Priority 1: Environment variable override
     if let Ok(path) = std::env::var(env_var) {
         let data = fs::read(&path)
@@ -340,7 +341,9 @@ fn check_capabilities() -> anyhow::Result<()> {
     eprintln!("\nFix:");
     eprintln!("  sudo setcap cap_bpf,cap_perfmon=ep $(which cognitod)");
     eprintln!("\nOr use Docker:");
-    eprintln!("  docker run --cap-add=BPF --cap-add=PERFMON --cap-drop=ALL ghcr.io/linnix-os/cognitod:latest");
+    eprintln!(
+        "  docker run --cap-add=BPF --cap-add=PERFMON --cap-drop=ALL ghcr.io/linnix-os/cognitod:latest"
+    );
     eprintln!("\nRequires: Linux 5.8+ with BTF support (/sys/kernel/btf/vmlinux)");
     eprintln!("Docs: https://docs.linnix.io/installation\n");
 
@@ -350,13 +353,16 @@ fn check_capabilities() -> anyhow::Result<()> {
 fn check_kernel_version(min_major: u32, min_minor: u32) -> anyhow::Result<()> {
     let release = fs::read_to_string("/proc/sys/kernel/osrelease")
         .context("failed to read /proc/sys/kernel/osrelease")?;
-    let version = parse_kernel_version(&release)
-        .context("unable to parse kernel release string")?;
+    let version =
+        parse_kernel_version(&release).context("unable to parse kernel release string")?;
 
     if version < (min_major, min_minor) {
         anyhow::bail!(
             "kernel {}.{} lacks required eBPF support (need >= {}.{})",
-            version.0, version.1, min_major, min_minor
+            version.0,
+            version.1,
+            min_major,
+            min_minor
         );
     }
     Ok(())
@@ -917,13 +923,17 @@ mod tests {
         assert_eq!(paths[9], "../../target/bpf/test-bpf.o");
 
         // Total should match old implementation (10 paths)
-        assert_eq!(paths.len(), 10, "Should maintain same number of search locations");
+        assert_eq!(
+            paths.len(),
+            10,
+            "Should maintain same number of search locations"
+        );
     }
 
     #[test]
     fn bpf_search_paths_maintains_backward_compatibility() {
         // Verify that all paths from the old CANDIDATES arrays are still covered
-        let old_main_paths = vec![
+        let old_main_paths = [
             "/usr/local/share/linnix/linnix-ai-ebpf-ebpf",
             "/usr/local/share/linnix/linnix-ai-ebpf-ebpf.o",
             "target/bpfel-unknown-none/release/linnix-ai-ebpf-ebpf",

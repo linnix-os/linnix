@@ -196,9 +196,7 @@ pub struct ProcessEventExt {
 #[cfg(all(feature = "user", not(target_os = "none")))]
 impl ProcessEventExt {
     pub fn new(base: ProcessEvent) -> Self {
-        Self {
-            base,
-        }
+        Self { base }
     }
 
     pub fn exit_time(&self) -> Option<u64> {
