@@ -54,19 +54,17 @@ pub fn start_listener(
 
                     // Process event asynchronously
                     let context_clone = context.clone();
-                    let mut event_for_llm = event.clone();
+                    let event_for_llm = event.clone();
                     let handlers_clone = handlers.clone();
                     rt_handle.spawn(async move {
-                        event_for_llm.tags = Vec::new();
                         println!(
-                            "[event] type={:?} pid={} ppid={} uid={} gid={} comm={} tags={:?}",
+                            "[event] type={:?} pid={} ppid={} uid={} gid={} comm={}",
                             event_label(event_for_llm.event_type),
                             event_for_llm.pid,
                             event_for_llm.ppid,
                             event_for_llm.uid,
                             event_for_llm.gid,
-                            comm,
-                            event_for_llm.tags
+                            comm
                         );
                         handlers_clone.on_event(&event_for_llm).await;
                         context_clone.add(event_for_llm);
@@ -201,17 +199,14 @@ pub fn start_perf_listener(
                             }
                         }
 
-                        event_for_llm.tags = Vec::new();
-
                         println!(
-                            "[event] type={:?} pid={} ppid={} uid={} gid={} comm={} tags={:?}",
+                            "[event] type={:?} pid={} ppid={} uid={} gid={} comm={}",
                             event_label(event_for_llm.event_type),
                             event_for_llm.pid,
                             event_for_llm.ppid,
                             event_for_llm.uid,
                             event_for_llm.gid,
-                            comm,
-                            event_for_llm.tags
+                            comm
                         );
                         handlers_clone.on_event(&event_for_llm).await;
                         context_clone.add(event_for_llm);

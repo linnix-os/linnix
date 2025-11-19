@@ -33,7 +33,6 @@ use crate::context::ContextStore;
 #[cfg(feature = "fake-events")]
 use crate::fake_events;
 use crate::handler::local_ilm::schema::insight_json_schema;
-use crate::inference::summarizer::TAG_CACHE;
 use crate::insights::{InsightRecord, InsightStore};
 use crate::metrics::Metrics;
 use crate::types::ProcessAlert;
@@ -80,7 +79,6 @@ struct ProcessInfo {
     gid: u32,
     comm: String,
     event_type: EventKind,
-    tags: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cpu_pct: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -127,7 +125,6 @@ struct ProcessEventSse {
     data2: u64,
     aux: u32,
     aux2: u32,
-    tags: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -373,7 +370,6 @@ async fn get_context_route(State(app_state): State<Arc<AppState>>) -> Json<Vec<P
                 .trim_end_matches('\0')
                 .to_string(),
             event_type: e.event_type.into(),
-            tags: e.tags.clone(),
             cpu_pct: e.cpu_percent(),
             mem_pct: e.mem_percent(),
             age_sec: calculate_age_sec(e.ts_ns),
@@ -432,7 +428,6 @@ async fn get_processes(
                 .trim_end_matches('\0')
                 .to_string(),
             event_type: e.event_type.into(),
-            tags: e.tags.clone(),
             cpu_pct: e.cpu_percent(),
             mem_pct: e.mem_percent(),
             age_sec: calculate_age_sec(e.ts_ns),
@@ -491,7 +486,6 @@ async fn get_process_by_pid(
                 .trim_end_matches('\0')
                 .to_string(),
             event_type: e.event_type.into(),
-            tags: e.tags.clone(),
             cpu_pct: e.cpu_percent(),
             mem_pct: e.mem_percent(),
             age_sec: calculate_age_sec(e.ts_ns),
@@ -525,7 +519,6 @@ async fn get_by_ppid(
                 .trim_end_matches('\0')
                 .to_string(),
             event_type: e.event_type.into(),
-            tags: e.tags.clone(),
             cpu_pct: e.cpu_percent(),
             mem_pct: e.mem_percent(),
             age_sec: calculate_age_sec(e.ts_ns),
@@ -748,7 +741,6 @@ pub async fn stream_events(
                         data2: event.data2,
                         aux: event.aux,
                         aux2: event.aux2,
-                        tags: event.tags.clone(),
                     };
                     let json = to_string(&sse_event).unwrap();
                     Some(Ok(Event::default().data(json)))
@@ -847,7 +839,6 @@ pub async fn stream_processes_live(
                         .trim_end_matches('\0')
                         .to_string(),
                     event_type: e.event_type.into(),
-                    tags: e.tags.clone(),
                     cpu_pct: e.cpu_percent(),
                     mem_pct: e.mem_percent(),
                     age_sec: calculate_age_sec(e.ts_ns),
@@ -1002,22 +993,9 @@ fn generate_alerts(ctx: &ContextStore) -> Vec<ProcessAlert> {
         let comm = String::from_utf8_lossy(&proc.comm)
             .trim_end_matches('\0')
             .to_string();
-        let tags = TAG_CACHE
-            .get(&comm.to_lowercase())
-            .map(|t| t.clone())
-            .unwrap_or_default();
 
-        // Example alert rules:
+        // Alert rules based on CPU/memory thresholds only
         let mut reasons = Vec::new();
-        if tags
-            .iter()
-            .any(|t| t.contains("suspicious") || t.contains("malware"))
-        {
-            reasons.push("Suspicious tag");
-        }
-        if tags.iter().any(|t| t == "package_manager") && proc.event_type == 0 {
-            reasons.push("Package manager execution");
-        }
         if proc.cpu_percent().unwrap_or(0.0) > 50.0 {
             reasons.push("High CPU usage");
         }
@@ -1029,7 +1007,6 @@ fn generate_alerts(ctx: &ContextStore) -> Vec<ProcessAlert> {
             alerts.push(ProcessAlert {
                 pid: proc.pid,
                 comm,
-                tags,
                 cpu_percent: proc.cpu_percent(),
                 mem_percent: proc.mem_percent(),
                 event_type: proc.event_type,

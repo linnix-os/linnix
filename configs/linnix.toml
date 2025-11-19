@@ -12,10 +12,6 @@ sample_interval_ms = 1000
 # Event retention window (seconds)
 retention_seconds = 60
 
-[probes]
-# Page fault tracing (high overhead - disabled by default)
-enable_page_faults = false
-
 [reasoner]
 # AI-powered incident detection
 enabled = true
