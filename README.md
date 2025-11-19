@@ -1,6 +1,6 @@
 # Linnix
 
-**Catches system failures before they crash your server.**
+**Real-time system failure detection using eBPF.**
 
 [![CI](https://github.com/linnix-os/linnix/actions/workflows/docker.yml/badge.svg)](https://github.com/linnix-os/linnix/actions/workflows/docker.yml)
 [![License](https://img.shields.io/badge/License-AGPL%203.0-blue.svg)](LICENSE)
@@ -16,12 +16,24 @@ git clone https://github.com/linnix-os/linnix.git && cd linnix
 ./quickstart.sh
 ```
 
-**Watch Linnix detect 3 system failures in real-time:**
-- 🔴 **Memory leak** → caught before OOM killer
-- 🔴 **Fork bomb** → detected before system hang
-- 🔴 **FD exhaustion** → alerted 15s before crash
+Linnix monitors real-time system events with **<1% CPU overhead** using eBPF.
 
-All with **<1% CPU overhead** using eBPF.
+**Optional: Run demo scenarios** to see detection in action:
+
+```bash
+# Enable demo mode in docker-compose.yml
+sed -i 's/# command: \["cognitod"/command: ["cognitod"/' docker-compose.yml
+
+# Restart to run 5 demo scenarios
+docker-compose restart cognitod
+```
+
+**Demo scenarios:**
+- **Fork bomb** - detects >10 forks/second for 2s
+- **Memory leak** - detects gradual RSS growth pattern
+- **CPU spike** - detects sustained high CPU (>50% for 5s)
+- **Runaway tree** - detects high CPU parent+child processes
+- **Short-lived jobs** - detects exec/exit cycle patterns
 
 <p align="center">
   <img src="docs/images/linnix-demo.gif" alt="Linnix detecting a fork storm" width="800"/>
@@ -31,19 +43,21 @@ All with **<1% CPU overhead** using eBPF.
 
 ---
 
-## What Just Happened?
+## How It Works
 
-Linnix caught 3 different failures **30-60 seconds before crash**:
+Linnix can detect 5 different failure patterns (when demo mode is enabled):
 
-| Scenario | Detection | Time Saved |
-|----------|-----------|------------|
-| Memory leak | 60MB/10s growth | ~15s before OOM |
-| Fork bomb | 48 forks/sec caught | ~30s before hang |
-| FD exhaustion | Alerted at 120/256 FDs | ~15s before crash |
+| Scenario | Detection Rule | Trigger |
+|----------|----------------|---------|
+| Fork bomb | forks_per_sec | >10 forks/second for 2s |
+| Memory leak | subtree_rss_mb | Gradual growth pattern |
+| CPU spike | subtree_cpu_pct | >50% CPU for 5s |
+| Runaway tree | High CPU subtree | Parent+child >90% CPU |
+| Short-lived jobs | Rapid exec/exit | Process churn detection |
 
-**How?** eBPF monitors at the kernel level (fork, exec, exit events). Rules engine analyzes patterns and alerts before failure.
+**How?** eBPF monitors at the kernel level (fork, exec, exit events). Rules engine analyzes patterns and alerts in real-time.
 
-See detailed scenarios: [`scenarios/README.md`](scenarios/README.md)
+All detection rules are configurable in `configs/rules.yaml`
 
 ---
 
@@ -63,24 +77,60 @@ docker-compose up -d
 ### Native Install (Ubuntu 22.04+)
 
 ```bash
-# eBPF monitoring only
-curl -fsSL https://raw.githubusercontent.com/linnix-os/linnix/main/install-ec2.sh | sudo bash
+# Download and install (runs as your user - no sudo needed)
+curl -fsSL https://raw.githubusercontent.com/linnix-os/linnix/main/install.sh | bash
 
-# Optional: Add local LLM
-wget https://raw.githubusercontent.com/linnix-os/linnix/main/install-llm-native.sh
-sudo ./install-llm-native.sh
+# Or manually:
+wget https://github.com/linnix-os/linnix/releases/latest/download/cognitod-linux-amd64
+chmod +x cognitod-linux-amd64
+
+# Grant capabilities (one-time, requires sudo)
+sudo setcap cap_bpf+eip cap_perfmon+eip cognitod-linux-amd64
+
+# Run (no sudo needed)
+./cognitod-linux-amd64
 ```
 
 **Requirements:**
 - Linux 5.8+ with BTF enabled (`ls /sys/kernel/btf/vmlinux`)
-- Docker (for containerized deployment)
+- Docker (for containerized deployment) - no sudo needed if in docker group
 - 2+ vCPU, 4GB+ RAM (8GB if using LLM)
+
+**Security:** Linnix uses minimal Linux capabilities (CAP_BPF + CAP_PERFMON) instead of root. See [SECURITY.md](SECURITY.md).
 
 **Uninstall:**
 ```bash
+# Stop user service
+systemctl --user stop linnix-cognitod
+systemctl --user disable linnix-cognitod
+
+# Or stop system service (if installed system-wide)
 sudo systemctl stop linnix-cognitod
 sudo systemctl disable linnix-cognitod
-sudo rm /etc/systemd/system/linnix-cognitod.service
+```
+
+---
+
+## Demo Mode
+
+Run simulated system failures to test detection rules:
+
+```bash
+# Run all 5 demo scenarios
+docker exec linnix-cognitod cognitod --demo all
+
+# Or run specific scenarios
+docker exec linnix-cognitod cognitod --demo fork-storm
+docker exec linnix-cognitod cognitod --demo cpu-spike
+docker exec linnix-cognitod cognitod --demo memory-leak
+docker exec linnix-cognitod cognitod --demo runaway-tree
+docker exec linnix-cognitod cognitod --demo short-jobs
+```
+
+**Watch demo output:**
+```bash
+docker logs -f linnix-cognitod | grep -i demo
+curl -N http://localhost:3000/stream  # Watch alerts in real-time
 ```
 
 ---

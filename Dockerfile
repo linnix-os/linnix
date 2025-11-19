@@ -1,7 +1,6 @@
 # Multi-stage build for Linnix Cognitod
-# Produces small production image with eBPF artifacts
 
-# Stage 1: Build eBPF programs (requires nightly Rust)
+# Stage 1: Build eBPF programs
 FROM rust:1.90-bookworm AS ebpf-builder
 
 # Install eBPF build dependencies
@@ -13,16 +12,16 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Rust nightly for eBPF (pinned version for stability)
+# Install Rust nightly for eBPF
 RUN rustup install nightly-2024-12-10
 RUN rustup component add rust-src --toolchain nightly-2024-12-10
 
-# Install bpf-linker (use specific version compatible with Rust 1.83)
+# Install bpf-linker
 RUN cargo install bpf-linker --version 0.9.13 --locked
 
 WORKDIR /build
 
-# Copy only Cargo files first for dependency caching
+# Copy Cargo files for dependency caching
 COPY Cargo.toml Cargo.lock ./
 COPY linnix-ai-ebpf/Cargo.toml.bak ./linnix-ai-ebpf/
 COPY linnix-ai-ebpf/linnix-ai-ebpf/Cargo.toml ./linnix-ai-ebpf/linnix-ai-ebpf/
@@ -36,8 +35,7 @@ COPY linnix-reasoner/Cargo.toml ./linnix-reasoner/
 # Copy source code
 COPY . .
 
-# Build eBPF programs (uses rust-toolchain.toml for nightly selection)
-# Note: -Z build-std is configured in .cargo/config.toml, not needed here
+# Build eBPF programs
 WORKDIR /build/linnix-ai-ebpf/linnix-ai-ebpf-ebpf
 RUN cargo build --release --target=bpfel-unknown-none
 
@@ -58,8 +56,8 @@ COPY linnix-reasoner/Cargo.toml ./linnix-reasoner/
 # Copy source
 COPY . .
 
-# Build release binaries
-RUN cargo build --release -p cognitod
+# Build release binaries with demo feature
+RUN cargo build --release -p cognitod --features fake-events
 
 # Stage 3: Runtime image (minimal Debian)
 FROM debian:bookworm-slim
@@ -71,10 +69,11 @@ RUN apt-get update && apt-get install -y \
     libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
-# Create linnix user and directories
-RUN useradd -r -s /bin/false linnix && \
-    mkdir -p /etc/linnix /var/lib/linnix /usr/local/share/linnix && \
-    chown -R linnix:linnix /var/lib/linnix
+# Create non-root user and directories
+RUN groupadd -r linnix && \
+    useradd -r -g linnix -s /bin/false linnix && \
+    mkdir -p /etc/linnix /var/lib/linnix /usr/local/share/linnix /tmp /var/run && \
+    chown -R linnix:linnix /var/lib/linnix /tmp /var/run
 
 # Copy binaries from builder
 COPY --from=rust-builder /build/target/release/cognitod /usr/local/bin/
@@ -87,20 +86,19 @@ COPY --from=ebpf-builder /build/target/bpfel-unknown-none/release/linnix-ai-ebpf
 COPY configs/linnix.toml /etc/linnix/linnix.toml.example
 COPY configs/rules.yaml /etc/linnix/rules.yaml
 
+# Set ownership
+RUN chown -R linnix:linnix /usr/local/bin/cognitod /usr/local/share/linnix /etc/linnix
+
 # Set environment
 ENV LINNIX_BPF_PATH=/usr/local/share/linnix/linnix-ai-ebpf-ebpf
 ENV LINNIX_CONFIG=/etc/linnix/linnix.toml
 ENV RUST_LOG=info
 
-# Expose API port
 EXPOSE 3000
 
-# Health check
 HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:3000/healthz || exit 1
 
-# Run as root (required for eBPF)
-USER root
-
-# Start cognitod
+# Security: runs as root with minimal capabilities (CAP_BPF + CAP_PERFMON)
+# Docker capabilities require root user. See SECURITY.md for details.
 CMD ["cognitod", "--config", "/etc/linnix/linnix.toml", "--handler", "rules:/etc/linnix/rules.yaml"]

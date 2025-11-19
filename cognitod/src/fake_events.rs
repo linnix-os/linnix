@@ -84,6 +84,9 @@ pub enum DemoProfile {
     ForkStorm,
     ShortJobs,
     RunawayTree,
+    CpuSpike,
+    MemoryLeak,
+    All,
 }
 
 #[cfg(feature = "fake-events")]
@@ -149,19 +152,76 @@ async fn demo_short_jobs(handlers: Arc<HandlerList>, cap: u64) {
 
 #[cfg(feature = "fake-events")]
 async fn demo_runaway_tree(handlers: Arc<HandlerList>, _cap: u64) {
-    let ev = build_event(4000, 0, EventType::Exec, 0, Some(90.0), Some(512.0));
+    let ev = build_event(4000, 0, EventType::Exec, 0, Some(90.0), Some(15.0));
     handlers.on_event(&ev).await;
     sleep(Duration::from_secs(2)).await;
-    let ev2 = build_event(4001, 4000, EventType::Fork, 1, Some(95.0), Some(512.0));
+    let ev2 = build_event(4001, 4000, EventType::Fork, 1, Some(95.0), Some(20.0));
     handlers.on_event(&ev2).await;
+}
+
+#[cfg(feature = "fake-events")]
+async fn demo_cpu_spike(handlers: Arc<HandlerList>, _cap: u64) {
+    // Simulate a process with sustained high CPU (>50% for 5+ seconds)
+    let pid = 5000;
+    let ev = build_event(pid, 0, EventType::Exec, 0, Some(75.0), Some(5.0));
+    handlers.on_event(&ev).await;
+
+    // Keep high CPU for duration threshold
+    for i in 1..8 {
+        sleep(Duration::from_secs(1)).await;
+        let update = build_event(pid, 0, EventType::Exec, i, Some(70.0 + (i as f32 * 2.0)), Some(5.0));
+        handlers.on_event(&update).await;
+    }
+}
+
+#[cfg(feature = "fake-events")]
+async fn demo_memory_leak(handlers: Arc<HandlerList>, _cap: u64) {
+    // Simulate gradual memory growth (memory leak pattern)
+    let pid = 6000;
+    let ev = build_event(pid, 0, EventType::Exec, 0, Some(10.0), Some(5.0));
+    handlers.on_event(&ev).await;
+
+    // Grow memory from 5% to 60% over ~8 seconds
+    for i in 1..10 {
+        sleep(Duration::from_millis(800)).await;
+        let mem_pct = 5.0 + (i as f32 * 6.0);  // +6% per iteration
+        let update = build_event(pid, 0, EventType::Exec, i, Some(10.0), Some(mem_pct));
+        handlers.on_event(&update).await;
+    }
 }
 
 #[cfg(feature = "fake-events")]
 pub async fn run_demo(profile: DemoProfile, handlers: Arc<HandlerList>, cap: u64) {
     match profile {
+        DemoProfile::All => {
+            log::info!("Running all demo scenarios sequentially...");
+
+            log::info!("Demo 1/5: Fork storm (rapid process spawning)");
+            demo_fork_storm(handlers.clone(), cap).await;
+            sleep(Duration::from_secs(3)).await;
+
+            log::info!("Demo 2/5: Short-lived jobs (exec/exit cycles)");
+            demo_short_jobs(handlers.clone(), cap).await;
+            sleep(Duration::from_secs(3)).await;
+
+            log::info!("Demo 3/5: Runaway process tree (high CPU parent+child)");
+            demo_runaway_tree(handlers.clone(), cap).await;
+            sleep(Duration::from_secs(3)).await;
+
+            log::info!("Demo 4/5: CPU spike (sustained high CPU)");
+            demo_cpu_spike(handlers.clone(), cap).await;
+            sleep(Duration::from_secs(3)).await;
+
+            log::info!("Demo 5/5: Memory leak (gradual RSS growth)");
+            demo_memory_leak(handlers, cap).await;
+
+            log::info!("All demo scenarios complete - 5/5 detection patterns triggered");
+        }
         DemoProfile::ForkStorm => demo_fork_storm(handlers, cap).await,
         DemoProfile::ShortJobs => demo_short_jobs(handlers, cap).await,
         DemoProfile::RunawayTree => demo_runaway_tree(handlers, cap).await,
+        DemoProfile::CpuSpike => demo_cpu_spike(handlers, cap).await,
+        DemoProfile::MemoryLeak => demo_memory_leak(handlers, cap).await,
     }
 }
 

@@ -348,49 +348,47 @@ fn init_rss_trace(bpf_bytes: &[u8]) -> anyhow::Result<BpfRuntimeGuards> {
     })
 }
 
-fn ensure_environment() -> anyhow::Result<()> {
-    check_capabilities()?;
-    check_kernel_version(5, 8)?;
-    Ok(())
-}
-
 fn check_capabilities() -> anyhow::Result<()> {
-    let required = [
-        Capability::CAP_BPF,
-        Capability::CAP_PERFMON,
-        Capability::CAP_SYS_ADMIN,
-    ];
+    let has_bpf = caps::has_cap(None, CapSet::Effective, Capability::CAP_BPF)
+        .context("failed to query CAP_BPF")?;
+    let has_perfmon = caps::has_cap(None, CapSet::Effective, Capability::CAP_PERFMON)
+        .context("failed to query CAP_PERFMON")?;
 
-    for cap in &required {
-        let has_cap = caps::has_cap(None, CapSet::Effective, *cap)
-            .with_context(|| format!("failed to query capability {cap:?}"))?;
-        if !has_cap {
-            anyhow::bail!(
-                "missing {:?} capability. Grant it with `sudo setcap cap_bpf,cap_perfmon,cap_sys_admin+ep $(command -v cognitod)` and restart.",
-                cap
-            );
-        }
+    if has_bpf && has_perfmon {
+        info!("Running with CAP_BPF + CAP_PERFMON");
+        return Ok(());
     }
 
-    Ok(())
+    // Missing required capabilities
+    eprintln!("\nERROR: Missing required capabilities CAP_BPF and CAP_PERFMON");
+    eprintln!("\nFix:");
+    eprintln!("  sudo setcap cap_bpf,cap_perfmon=ep $(which cognitod)");
+    eprintln!("\nOr use Docker:");
+    eprintln!("  docker run --cap-add=BPF --cap-add=PERFMON --cap-drop=ALL ghcr.io/linnix-os/cognitod:latest");
+    eprintln!("\nRequires: Linux 5.8+ with BTF support (/sys/kernel/btf/vmlinux)");
+    eprintln!("Docs: https://docs.linnix.io/installation\n");
+
+    anyhow::bail!("missing CAP_BPF and CAP_PERFMON")
 }
 
 fn check_kernel_version(min_major: u32, min_minor: u32) -> anyhow::Result<()> {
     let release = fs::read_to_string("/proc/sys/kernel/osrelease")
         .context("failed to read /proc/sys/kernel/osrelease")?;
-    let version =
-        parse_kernel_version(&release).context("unable to parse kernel release string")?;
+    let version = parse_kernel_version(&release)
+        .context("unable to parse kernel release string")?;
 
     if version < (min_major, min_minor) {
         anyhow::bail!(
-            "kernel {major}.{minor} lacks tracepoint support; require >= {min_major}.{min_minor}",
-            major = version.0,
-            minor = version.1,
-            min_major = min_major,
-            min_minor = min_minor
+            "kernel {}.{} lacks required eBPF support (need >= {}.{})",
+            version.0, version.1, min_major, min_minor
         );
     }
+    Ok(())
+}
 
+fn ensure_environment() -> anyhow::Result<()> {
+    check_capabilities()?;
+    check_kernel_version(5, 8)?;
     Ok(())
 }
 

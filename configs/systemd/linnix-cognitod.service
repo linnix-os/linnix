@@ -1,25 +1,53 @@
-/etc/systemd/system/cognitod.service
+# Systemd service for Linnix cognitod
+# Install to: /etc/systemd/system/cognitod.service
+# Or for user mode: ~/.config/systemd/user/cognitod.service
+
 [Unit]
 Description=Linnix cognitod (eBPF process observer)
 After=network.target
+Documentation=https://github.com/linnix-os/linnix
 
 [Service]
 Type=simple
 EnvironmentFile=-/etc/linnix/linnix.env
 ExecStart=/usr/local/bin/cognitod --config /etc/linnix/linnix.toml --handler rules:/etc/linnix/rules.toml
+
+# Environment variables
 Environment=LINNIX_BPF_PATH=/usr/local/share/linnix/linnix-ai-ebpf-ebpf
 Environment=LINNIX_RSS_TRACE_BPF_PATH=/usr/local/share/linnix/rss_trace.o
 Environment=LINNIX_KERNEL_BTF=/sys/kernel/btf/vmlinux
 Environment=LLM_ENDPOINT=http://127.0.0.1:8090/v1/chat/completions
 Environment=LLM_MODEL=linnix-qwen-v1
 Environment=RUST_LOG=info
-# caps + limits for eBPF/perf
-AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN
-CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN
+
+# Security: Minimal capabilities only (requires Linux 5.8+)
+AmbientCapabilities=CAP_BPF CAP_PERFMON
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON
+
+# Security hardening
 NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/linnix /var/log/linnix
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+
+# Resource limits
 LimitMEMLOCK=infinity
+LimitNOFILE=65536
+
+# Restart policy
 Restart=on-failure
-RestartSec=2s
+RestartSec=5s
+StartLimitBurst=3
+StartLimitIntervalSec=60
 
 [Install]
 WantedBy=multi-user.target

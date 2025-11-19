@@ -56,14 +56,14 @@ Complete guide for deploying Linnix eBPF observability platform on AWS EC2 insta
 SSH into your EC2 instance and run:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/linnix-os/linnix/main/install-ec2.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/linnix-os/linnix/main/docs/examples/install-ec2.sh | sudo bash
 ```
 
 ### Option 2: Download and Inspect First
 
 ```bash
 # Download the script
-wget https://raw.githubusercontent.com/linnix-os/linnix/main/install-ec2.sh
+wget https://raw.githubusercontent.com/linnix-os/linnix/main/docs/examples/install-ec2.sh
 
 # Review the script
 less install-ec2.sh
@@ -88,24 +88,16 @@ sudo ./install-ec2.sh --port 8080
 sudo ./install-ec2.sh --skip-systemd
 ```
 
-### LLM Installation (Separate Script)
-
-For AI-powered insights, install the LLM server after installing cognitod:
-
-```bash
-# Download and run LLM installation script
-wget https://raw.githubusercontent.com/linnix-os/linnix/main/install-llm-native.sh
-sudo ./install-llm-native.sh
-```
+**Note:** The install-llm-native.sh script has been removed. Use `./quickstart.sh` instead for Docker-based deployment with LLM support.
 
 **Requirements:**
 - Minimum 16 GB disk space (5 GB for model + build artifacts)
 - Minimum 4 GB RAM
 - At least t3.medium instance recommended
 
-See [LLM_INSTALLATION.md](../LLM_INSTALLATION.md) for detailed guide.
+For Docker-based LLM deployment, use `./quickstart.sh` which includes the LLM service.
 
-### What the install-ec2.sh Script Does
+### What the docs/examples/install-ec2.sh Script Does
 
 1. ✅ Detects OS and validates kernel version (>= 5.8)
 2. ✅ Installs system dependencies (libelf, kernel headers, OpenSSL)
@@ -122,7 +114,7 @@ See [LLM_INSTALLATION.md](../LLM_INSTALLATION.md) for detailed guide.
 
 **Installation Time:** 3-5 minutes (pre-built) or 10-15 minutes (build from source)
 
-### What the install-llm-native.sh Script Does
+### LLM Support (via Docker)
 
 1. ✅ Checks disk space (requires 5 GB minimum)
 2. ✅ Installs build dependencies (CMake, curl, git)
@@ -236,7 +228,7 @@ sudo dnf install -y \
 
 **Option A: Using the install script**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/linnix-os/linnix/main/install-ec2.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/linnix-os/linnix/main/docs/examples/install-ec2.sh | sudo bash
 ```
 
 **Option B: From pre-built packages**
@@ -383,7 +375,7 @@ sudo resize2fs /dev/nvme0n1p1
 ```bash
 #!/bin/bash
 # Auto-install Linnix on instance launch
-curl -fsSL https://raw.githubusercontent.com/linnix-os/linnix/main/install-ec2.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/linnix-os/linnix/main/docs/examples/install-ec2.sh | sudo bash
 ```
 
 ---
@@ -458,7 +450,7 @@ sample_interval_ms = 1000  # Adjust sampling rate
 listen_addr = "0.0.0.0:3000"  # API server binding
 
 [reasoner]
-enabled = true  # Enable if you have LLM installed via install-llm-native.sh
+enabled = true  # Enable if you have LLM installed via Docker
 endpoint = "http://127.0.0.1:8090/v1/chat/completions"
 model = "linnix-3b-distilled"
 
@@ -837,25 +829,8 @@ curl http://localhost:3000/metrics | grep ilm
 curl http://localhost:3000/insights
 ```
 
-**llama.cpp build fails:**
-```bash
-# Ensure CMake is installed (version 3.10+)
-cmake --version
-
-# Ubuntu/Debian: Install cmake
-sudo apt-get install -y cmake
-
-# Amazon Linux: Use cmake3
-sudo yum install -y cmake3
-sudo ln -s /usr/bin/cmake3 /usr/bin/cmake
-
-# Ensure libcurl is installed
-sudo apt-get install -y libcurl4-openssl-dev  # Ubuntu/Debian
-sudo yum install -y libcurl-devel              # Amazon Linux
-
-# Re-run installation
-sudo ./install-llm-native.sh
-```
+**LLM issues:**
+For LLM support, use Docker-based deployment via `./quickstart.sh` which includes the LLM service pre-configured. Native LLM installation is no longer supported via install scripts.
 
 ---
 
@@ -873,7 +848,7 @@ aws ec2 create-launch-template \
     "InstanceType": "t3.medium",
     "KeyName": "my-keypair",
     "SecurityGroupIds": ["sg-xxxxxxxx"],
-    "UserData": "'$(base64 -w0 install-ec2.sh)'",
+    "UserData": "'$(base64 -w0 docs/examples/install-ec2.sh)'",
     "IamInstanceProfile": {"Name": "linnix-role"},
     "BlockDeviceMappings": [{
       "DeviceName": "/dev/sda1",
@@ -973,7 +948,7 @@ resource "aws_instance" "linnix" {
     volume_type = "gp3"
   }
 
-  user_data = file("install-ec2.sh")
+  user_data = file("docs/examples/install-ec2.sh")
 
   tags = {
     Name = "linnix-server"
@@ -1016,7 +991,7 @@ for region in "${REGIONS[@]}"; do
     --instance-type t3.medium \
     --key-name my-keypair \
     --security-group-ids sg-xxxxxxxx \
-    --user-data file://install-ec2.sh \
+    --user-data file://docs/examples/install-ec2.sh \
     --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=linnix-$region}]"
 done
 ```

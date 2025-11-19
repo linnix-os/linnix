@@ -1,20 +1,20 @@
-# Linnix - eBPF-powered Linux observability with AI
-# 
-# Quick Start (5 minutes):
-#   ./setup-llm.sh
+# Linnix - eBPF system monitoring
+#
+# Quick Start:
+#   ./quickstart.sh
 #
 # Manual Start:
-#   docker-compose up -d
+#   docker compose up -d
 #
 # Access:
-#   - Dashboard: http://localhost:8080
-#   - API: http://localhost:3000
-#   - LLM: http://localhost:8090
+#   - API & Dashboard: http://localhost:3000
+#   - LLM Server: http://localhost:8090
 
 version: '3.8'
 
 services:
   # Cognitod - eBPF monitoring daemon
+  # Security: root + minimal caps (CAP_BPF + CAP_PERFMON only)
   cognitod:
     image: ghcr.io/linnix-os/cognitod:latest
     # Fallback: build locally if image pull fails
@@ -22,28 +22,39 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: linnix-cognitod
-    privileged: true
+
     network_mode: host
     pid: host
+
+    # Minimal capabilities (requires Linux 5.8+)
     cap_add:
-      - SYS_ADMIN
-      - SYS_RESOURCE
-      - NET_ADMIN
+      - BPF
+      - PERFMON
+
     security_opt:
-      - apparmor:unconfined
+      - no-new-privileges:true
+
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/run
+
     volumes:
-      # Required: Kernel BTF for dynamic offset resolution
       - /sys/kernel/btf:/sys/kernel/btf:ro
-      # Required: tracefs for eBPF tracepoints
       - /sys/kernel/debug:/sys/kernel/debug:ro
-      # Optional: Custom config
       - ./configs:/etc/linnix:ro
-      # Optional: Persistent tag cache
-      - linnix-data:/var/lib/linnix
+      - linnix-data:/var/lib/linnix:rw
+
     environment:
       - RUST_LOG=info
-      - LINNIX_CONFIG=/etc/linnix/linnix-local.toml
+      - LINNIX_CONFIG=/etc/linnix/linnix.toml
+
+    # Demo mode: Run all demo scenarios on startup
+    # Uncomment the line below to enable demo mode
+    # command: ["cognitod", "--config", "/etc/linnix/linnix.toml", "--handler", "rules:/etc/linnix/rules.yaml", "--demo", "all"]
+
     restart: unless-stopped
+
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/healthz"]
       interval: 10s
@@ -51,7 +62,7 @@ services:
       retries: 3
       start_period: 30s
 
-  # LLM Server - Linnix 3B distilled model for AI insights
+  # LLM Server - Linnix 3B distilled model
   llama-server:
     image: ghcr.io/ggerganov/llama.cpp:server
     container_name: linnix-llm
@@ -76,7 +87,7 @@ services:
       retries: 3
       start_period: 60s
 
-  # Web Dashboard - Simple UI for visualization
+  # Web Dashboard
   dashboard:
     image: nginx:alpine
     container_name: linnix-dashboard
@@ -94,10 +105,5 @@ services:
       retries: 3
 
 volumes:
-  # Persistent storage for cognitod state
   linnix-data:
     driver: local
-
-networks:
-  default:
-    name: linnix-network

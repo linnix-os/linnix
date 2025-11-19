@@ -1,6 +1,6 @@
 #!/bin/bash
 # Linnix Quick Start Script
-# Gets you from zero to AI-powered insights in < 5 minutes
+# Starts Linnix with Docker Compose
 
 set -e
 
@@ -13,24 +13,17 @@ NC='\033[0m' # No Color
 
 # --- Globals ---
 COMPOSE_CMD=""
-AUTO_DEMO=1
 ACTION="start"
 
 # --- Functions ---
-
-# Cleanup temporary files on exit
-cleanup() {
-  # Add any temp files here if needed in the future
-  :
-}
 
 # Display a banner for the script
 banner() {
     echo ""
     echo "╔════════════════════════════════════════════════════════════╗"
     echo "║                                                            ║"
-    echo "║   🚀  Linnix Quick Start                                   ║"
-    echo "║   eBPF Monitoring + AI Incident Detection                 ║"
+    echo "║   Linnix Quick Start                                       ║"
+    echo "║   eBPF System Monitoring                                   ║"
     echo "║                                                            ║"
     echo "╚════════════════════════════════════════════════════════════╝"
     echo ""
@@ -40,21 +33,22 @@ banner() {
 parse_args() {
     for arg in "$@"; do
         case "$arg" in
-            --autodemo|-d)
-                AUTO_DEMO=1
-                ;;
-            --no-autodemo|--no-demo)
-                AUTO_DEMO=0
-                ;;
             stop|down)
                 ACTION="stop"
                 ;;
             --help|-h)
-                echo "Usage: $0 [start|stop|--autodemo|-d|--no-autodemo|--help|-h]"
-                echo "  start (default):    Start services and run quickstart."
+                echo "Usage: $0 [start|stop|--help|-h]"
+                echo "  start (default):    Start services with automatic demo scenarios."
                 echo "  stop:               Stop all running Linnix services."
-                echo "  --autodemo, -d:     Ensure the auto-demo runs after setup (default)."
-                echo "  --no-autodemo:      Skip running the auto-demo workload."
+                echo ""
+                echo "Demo scenarios (run automatically on startup):"
+                echo "  1. Fork storm       - Rapid process spawning detection"
+                echo "  2. Short jobs       - Exec/exit cycle monitoring"
+                echo "  3. Runaway tree     - High CPU parent+child processes"
+                echo "  4. CPU spike        - Sustained high CPU detection"
+                echo "  5. Memory leak      - Gradual RSS growth pattern"
+                echo ""
+                echo "For production use, comment out the 'command:' line in docker-compose.yml"
                 exit 0
                 ;;
         esac
@@ -116,7 +110,7 @@ check_model() {
         echo -e "${GREEN}✅ Model already downloaded.${NC}"
     else
         mkdir -p ./models
-        echo -e "${YELLOW}📥 Demo model not found. It will be downloaded when containers start (2.1GB).${NC}"
+        echo -e "${YELLOW}⚠️  Demo model not found. It will be downloaded when containers start (2.1GB).${NC}"
     fi
 }
 
@@ -149,17 +143,15 @@ EOF
         echo -e "${GREEN}✅ Using existing config file.${NC}"
     fi
 
-    local demo_rules_src="./demo-rules.yaml"
-    local rules_dest="./configs/rules.yaml"
-    if [ -f "$demo_rules_src" ]; then
-        if [ -f "$rules_dest" ] && cmp -s "$demo_rules_src" "$rules_dest" >/dev/null 2>&1; then
-            echo -e "${GREEN}✅ Demo rules already applied at $rules_dest.${NC}"
+    if [ ! -f "./configs/rules.yaml" ]; then
+        if [ -f "./configs/rules.yaml.example" ]; then
+            cp "./configs/rules.yaml.example" "./configs/rules.yaml"
+            echo -e "${GREEN}✅ Created rules.yaml from example.${NC}"
         else
-            cp "$demo_rules_src" "$rules_dest"
-            echo -e "${GREEN}✅ Applied demo rules from $demo_rules_src → $rules_dest.${NC}"
+            echo -e "${YELLOW}⚠️  No rules.yaml found. Using default rules from container.${NC}"
         fi
     else
-        echo -e "${YELLOW}⚠️  Demo rules file $demo_rules_src not found. Skipping rules sync.${NC}"
+        echo -e "${GREEN}✅ Using existing rules.yaml${NC}"
     fi
 }
 
@@ -178,8 +170,6 @@ start_services() {
 # Wait for services to become healthy
 wait_for_health() {
     echo -e "\n${BLUE}[5/5]${NC} Waiting for services to become healthy..."
-    
-    # Wait for cognitod
     echo -n "   Cognitod: "
     for i in {1..30}; do
         if curl -sf http://localhost:3000/healthz > /dev/null; then
@@ -193,7 +183,6 @@ wait_for_health() {
         fi
     done
 
-    # Wait for llama-server
     echo -n "   LLM Server: "
     for i in {1..180}; do # Increased timeout for model download
         if curl -sf http://localhost:8090/health > /dev/null; then
@@ -208,41 +197,28 @@ wait_for_health() {
     done
 }
 
-# Run the automated demo workload
-run_demo() {
-    if [ "$AUTO_DEMO" -eq 1 ]; then
-        echo -e "\n${BLUE}⏱️  Auto-demo enabled, starting workload...${NC}"
-        local demo_script="./scenarios/demo/demo-script.sh"
-        if [ -f "$demo_script" ]; then
-            mkdir -p ./logs
-            nohup bash "$demo_script" > ./logs/autodemo.log 2>&1 &
-            echo "   Demo started in the background. Logs: tail -f ./logs/autodemo.log"
-        else
-            echo -e "${YELLOW}   Demo script not found at $demo_script. Skipping.${NC}"
-        fi
-    fi
-}
-
 # Display a summary of commands and next steps
 show_summary() {
     echo ""
     echo "╔════════════════════════════════════════════════════════════╗"
     echo "║                                                            ║"
-    echo "║   🎉  Linnix is running!                                   ║"
+    echo "║   Linnix is running                                        ║"
     echo "║                                                            ║"
     echo "╚════════════════════════════════════════════════════════════╝"
     echo ""
     echo -e "${GREEN}Services:${NC}"
-    echo "   • Dashboard & API:        http://localhost:3000"
+    echo "   • Dashboard & API:          http://localhost:3000"
     echo "   • LLM Server:               http://localhost:8090"
     echo "   • Prometheus Metrics:       http://localhost:3000/metrics/prometheus"
     echo ""
     echo -e "${GREEN}Quick Commands:${NC}"
-    echo "   • View status:              $COMPOSE_CMD ps"
-    echo "   • View logs:                $COMPOSE_CMD logs -f"
-    echo "   • Get AI insights:          curl http://localhost:3000/insights | jq"
-    echo "   • Stream raw events:        curl -N http://localhost:3000/stream"
+    echo "   • Watch alerts:             curl -N http://localhost:3000/stream"
+    echo "   • Get LLM insights:         curl http://localhost:3000/insights | jq"
+    echo "   • View all logs:            $COMPOSE_CMD logs -f"
     echo "   • Stop services:            ./quickstart.sh stop"
+    echo ""
+    echo -e "${YELLOW}Note:${NC} Demo mode is disabled by default"
+    echo "      To enable, uncomment the 'command:' line in docker-compose.yml"
     echo ""
 }
 
@@ -258,8 +234,6 @@ stop_services() {
 
 # --- Main Execution ---
 main() {
-    trap cleanup EXIT
-    
     parse_args "$@"
     
     # Determine compose command early for stop action
@@ -280,7 +254,6 @@ main() {
     setup_config
     start_services
     wait_for_health
-    run_demo
     show_summary
 }
 
