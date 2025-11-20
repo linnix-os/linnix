@@ -1,8 +1,11 @@
 # Linnix Configuration
 # Documentation: https://docs.linnix.io/configuration
 
+[api]
+listen_addr = "127.0.0.1:3000"
+# auth_token = "your-secret-token"
+
 [runtime]
-# Offline mode: disable external HTTP requests (Slack, PagerDuty, etc.)
 offline = false
 
 [telemetry]

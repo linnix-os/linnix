@@ -69,6 +69,34 @@ jobs:
         run: |
           cargo build --release --target ${{ matrix.rust_target }} -p linnix-reasoner
 
+      - name: Install eBPF dependencies
+        run: |
+          rustup install nightly-2024-12-10
+          rustup component add rust-src --toolchain nightly-2024-12-10
+          cargo install bpf-linker --version 0.9.13 --locked
+
+      - name: Build eBPF programs
+        run: |
+          cargo xtask build-ebpf --release
+
+      - name: Create tarball
+        run: |
+          mkdir -p dist
+          cd dist
+          mkdir -p linnix-${{ matrix.arch }}-unknown-linux-gnu
+          cp ../target/${{ matrix.rust_target }}/release/cognitod linnix-${{ matrix.arch }}-unknown-linux-gnu/
+          cp ../target/${{ matrix.rust_target }}/release/linnix-cli linnix-${{ matrix.arch }}-unknown-linux-gnu/
+          cp ../target/bpfel-unknown-none/release/linnix-ai-ebpf-ebpf linnix-${{ matrix.arch }}-unknown-linux-gnu/
+          tar -czf linnix-${{ matrix.arch }}-unknown-linux-gnu.tar.gz linnix-${{ matrix.arch }}-unknown-linux-gnu/
+          rm -rf linnix-${{ matrix.arch }}-unknown-linux-gnu
+          ls -lh
+
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarball-${{ matrix.arch }}
+          path: dist/*.tar.gz
+
       - name: Install packaging tools
         run: |
           cargo install cargo-deb cargo-generate-rpm
@@ -118,7 +146,14 @@ jobs:
           mkdir -p release-packages
           find all-packages -name "*.deb" -exec cp {} release-packages/ \;
           find all-packages -name "*.rpm" -exec cp {} release-packages/ \;
+          find all-packages -name "*.tar.gz" -exec cp {} release-packages/ \;
           ls -lh release-packages/
+
+      - name: Generate checksums
+        run: |
+          cd release-packages
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Create symlinks for latest
         run: |

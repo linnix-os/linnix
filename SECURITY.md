@@ -111,6 +111,45 @@ With CAP_BPF + CAP_PERFMON, an attacker could:
 5. **Network isolation**: Run on isolated networks if possible
 6. **Regular updates**: Keep Linnix and base images updated for security patches
 
+## API Authentication
+
+### Default Configuration
+
+Linnix binds to `127.0.0.1:3000` by default (localhost only, no authentication required).
+
+### Remote Access
+
+For remote access, configure authentication:
+
+**Environment Variable (Recommended):**
+```bash
+export LINNIX_API_TOKEN="$(openssl rand -hex 32)"
+```
+
+**Configuration File:**
+```toml
+# /etc/linnix/linnix.toml
+[api]
+listen_addr = "0.0.0.0:3000"
+auth_token = "your-secret-token"
+```
+
+**Priority:** `LINNIX_API_TOKEN` env var overrides config file.
+
+### Client Usage
+
+**cURL:**
+```bash
+curl -H "Authorization: Bearer your-secret-token" \
+  http://your-server:3000/processes
+```
+
+**SSH Tunnel (No Auth Required):**
+```bash
+ssh -L 3000:localhost:3000 user@server
+curl http://localhost:3000/processes
+```
+
 ## Reporting Security Issues
 
 If you discover a security vulnerability:
