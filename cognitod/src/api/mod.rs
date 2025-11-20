@@ -1926,7 +1926,12 @@ mod tests {
         });
         let router = super::all_routes(app_state);
         let response = router
-            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1951,7 +1956,12 @@ mod tests {
         });
         let router = super::all_routes(app_state);
         let response = router
-            .oneshot(Request::builder().uri("/processes").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/processes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);

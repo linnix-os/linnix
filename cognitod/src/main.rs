@@ -871,8 +871,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     });
 
     let api = all_routes(app_state.clone());
-    let listen_addr = std::env::var("LINNIX_LISTEN_ADDR")
-        .unwrap_or(config.api.listen_addr.clone());
+    let listen_addr = std::env::var("LINNIX_LISTEN_ADDR").unwrap_or(config.api.listen_addr.clone());
     let listener = TcpListener::bind(&listen_addr).await?;
 
     if listen_addr.starts_with("0.0.0.0") && auth_token.is_none() {
