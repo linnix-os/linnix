@@ -331,9 +331,10 @@ install_linnix_binaries() {
         fi
 
         tar -xzf "$TAR_NAME"
-        cp linnix-ai-ebpf-ebpf "$SHARE_DIR/"
-        cp cognitod "$INSTALL_DIR/"
-        cp linnix-cli "$INSTALL_DIR/"
+        EXTRACT_DIR="linnix-${ARCH_TAG}-unknown-linux-gnu"
+        cp "$EXTRACT_DIR/linnix-ai-ebpf-ebpf" "$SHARE_DIR/"
+        cp "$EXTRACT_DIR/cognitod" "$INSTALL_DIR/"
+        cp "$EXTRACT_DIR/linnix-cli" "$INSTALL_DIR/"
         chmod +x "$INSTALL_DIR/cognitod"
         chmod +x "$INSTALL_DIR/linnix-cli"
 
