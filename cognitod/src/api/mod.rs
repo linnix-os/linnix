@@ -1268,6 +1268,61 @@ async fn get_insight_schema_route() -> Json<Value> {
     Json(insight_json_schema().clone())
 }
 
+async fn get_actions(State(state): State<Arc<AppState>>) -> Json<Vec<crate::enforcement::EnforcementAction>> {
+    if let Some(queue) = &state.enforcement {
+        let all = queue.get_all().await;
+        Json(all)
+    } else {
+        Json(vec![])
+    }
+}
+
+async fn get_action_by_id(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::enforcement::EnforcementAction>, StatusCode> {
+    if let Some(queue) = &state.enforcement {
+        queue.get_by_id(&id).await
+            .map(Json)
+            .ok_or(StatusCode::NOT_FOUND)
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+#[derive(Deserialize)]
+struct ApprovalRequest {
+    approver: String,
+}
+
+async fn approve_action(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<ApprovalRequest>,
+) -> Result<Json<crate::enforcement::EnforcementAction>, StatusCode> {
+    if let Some(queue) = &state.enforcement {
+        queue.approve(&id, req.approver).await
+            .map(Json)
+            .map_err(|_| StatusCode::BAD_REQUEST)
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+async fn reject_action(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<ApprovalRequest>,
+) -> Result<StatusCode, StatusCode> {
+    if let Some(queue) = &state.enforcement {
+        queue.reject(&id, req.approver).await
+            .map(|_| StatusCode::OK)
+            .map_err(|_| StatusCode::BAD_REQUEST)
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
 #[derive(Serialize)]
 struct DropBreakdown {
     event_type: u32,
@@ -1575,6 +1630,7 @@ pub struct AppState {
     pub prometheus_enabled: bool,
     pub alert_history: Arc<AlertHistory>,
     pub auth_token: Option<String>,
+    pub enforcement: Option<Arc<crate::enforcement::EnforcementQueue>>,
 }
 
 pub fn all_routes(app_state: Arc<AppState>) -> Router {
@@ -1602,7 +1658,11 @@ pub fn all_routes(app_state: Arc<AppState>) -> Router {
         .route("/metrics", get(metrics_handler))
         .route("/status", get(status_handler))
         .route("/healthz", get(healthz))
-        .route("/schema/insight", get(get_insight_schema_route));
+        .route("/schema/insight", get(get_insight_schema_route))
+        .route("/actions", get(get_actions))
+        .route("/actions/{id}", get(get_action_by_id))
+        .route("/actions/{id}/approve", axum::routing::post(approve_action))
+        .route("/actions/{id}/reject", axum::routing::post(reject_action));
 
     if prometheus_enabled {
         router = router.route("/metrics/prometheus", get(prometheus_metrics));
