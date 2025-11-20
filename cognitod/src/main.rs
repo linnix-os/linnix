@@ -852,6 +852,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
     }
 
+    let auth_token = std::env::var("LINNIX_API_TOKEN")
+        .ok()
+        .or(config.api.auth_token.clone());
+
     let app_state = Arc::new(AppState {
         context: Arc::clone(&context),
         metrics: Arc::clone(&metrics),
@@ -863,12 +867,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
         reasoner: config.reasoner.clone(),
         prometheus_enabled: config.outputs.prometheus,
         alert_history: Arc::clone(&alert_history),
+        auth_token: auth_token.clone(),
     });
 
     let api = all_routes(app_state.clone());
-    let listen_addr = "0.0.0.0:3000";
-    let listener = TcpListener::bind(listen_addr).await?;
-    println!("[cognitod] HTTP server on http://{}", listen_addr);
+    let listen_addr = std::env::var("LINNIX_LISTEN_ADDR")
+        .unwrap_or(config.api.listen_addr.clone());
+    let listener = TcpListener::bind(&listen_addr).await?;
+
+    if listen_addr.starts_with("0.0.0.0") && auth_token.is_none() {
+        warn!(
+            "API listening on {} with NO AUTHENTICATION. \
+            Set LINNIX_API_TOKEN to secure the API.",
+            listen_addr
+        );
+    }
+
+    info!("[cognitod] HTTP server on http://{}", listen_addr);
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, api).await {
             eprintln!("server error: {e}");

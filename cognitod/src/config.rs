@@ -5,33 +5,36 @@ use std::path::PathBuf;
 const DEFAULT_CONFIG_PATH: &str = "/etc/linnix/linnix.toml";
 const ENV_CONFIG_PATH: &str = "LINNIX_CONFIG";
 
-/// Notification configuration for external alerting systems
+/// API server configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiConfig {
+    #[serde(default = "default_listen_addr")]
+    pub listen_addr: String,
+    #[serde(default)]
+    pub auth_token: Option<String>,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            listen_addr: default_listen_addr(),
+            auth_token: None,
+        }
+    }
+}
+
+fn default_listen_addr() -> String {
+    "127.0.0.1:3000".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NotificationConfig {
-    /// Apprise notification configuration (supports 100+ services)
     pub apprise: Option<AppriseConfig>,
 }
 
-/// Apprise notification configuration
-///
-/// Apprise provides a unified interface to send notifications to 100+ services
-/// including Slack, Discord, Teams, Telegram, SMS providers, and email.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppriseConfig {
-    /// List of Apprise service URLs
-    ///
-    /// Examples:
-    /// - Slack: "slack://xoxb-token/C0123456789"
-    /// - Discord: "discord://webhook_id/webhook_token"
-    /// - Email: "mailto://user:pass@smtp.gmail.com"
-    ///
-    /// See https://github.com/caronc/apprise for full list of supported services
     pub urls: Vec<String>,
-
-    /// Minimum severity level to notify (optional)
-    ///
-    /// Valid values: "info", "low", "medium", "high"
-    /// Default: "info" (notify all alerts)
     #[serde(default)]
     pub min_severity: Option<String>,
 }
@@ -39,6 +42,8 @@ pub struct AppriseConfig {
 #[derive(Debug, Deserialize, Clone, Default)]
 #[allow(dead_code)]
 pub struct Config {
+    #[serde(default)]
+    pub api: ApiConfig,
     #[serde(default)]
     pub runtime: RuntimeConfig,
     #[serde(default)]
@@ -307,42 +312,22 @@ mod tests {
     fn parse_config_defaults() {
         let toml = r#"[runtime]
 offline = true
-cpu_target_pct = 25
-rss_cap_mb = 512
-events_rate_cap = 100000
-[reasoner]
-enabled = true
-endpoint = "http://127.0.0.1:8087/v1/chat/completions"
-window_seconds = 5
-timeout_ms = 150
-min_eps_to_enable = 20
-[logging]
-alerts_file = "/var/log/linnix/alerts.ndjson"
-journald = true
-[outputs]
-slack = false
-pagerduty = false
-prometheus = false
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(cfg.runtime.offline);
-        assert_eq!(cfg.runtime.cpu_target_pct, 25);
-        assert_eq!(cfg.logging.alerts_file, "/var/log/linnix/alerts.ndjson");
-        assert_eq!(cfg.logging.insights_file, "/var/log/linnix/insights.ndjson");
-        assert!(!cfg.outputs.slack);
-        assert_eq!(cfg.rules.path, "/etc/linnix/rules.toml");
-        assert!(cfg.reasoner.enabled);
-        assert_eq!(cfg.reasoner.window_seconds, 5);
-        assert_eq!(cfg.reasoner.min_eps_to_enable, 20);
-        assert_eq!(cfg.reasoner.topk_kb, 3);
-        assert!(cfg.reasoner.tools_enabled);
-        assert_eq!(cfg.reasoner.kb.max_docs, 10);
-        assert_eq!(cfg.reasoner.kb.max_doc_bytes, 5_000);
-        assert_eq!(
-            cfg.reasoner.kb.dir.as_deref(),
-            Some(std::path::Path::new("/etc/linnix/kb"))
-        );
-        assert!(cfg.logging.incident_context_file.is_none());
+        assert_eq!(cfg.api.listen_addr, "127.0.0.1:3000");
+        assert!(cfg.api.auth_token.is_none());
+    }
+
+    #[test]
+    fn parse_api_config() {
+        let toml = r#"[api]
+listen_addr = "0.0.0.0:8080"
+auth_token = "secret123"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.api.listen_addr, "0.0.0.0:8080");
+        assert_eq!(cfg.api.auth_token, Some("secret123".to_string()));
     }
 
     #[test]

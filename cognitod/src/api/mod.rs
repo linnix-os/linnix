@@ -1,3 +1,5 @@
+mod auth;
+
 use crate::runtime::probes::ProbeState;
 use axum::{
     Router,
@@ -1572,10 +1574,12 @@ pub struct AppState {
     pub reasoner: ReasonerConfig,
     pub prometheus_enabled: bool,
     pub alert_history: Arc<AlertHistory>,
+    pub auth_token: Option<String>,
 }
 
 pub fn all_routes(app_state: Arc<AppState>) -> Router {
     let prometheus_enabled = app_state.prometheus_enabled;
+    let auth_token = app_state.auth_token.clone();
 
     let mut router = Router::new()
         .route("/", get(crate::ui::dashboard_handler))
@@ -1602,6 +1606,13 @@ pub fn all_routes(app_state: Arc<AppState>) -> Router {
 
     if prometheus_enabled {
         router = router.route("/metrics/prometheus", get(prometheus_metrics));
+    }
+
+    if auth_token.is_some() {
+        router = router.layer(axum::middleware::from_fn_with_state(
+            auth_token,
+            auth::auth_middleware,
+        ));
     }
 
     router.with_state(app_state)
@@ -1747,6 +1758,7 @@ mod tests {
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
+            auth_token: None,
         });
         let Json(resp) = super::status_handler(State(app_state)).await;
         let val = serde_json::to_value(resp).unwrap();
@@ -1791,6 +1803,7 @@ mod tests {
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
+            auth_token: None,
         });
 
         let Json(resp) = super::metrics_handler(State(app_state)).await;
@@ -1833,6 +1846,7 @@ mod tests {
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
+            auth_token: None,
         });
         let router = super::all_routes(Arc::clone(&app_state));
         let response = router
@@ -1863,6 +1877,7 @@ mod tests {
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: true,
             alert_history: Arc::new(AlertHistory::new(16)),
+            auth_token: None,
         });
         let router = super::all_routes(Arc::clone(&app_state));
         let response = router
@@ -1890,5 +1905,148 @@ mod tests {
             body_text.contains("linnix_events_total"),
             "expected metric missing: {body_text}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_no_auth_allows_requests() {
+        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10));
+        let metrics = Arc::new(Metrics::new());
+        let app_state = Arc::new(AppState {
+            context: Arc::clone(&ctx),
+            metrics: Arc::clone(&metrics),
+            alerts: None,
+            insights: Arc::new(InsightStore::new(16, None)),
+            offline: Arc::new(OfflineGuard::new(false)),
+            transport: "perf",
+            probe_state: ProbeState::disabled(),
+            reasoner: ReasonerConfig::default(),
+            prometheus_enabled: false,
+            alert_history: Arc::new(AlertHistory::new(16)),
+            auth_token: None,
+        });
+        let router = super::all_routes(app_state);
+        let response = router
+            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_auth_required_when_token_set() {
+        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10));
+        let metrics = Arc::new(Metrics::new());
+        let app_state = Arc::new(AppState {
+            context: Arc::clone(&ctx),
+            metrics: Arc::clone(&metrics),
+            alerts: None,
+            insights: Arc::new(InsightStore::new(16, None)),
+            offline: Arc::new(OfflineGuard::new(false)),
+            transport: "perf",
+            probe_state: ProbeState::disabled(),
+            reasoner: ReasonerConfig::default(),
+            prometheus_enabled: false,
+            alert_history: Arc::new(AlertHistory::new(16)),
+            auth_token: Some("secret123".to_string()),
+        });
+        let router = super::all_routes(app_state);
+        let response = router
+            .oneshot(Request::builder().uri("/processes").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_with_valid_bearer_token() {
+        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10));
+        let metrics = Arc::new(Metrics::new());
+        let app_state = Arc::new(AppState {
+            context: Arc::clone(&ctx),
+            metrics: Arc::clone(&metrics),
+            alerts: None,
+            insights: Arc::new(InsightStore::new(16, None)),
+            offline: Arc::new(OfflineGuard::new(false)),
+            transport: "perf",
+            probe_state: ProbeState::disabled(),
+            reasoner: ReasonerConfig::default(),
+            prometheus_enabled: false,
+            alert_history: Arc::new(AlertHistory::new(16)),
+            auth_token: Some("secret123".to_string()),
+        });
+        let router = super::all_routes(app_state);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .header("Authorization", "Bearer secret123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_auth_with_invalid_token() {
+        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10));
+        let metrics = Arc::new(Metrics::new());
+        let app_state = Arc::new(AppState {
+            context: Arc::clone(&ctx),
+            metrics: Arc::clone(&metrics),
+            alerts: None,
+            insights: Arc::new(InsightStore::new(16, None)),
+            offline: Arc::new(OfflineGuard::new(false)),
+            transport: "perf",
+            probe_state: ProbeState::disabled(),
+            reasoner: ReasonerConfig::default(),
+            prometheus_enabled: false,
+            alert_history: Arc::new(AlertHistory::new(16)),
+            auth_token: Some("secret123".to_string()),
+        });
+        let router = super::all_routes(app_state);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/processes")
+                    .header("Authorization", "Bearer wrong_token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_with_malformed_header() {
+        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10));
+        let metrics = Arc::new(Metrics::new());
+        let app_state = Arc::new(AppState {
+            context: Arc::clone(&ctx),
+            metrics: Arc::clone(&metrics),
+            alerts: None,
+            insights: Arc::new(InsightStore::new(16, None)),
+            offline: Arc::new(OfflineGuard::new(false)),
+            transport: "perf",
+            probe_state: ProbeState::disabled(),
+            reasoner: ReasonerConfig::default(),
+            prometheus_enabled: false,
+            alert_history: Arc::new(AlertHistory::new(16)),
+            auth_token: Some("secret123".to_string()),
+        });
+        let router = super::all_routes(app_state);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/processes")
+                    .header("Authorization", "Basic dXNlcjpwYXNz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }
