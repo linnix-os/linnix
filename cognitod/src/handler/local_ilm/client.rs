@@ -4,6 +4,13 @@ use serde::Serialize;
 use serde_json::Value;
 use std::time::Duration;
 
+const INSIGHT_GRAMMAR: &str = r#"root ::= "{" space "\"class\"" space ":" space class space "," space "\"confidence\"" space ":" space confidence space "," space "\"why\"" space ":" space string space "," space "\"actions\"" space ":" space actions space "}"
+class ::= "\"fork_storm\"" | "\"cpu_spin\"" | "\"memory_leak\"" | "\"runaway_tree\"" | "\"short_lived_jobs\"" | "\"unknown\""
+confidence ::= "0." [0-9] [0-9]? | "1.0"
+string ::= "\"" [^\"]* "\""
+actions ::= "[" space (string (space "," space string)*)? space "]"
+space ::= [ \t\n]*"#;
+
 #[derive(Clone)]
 pub struct ChatMessage {
     pub role: &'static str,
@@ -79,6 +86,8 @@ struct ChatRequest<'a> {
     max_tokens: u32,
     stream: bool,
     messages: Vec<MessagePayload<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grammar: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -101,6 +110,7 @@ fn build_request(messages: &[ChatMessage]) -> ChatRequest<'_> {
         max_tokens: 48,
         stream: false,
         messages: payload,
+        grammar: Some(INSIGHT_GRAMMAR),
     }
 }
 
@@ -118,4 +128,28 @@ fn extract_message(value: &Value) -> Result<String> {
         .and_then(|c| c.as_str())
         .ok_or_else(|| anyhow!("completion missing message content"))?;
     Ok(message.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_grammar_is_valid_gbnf() {
+        assert!(INSIGHT_GRAMMAR.contains("root ::="));
+        assert!(INSIGHT_GRAMMAR.contains("class ::="));
+        assert!(INSIGHT_GRAMMAR.contains("confidence ::="));
+        assert!(INSIGHT_GRAMMAR.contains("actions ::="));
+    }
+
+    #[test]
+    fn test_request_includes_grammar() {
+        let msg = ChatMessage {
+            role: "user",
+            content: "test".to_string(),
+        };
+        let messages = [msg];
+        let req = build_request(&messages);
+        assert_eq!(req.grammar, Some(INSIGHT_GRAMMAR));
+    }
 }
