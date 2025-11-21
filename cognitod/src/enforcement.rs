@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
+mod safety;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum ActionType {
@@ -57,7 +59,13 @@ impl EnforcementQueue {
         reason: String,
         source: String,
         confidence: Option<f64>,
-    ) -> String {
+    ) -> Result<String, String> {
+        match &action {
+            ActionType::KillProcess { pid, .. } => {
+                safety::SafetyGuard::is_safe_to_kill(*pid)?;
+            }
+        }
+
         let id = format!("action-{}", self.next_id.fetch_add(1, Ordering::SeqCst));
         let now = current_epoch_secs();
 
@@ -79,7 +87,7 @@ impl EnforcementQueue {
             .await
             .insert(id.clone(), enforcement_action);
         log::info!("[enforcement] proposed {id}");
-        id
+        Ok(id)
     }
 
     pub async fn approve(&self, id: &str, approver: String) -> Result<EnforcementAction, String> {
@@ -173,7 +181,7 @@ mod tests {
                 "test".to_string(),
                 None,
             )
-            .await;
+            .await.unwrap();
 
         let pending = queue.get_pending().await;
         assert_eq!(pending.len(), 1);
@@ -199,7 +207,7 @@ mod tests {
                 "test".to_string(),
                 None,
             )
-            .await;
+            .await.unwrap();
 
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
@@ -221,7 +229,7 @@ mod tests {
                 "test".to_string(),
                 None,
             )
-            .await;
+            .await.unwrap();
 
         queue.reject(&id, "bob".to_string()).await.unwrap();
 
@@ -245,7 +253,7 @@ mod tests {
                 "test".to_string(),
                 None,
             )
-            .await;
+            .await.unwrap();
 
         queue.approve(&id, "alice".to_string()).await.unwrap();
 

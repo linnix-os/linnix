@@ -649,14 +649,17 @@ fn emit_insight(
                 let reason = insight.why.clone();
                 let confidence = insight.confidence;
                 tokio::spawn(async move {
-                    queue_clone
+                    if let Err(e) = queue_clone
                         .propose(
                             crate::enforcement::ActionType::KillProcess { pid, signal: 9 },
                             reason,
                             "llm".to_string(),
                             Some(confidence),
                         )
-                        .await;
+                        .await
+                    {
+                        log::warn!("[enforcement] rejected proposal: {}", e);
+                    }
                 });
             }
         }
