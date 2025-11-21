@@ -35,6 +35,24 @@ Recommended toolchain versions:
 
 ## Workflow
 
+### Install Git Hooks (Recommended)
+
+Run checks locally before every commit:
+
+```bash
+./scripts/install-git-hooks.sh
+```
+
+This installs a pre-commit hook that automatically runs:
+- `cargo fmt --check` - Code formatting
+- `cargo clippy` - Lints
+- `cargo nextest run` - Unit tests
+- `cargo deny check` - Dependency audit (if installed)
+
+To skip hooks temporarily: `git commit --no-verify`
+
+### Development Steps
+
 1. **Fork & branch**: `git checkout -b feat/my-change`
 2. **Make changes** with clear, small commits.
 3. **Format + lint**:
