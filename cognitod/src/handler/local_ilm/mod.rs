@@ -130,6 +130,7 @@ struct WindowSummary {
     primary_ppid: Option<u32>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_worker(
     mut rx: mpsc::Receiver<ProcessEvent>,
     cfg: ReasonerConfig,
@@ -783,6 +784,7 @@ mod tests {
             None,
             Arc::clone(&context),
             Arc::clone(&insight_store),
+            None,
         )
         .await
         .expect("handler should initialize");

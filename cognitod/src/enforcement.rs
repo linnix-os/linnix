@@ -82,11 +82,7 @@ impl EnforcementQueue {
         id
     }
 
-    pub async fn approve(
-        &self,
-        id: &str,
-        approver: String,
-    ) -> Result<EnforcementAction, String> {
+    pub async fn approve(&self, id: &str, approver: String) -> Result<EnforcementAction, String> {
         let mut actions = self.actions.write().await;
         let action = actions.get_mut(id).ok_or("action not found")?;
 
@@ -126,6 +122,7 @@ impl EnforcementQueue {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn get_pending(&self) -> Vec<EnforcementAction> {
         let now = current_epoch_secs();
         let mut actions = self.actions.write().await;
@@ -168,7 +165,10 @@ mod tests {
         let queue = EnforcementQueue::new(300);
         let id = queue
             .propose(
-                ActionType::KillProcess { pid: 123, signal: 9 },
+                ActionType::KillProcess {
+                    pid: 123,
+                    signal: 9,
+                },
                 "test".to_string(),
                 "test".to_string(),
                 None,
@@ -188,17 +188,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_expiration() {
-        let queue = EnforcementQueue::new(0); // Expire immediately
+        let queue = EnforcementQueue::new(0); // Expire immediately (0 seconds TTL)
         let id = queue
             .propose(
-                ActionType::KillProcess { pid: 123, signal: 9 },
+                ActionType::KillProcess {
+                    pid: 123,
+                    signal: 9,
+                },
                 "test".to_string(),
                 "test".to_string(),
                 None,
             )
             .await;
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
         let result = queue.approve(&id, "alice".to_string()).await;
         assert!(result.is_err());
@@ -210,7 +213,10 @@ mod tests {
         let queue = EnforcementQueue::new(300);
         let id = queue
             .propose(
-                ActionType::KillProcess { pid: 123, signal: 9 },
+                ActionType::KillProcess {
+                    pid: 123,
+                    signal: 9,
+                },
                 "test".to_string(),
                 "test".to_string(),
                 None,
@@ -231,7 +237,10 @@ mod tests {
         let queue = EnforcementQueue::new(300);
         let id = queue
             .propose(
-                ActionType::KillProcess { pid: 123, signal: 9 },
+                ActionType::KillProcess {
+                    pid: 123,
+                    signal: 9,
+                },
                 "test".to_string(),
                 "test".to_string(),
                 None,

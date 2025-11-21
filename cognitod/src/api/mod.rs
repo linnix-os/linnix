@@ -1268,7 +1268,9 @@ async fn get_insight_schema_route() -> Json<Value> {
     Json(insight_json_schema().clone())
 }
 
-async fn get_actions(State(state): State<Arc<AppState>>) -> Json<Vec<crate::enforcement::EnforcementAction>> {
+async fn get_actions(
+    State(state): State<Arc<AppState>>,
+) -> Json<Vec<crate::enforcement::EnforcementAction>> {
     if let Some(queue) = &state.enforcement {
         let all = queue.get_all().await;
         Json(all)
@@ -1282,7 +1284,9 @@ async fn get_action_by_id(
     Path(id): Path<String>,
 ) -> Result<Json<crate::enforcement::EnforcementAction>, StatusCode> {
     if let Some(queue) = &state.enforcement {
-        queue.get_by_id(&id).await
+        queue
+            .get_by_id(&id)
+            .await
             .map(Json)
             .ok_or(StatusCode::NOT_FOUND)
     } else {
@@ -1301,7 +1305,9 @@ async fn approve_action(
     Json(req): Json<ApprovalRequest>,
 ) -> Result<Json<crate::enforcement::EnforcementAction>, StatusCode> {
     if let Some(queue) = &state.enforcement {
-        queue.approve(&id, req.approver).await
+        queue
+            .approve(&id, req.approver)
+            .await
             .map(Json)
             .map_err(|_| StatusCode::BAD_REQUEST)
     } else {
@@ -1315,7 +1321,9 @@ async fn reject_action(
     Json(req): Json<ApprovalRequest>,
 ) -> Result<StatusCode, StatusCode> {
     if let Some(queue) = &state.enforcement {
-        queue.reject(&id, req.approver).await
+        queue
+            .reject(&id, req.approver)
+            .await
             .map(|_| StatusCode::OK)
             .map_err(|_| StatusCode::BAD_REQUEST)
     } else {
@@ -1815,6 +1823,7 @@ mod tests {
             offline: Arc::new(OfflineGuard::new(false)),
             transport: "perf",
             probe_state: ProbeState::disabled(),
+            enforcement: None,
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
@@ -1860,6 +1869,7 @@ mod tests {
                 rss_probe: RssProbeMode::CoreMm,
                 btf_available: true,
             },
+            enforcement: None,
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
@@ -1903,6 +1913,7 @@ mod tests {
             offline: Arc::new(OfflineGuard::new(false)),
             transport: "perf",
             probe_state: ProbeState::disabled(),
+            enforcement: None,
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
@@ -1934,6 +1945,7 @@ mod tests {
             offline: Arc::new(OfflineGuard::new(false)),
             transport: "perf",
             probe_state: ProbeState::disabled(),
+            enforcement: None,
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: true,
             alert_history: Arc::new(AlertHistory::new(16)),
@@ -1979,6 +1991,7 @@ mod tests {
             offline: Arc::new(OfflineGuard::new(false)),
             transport: "perf",
             probe_state: ProbeState::disabled(),
+            enforcement: None,
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
@@ -2009,6 +2022,7 @@ mod tests {
             offline: Arc::new(OfflineGuard::new(false)),
             transport: "perf",
             probe_state: ProbeState::disabled(),
+            enforcement: None,
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
@@ -2039,6 +2053,7 @@ mod tests {
             offline: Arc::new(OfflineGuard::new(false)),
             transport: "perf",
             probe_state: ProbeState::disabled(),
+            enforcement: None,
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
@@ -2070,6 +2085,7 @@ mod tests {
             offline: Arc::new(OfflineGuard::new(false)),
             transport: "perf",
             probe_state: ProbeState::disabled(),
+            enforcement: None,
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
@@ -2101,6 +2117,7 @@ mod tests {
             offline: Arc::new(OfflineGuard::new(false)),
             transport: "perf",
             probe_state: ProbeState::disabled(),
+            enforcement: None,
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
