@@ -18,11 +18,11 @@ retention_seconds = 60
 [reasoner]
 # AI-powered incident detection
 enabled = true
-endpoint = "http://llama-server:8090/v1/chat/completions"
+endpoint = "http://localhost:8090/v1/chat/completions"
 model = "linnix-3b-distilled"
-window_seconds = 30
+window_seconds = 10
 timeout_ms = 30000
-min_eps_to_enable = 0
+min_eps_to_enable = 0  # Enable for testing
 
 [prometheus]
 # Prometheus metrics endpoint

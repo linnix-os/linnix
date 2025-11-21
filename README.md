@@ -39,7 +39,38 @@ docker-compose restart cognitod
   <img src="docs/images/linnix-demo.gif" alt="Linnix detecting a fork storm" width="800"/>
 </p>
 
-**Dashboard:** http://localhost:3000 | **API:** http://localhost:3000/alerts
+**Dashboard:** http://localhost:3000 | **API:** http://localhost:3000/alerts | **Enforcement:** http://localhost:3000/actions
+
+---
+
+## Human-in-the-Loop Enforcement
+
+![Enforcement Demo](docs/images/enforcement-demo.gif)
+
+When AI detects system failures, it proposes enforcement actions—but only humans can approve them.
+
+```bash
+# 1. AI detects issue and proposes action
+[eBPF] CPU spike: 92% for 8 seconds
+[LLM]  Proposes: kill 31337
+
+# 2. Review pending action
+$ curl http://localhost:3000/actions
+[{"id": "action-1", "action": {"type": "kill_process", "pid": 31337}, "status": "pending"}]
+
+# 3. Human approves
+$ curl -X POST http://localhost:3000/actions/action-1/approve -d '{"approver": "sre-alice"}'
+
+# 4. Audit trail
+$ docker logs cognitod | grep APPROVED
+[linnix_audit] APPROVED action-1 by sre-alice
+```
+
+**Why human approval?** Security (no prompt injection), compliance (audit trail), trust (progressive automation).
+
+**API:** `GET /actions`, `GET /actions/{id}`, `POST /actions/{id}/approve`, `POST /actions/{id}/reject`
+
+See [DEMO_ENFORCEMENT.md](DEMO_ENFORCEMENT.md) for full walkthrough.
 
 ---
 

@@ -33,6 +33,7 @@ mod api;
 mod bpf_config;
 mod config;
 mod context;
+mod enforcement;
 #[cfg(feature = "fake-events")]
 mod fake_events;
 mod handler;
@@ -539,6 +540,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     // Handlers specified on the command line
     let mut handler_list = HandlerList::new();
+    let enforcement_queue = Some(Arc::new(enforcement::EnforcementQueue::new(300)));
     let mut alert_tx = None;
     for h in handler {
         if let Some(path) = h.strip_prefix("jsonl:") {
@@ -729,6 +731,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             kb_index,
             Arc::clone(&context),
             Arc::clone(&insight_store),
+            enforcement_queue.clone(),
         )
         .await
         {
@@ -868,6 +871,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         prometheus_enabled: config.outputs.prometheus,
         alert_history: Arc::clone(&alert_history),
         auth_token: auth_token.clone(),
+        enforcement: enforcement_queue,
     });
 
     let api = all_routes(app_state.clone());
