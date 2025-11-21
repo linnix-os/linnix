@@ -181,7 +181,8 @@ mod tests {
                 "test".to_string(),
                 None,
             )
-            .await.unwrap();
+            .await
+            .unwrap();
 
         let pending = queue.get_pending().await;
         assert_eq!(pending.len(), 1);
@@ -207,7 +208,8 @@ mod tests {
                 "test".to_string(),
                 None,
             )
-            .await.unwrap();
+            .await
+            .unwrap();
 
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
@@ -229,7 +231,8 @@ mod tests {
                 "test".to_string(),
                 None,
             )
-            .await.unwrap();
+            .await
+            .unwrap();
 
         queue.reject(&id, "bob".to_string()).await.unwrap();
 
@@ -253,7 +256,8 @@ mod tests {
                 "test".to_string(),
                 None,
             )
-            .await.unwrap();
+            .await
+            .unwrap();
 
         queue.approve(&id, "alice".to_string()).await.unwrap();
 
