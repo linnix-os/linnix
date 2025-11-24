@@ -214,7 +214,9 @@ mod tests {
     #[test]
     fn test_parse_analysis() {
         let response = r#"
+ACTION_SUMMARY: Auto-killed aggressive process causing system thrashing
 ROOT_CAUSE: Process fork bomb created 200 competing processes, overwhelming scheduler
+IMPACT: System became unresponsive
 SEVERITY: critical
 RECOMMENDATION: Implement process limits (ulimit -u) and monitor fork rates
 CONFIDENCE: 0.95
@@ -224,6 +226,7 @@ CONFIDENCE: 0.95
         assert_eq!(analysis.severity, "critical");
         assert_eq!(analysis.confidence, 0.95);
         assert!(analysis.root_cause.contains("fork bomb"));
+        assert!(analysis.action_summary.contains("Auto-killed"));
     }
 
     #[test]
@@ -254,7 +257,7 @@ CONFIDENCE: 0.95
 
         let prompt = analyzer.build_analysis_prompt(&incident);
 
-        assert!(prompt.contains("75.21%"));
+        assert!(prompt.contains("75.2%")); // .1 precision
         assert!(prompt.contains("aggressive-stress.sh"));
         assert!(prompt.contains("Dual-signal CPU thrashing"));
     }
