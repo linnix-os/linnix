@@ -85,10 +85,26 @@ Linnix can detect 5 different failure patterns (when demo mode is enabled):
 | CPU spike | subtree_cpu_pct | >50% CPU for 5s |
 | Runaway tree | High CPU subtree | Parent+child >90% CPU |
 | Short-lived jobs | Rapid exec/exit | Process churn detection |
+| **Circuit Breaker** | **PSI + CPU Saturation** | **>90% CPU + >40% PSI (Stall) for 15s** |
 
 **How?** eBPF monitors at the kernel level (fork, exec, exit events). Rules engine analyzes patterns and alerts in real-time.
 
 All detection rules are configurable in `configs/rules.yaml`
+
+### 🛡️ Circuit Breaker with Grace Period
+Prevents system thrashing by monitoring **Pressure Stall Information (PSI)**.
+- **Dual-Signal Detection**: Triggers only when CPU is high (>90%) **AND** processes are actually stalled (>40% PSI).
+- **Grace Period**: Configurable delay (default 15s) prevents killing processes during transient spikes.
+- **Incident Analysis**: Automatically captures system state and uses LLM to analyze the root cause.
+
+**Configuration:**
+```toml
+[circuit_breaker]
+enabled = true
+cpu_usage_threshold = 90.0
+cpu_psi_threshold = 40.0
+grace_period_secs = 15  # Prevents false positives
+```
 
 ---
 
@@ -186,6 +202,10 @@ Built-in pattern detection catches:
 - **CPU thrashing** - processes stuck in loops
 - **FD exhaustion** - files not closed (approaching limit)
 
+### Incident Forensics
+- **Incident Store**: Stores full incident context (snapshots, process tree) in SQLite for post-mortem analysis.
+- **LLM Analysis**: Automatically analyzes root cause and suggests fixes.
+
 ### Optional: Local LLM Analysis
 
 - Runs llama.cpp with 3B quantized model
@@ -211,6 +231,7 @@ Built-in pattern detection catches:
 │  • Event processing    • Process tree tracking               │
 │  • State management    • Rules engine                        │
 │  • HTTP/SSE API        • Prometheus metrics                  │
+│  • Incident Store (SQLite)                                   │
 └────────────────────────┬─────────────────────────────────────┘
                          │
          ┌───────────────┼───────────────┐
