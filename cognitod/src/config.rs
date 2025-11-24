@@ -347,6 +347,11 @@ pub struct CircuitBreakerConfig {
     /// Require human approval even when circuit breaker triggers (override safety)
     #[serde(default = "default_require_human_approval")]
     pub require_human_approval: bool,
+
+    /// Operation mode: "monitor" (default) or "enforce"
+    /// In "monitor" mode, actions are proposed but NEVER executed automatically.
+    #[serde(default = "default_circuit_breaker_mode")]
+    pub mode: String,
 }
 
 impl Default for CircuitBreakerConfig {
@@ -360,6 +365,7 @@ impl Default for CircuitBreakerConfig {
             check_interval_secs: default_check_interval_secs(),
             grace_period_secs: default_grace_period_secs(),
             require_human_approval: default_require_human_approval(),
+            mode: default_circuit_breaker_mode(),
         }
     }
 }
@@ -394,6 +400,10 @@ fn default_grace_period_secs() -> u64 {
 
 fn default_require_human_approval() -> bool {
     false // Auto-approve when circuit breaker triggers (but still requires enabled=true)
+}
+
+fn default_circuit_breaker_mode() -> String {
+    "monitor".to_string() // Default to safe mode
 }
 
 #[cfg(test)]

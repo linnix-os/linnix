@@ -902,8 +902,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
 
             info!(
-                "[circuit_breaker] enabled - CPU>{}% AND PSI>{}% sustained for {}s triggers kill",
-                cb_cfg.cpu_usage_threshold, cb_cfg.cpu_psi_threshold, cb_cfg.grace_period_secs
+                "[circuit_breaker] enabled - CPU>{}% AND PSI>{}% sustained for {}s triggers kill (mode: {})",
+                cb_cfg.cpu_usage_threshold,
+                cb_cfg.cpu_psi_threshold,
+                cb_cfg.grace_period_secs,
+                cb_cfg.mode
             );
 
             let mut breach_started_at: Option<std::time::Instant> = None;
@@ -959,7 +962,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         reason.clone(),
                                         "circuit_breaker".to_string(),
                                         None,
-                                        !cb_cfg.require_human_approval,
+                                        if cb_cfg.mode == "monitor" {
+                                            false // Force manual approval in monitor mode
+                                        } else {
+                                            !cb_cfg.require_human_approval
+                                        },
                                     )
                                     .await
                                 {

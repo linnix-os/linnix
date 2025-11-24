@@ -43,6 +43,17 @@ docker-compose restart cognitod
 
 ---
 
+---
+
+## Modes
+
+Linnix runs in two modes, configured in `linnix.toml`:
+
+- **`monitor` (Default)**: Safe by default. Detects failures and proposes actions, but **NEVER** executes them automatically. Requires human approval via API.
+- **`enforce`**: Advanced mode. Automatically executes actions (like killing processes) when strict safety rules are met.
+
+---
+
 ## Human-in-the-Loop Enforcement
 
 ![Enforcement Demo](docs/images/enforcement-demo.gif)
