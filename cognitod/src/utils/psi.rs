@@ -43,6 +43,7 @@ pub struct PsiMetrics {
     pub io_full_avg10: f32,
 }
 
+#[allow(dead_code)]
 impl PsiMetrics {
     /// Read PSI metrics from /proc/pressure/*
     ///

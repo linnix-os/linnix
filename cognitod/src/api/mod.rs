@@ -1740,6 +1740,7 @@ fn dependency_version(target: &str) -> Option<String> {
 // ========================================
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct IncidentQueryParams {
     #[serde(default = "default_limit")]
     limit: i64,
@@ -2174,6 +2175,7 @@ mod tests {
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
+            incident_store: None,
             auth_token: Some("secret123".to_string()),
         });
         let router = super::all_routes(app_state);
@@ -2205,6 +2207,7 @@ mod tests {
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
+            incident_store: None,
             auth_token: Some("secret123".to_string()),
         });
         let router = super::all_routes(app_state);
@@ -2237,6 +2240,7 @@ mod tests {
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
+            incident_store: None,
             auth_token: Some("secret123".to_string()),
         });
         let router = super::all_routes(app_state);
@@ -2269,6 +2273,7 @@ mod tests {
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
+            incident_store: None,
             auth_token: Some("secret123".to_string()),
         });
         let router = super::all_routes(app_state);

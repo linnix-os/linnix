@@ -119,7 +119,6 @@ fn default_events_rate_cap() -> u64 {
 
 #[derive(Debug, Deserialize, Clone)]
 #[allow(dead_code)]
-#[allow(dead_code)]
 pub struct LoggingConfig {
     #[serde(default = "default_alerts_file")]
     pub alerts_file: String,
@@ -153,7 +152,6 @@ fn default_insights_file() -> String {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[allow(dead_code)]
 #[allow(dead_code)]
 pub struct RulesFileConfig {
     #[serde(default = "default_rules_file")]
