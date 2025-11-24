@@ -10,7 +10,7 @@ use super::Incident;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::time::Duration;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Analysis result from LLM
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,7 +26,6 @@ pub struct IncidentAnalysis {
 /// Incident analyzer using local LLM
 pub struct IncidentAnalyzer {
     endpoint: String,
-    timeout: Duration,
     client: reqwest::Client,
 }
 
@@ -35,11 +34,7 @@ impl IncidentAnalyzer {
     pub fn new(endpoint: String, timeout: Duration) -> Result<Self, reqwest::Error> {
         let client = reqwest::Client::builder().timeout(timeout).build()?;
 
-        Ok(Self {
-            endpoint,
-            timeout,
-            client,
-        })
+        Ok(Self { endpoint, client })
     }
 
     /// Analyze an incident using the LLM

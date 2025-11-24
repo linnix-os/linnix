@@ -1971,6 +1971,7 @@ mod tests {
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
             auth_token: None,
+            incident_store: None,
         });
         let Json(resp) = super::status_handler(State(app_state)).await;
         let val = serde_json::to_value(resp).unwrap();
@@ -2017,6 +2018,7 @@ mod tests {
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
             auth_token: None,
+            incident_store: None,
         });
 
         let Json(resp) = super::metrics_handler(State(app_state)).await;
@@ -2061,6 +2063,7 @@ mod tests {
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
             auth_token: None,
+            incident_store: None,
         });
         let router = super::all_routes(Arc::clone(&app_state));
         let response = router
@@ -2093,6 +2096,7 @@ mod tests {
             prometheus_enabled: true,
             alert_history: Arc::new(AlertHistory::new(16)),
             auth_token: None,
+            incident_store: None,
         });
         let router = super::all_routes(Arc::clone(&app_state));
         let response = router
@@ -2139,6 +2143,7 @@ mod tests {
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
             auth_token: None,
+            incident_store: None,
         });
         let router = super::all_routes(app_state);
         let response = router

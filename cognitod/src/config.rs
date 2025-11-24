@@ -81,6 +81,7 @@ impl Config {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
 pub struct RuntimeConfig {
     #[serde(default = "default_offline")]
     pub offline: bool,
@@ -118,6 +119,7 @@ fn default_events_rate_cap() -> u64 {
 
 #[derive(Debug, Deserialize, Clone)]
 #[allow(dead_code)]
+#[allow(dead_code)]
 pub struct LoggingConfig {
     #[serde(default = "default_alerts_file")]
     pub alerts_file: String,
@@ -152,6 +154,7 @@ fn default_insights_file() -> String {
 
 #[derive(Debug, Deserialize, Clone)]
 #[allow(dead_code)]
+#[allow(dead_code)]
 pub struct RulesFileConfig {
     #[serde(default = "default_rules_file")]
     pub path: String,
@@ -170,6 +173,7 @@ fn default_rules_file() -> String {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
 pub struct ReasonerConfig {
     #[serde(default = "default_reasoner_enabled")]
     pub enabled: bool,
@@ -233,6 +237,7 @@ fn default_reasoner_tools_enabled() -> bool {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
 pub struct ReasonerKbConfig {
     #[serde(default = "default_reasoner_kb_dir")]
     pub dir: Option<PathBuf>,
@@ -309,6 +314,7 @@ pub struct ProbesConfig {
 /// PSI measures resource contention (stall time), not just usage.
 /// Key insight: 100% CPU + low PSI = efficient worker. 40% CPU + high PSI = disaster.
 #[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
 pub struct CircuitBreakerConfig {
     /// Enable automatic circuit breaking (disabled by default for safety)
     #[serde(default = "default_circuit_breaker_enabled")]

@@ -49,6 +49,7 @@ pub struct Metrics {
     circuit_breaker_safety_vetoes: AtomicU64, // Kills blocked by safety checks
 }
 
+#[allow(dead_code)]
 impl Metrics {
     pub fn new() -> Self {
         Self {

@@ -23,6 +23,12 @@ pub struct HandlerList {
     handlers: Vec<Arc<dyn Handler>>,
 }
 
+impl Default for HandlerList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HandlerList {
     pub fn new() -> Self {
         Self {
@@ -126,6 +132,11 @@ mod tests {
             disk_write_bytes: 0,
             net_rx_bytes: 0,
             net_tx_bytes: 0,
+            psi_cpu_some_avg10: 0.0,
+            psi_memory_some_avg10: 0.0,
+            psi_memory_full_avg10: 0.0,
+            psi_io_some_avg10: 0.0,
+            psi_io_full_avg10: 0.0,
         };
         handler.on_snapshot(&snap).await;
         let content = tokio::fs::read_to_string(file.path()).await.unwrap();
