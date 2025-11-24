@@ -19,6 +19,7 @@ pub enum ActionStatus {
     Approved,
     Rejected,
     Expired,
+    Executed,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -60,6 +61,35 @@ impl EnforcementQueue {
         source: String,
         confidence: Option<f64>,
     ) -> Result<String, String> {
+        self.propose_internal(action, reason, source, confidence, false)
+            .await
+    }
+
+    /// Propose an action with optional auto-approval
+    ///
+    /// If auto_approve=true, the action is immediately approved by "circuit_breaker"
+    /// after safety checks pass. Still creates audit trail.
+    pub async fn propose_auto(
+        &self,
+        action: ActionType,
+        reason: String,
+        source: String,
+        confidence: Option<f64>,
+        auto_approve: bool,
+    ) -> Result<String, String> {
+        self.propose_internal(action, reason, source, confidence, auto_approve)
+            .await
+    }
+
+    async fn propose_internal(
+        &self,
+        action: ActionType,
+        reason: String,
+        source: String,
+        confidence: Option<f64>,
+        auto_approve: bool,
+    ) -> Result<String, String> {
+        // Safety checks ALWAYS run, even for auto-approved actions
         match &action {
             ActionType::KillProcess { pid, .. } => {
                 safety::SafetyGuard::is_safe_to_kill(*pid)?;
@@ -69,24 +99,44 @@ impl EnforcementQueue {
         let id = format!("action-{}", self.next_id.fetch_add(1, Ordering::SeqCst));
         let now = current_epoch_secs();
 
+        let (status, approved_by, approved_at) = if auto_approve {
+            (
+                ActionStatus::Approved,
+                Some("circuit_breaker".to_string()),
+                Some(now),
+            )
+        } else {
+            (ActionStatus::Pending, None, None)
+        };
+
         let enforcement_action = EnforcementAction {
             id: id.clone(),
             action,
-            reason,
-            source,
+            reason: reason.clone(),
+            source: source.clone(),
             confidence,
-            status: ActionStatus::Pending,
+            status,
             created_at: now,
             expires_at: now + self.ttl_secs,
-            approved_by: None,
-            approved_at: None,
+            approved_by: approved_by.clone(),
+            approved_at,
         };
 
         self.actions
             .write()
             .await
             .insert(id.clone(), enforcement_action);
-        log::info!("[enforcement] proposed {id}");
+
+        if auto_approve {
+            log::warn!(
+                target: "linnix_audit",
+                "CIRCUIT_BREAKER auto-approved {} source={} reason={}",
+                id, source, reason
+            );
+        } else {
+            log::info!("[enforcement] proposed {id}");
+        }
+
         Ok(id)
     }
 
@@ -127,6 +177,19 @@ impl EnforcementQueue {
 
         action.status = ActionStatus::Rejected;
         log::info!("[enforcement] rejected {id} by {rejector}");
+        Ok(())
+    }
+
+    pub async fn complete(&self, id: &str) -> Result<(), String> {
+        let mut actions = self.actions.write().await;
+        let action = actions.get_mut(id).ok_or("action not found")?;
+
+        if action.status != ActionStatus::Approved {
+            return Err(format!("not approved: {:?}", action.status));
+        }
+
+        action.status = ActionStatus::Executed;
+        log::info!("[enforcement] completed {id}");
         Ok(())
     }
 

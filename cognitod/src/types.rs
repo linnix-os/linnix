@@ -10,6 +10,13 @@ pub struct SystemSnapshot {
     pub disk_write_bytes: u64,
     pub net_rx_bytes: u64,
     pub net_tx_bytes: u64,
+    // PSI (Pressure Stall Information) - measures STALL TIME not just usage
+    // Key insight: 100% CPU with 5% PSI = efficient. 40% CPU with 60% PSI = disaster.
+    pub psi_cpu_some_avg10: f32, // % time tasks stalled waiting for CPU (10s avg)
+    pub psi_memory_some_avg10: f32, // % time tasks stalled waiting for memory
+    pub psi_memory_full_avg10: f32, // % time ALL tasks stalled (complete thrashing)
+    pub psi_io_some_avg10: f32,  // % time tasks stalled on I/O
+    pub psi_io_full_avg10: f32,  // % time ALL tasks stalled on I/O
 }
 
 #[derive(Debug, Serialize, Clone)]

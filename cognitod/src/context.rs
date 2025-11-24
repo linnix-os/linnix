@@ -8,6 +8,7 @@ use tokio::sync::broadcast;
 
 use crate::ProcessEvent;
 use crate::types::SystemSnapshot;
+use crate::utils::psi::PsiMetrics;
 
 use sysinfo::{
     Disks,    // disk container (sysinfo ≥ 0.36)
@@ -24,6 +25,7 @@ pub struct ContextStore {
     broadcaster: broadcast::Sender<ProcessEvent>,
     seq: AtomicU64,
     system_snapshot: Mutex<SystemSnapshot>,
+    sys: Mutex<System>,
 }
 
 #[derive(Clone, Debug)]
@@ -52,7 +54,13 @@ impl ContextStore {
                 disk_write_bytes: 0,
                 net_rx_bytes: 0,
                 net_tx_bytes: 0,
+                psi_cpu_some_avg10: 0.0,
+                psi_memory_some_avg10: 0.0,
+                psi_memory_full_avg10: 0.0,
+                psi_io_some_avg10: 0.0,
+                psi_io_full_avg10: 0.0,
             }),
+            sys: Mutex::new(System::new_all()),
         }
     }
 
@@ -248,8 +256,8 @@ impl ContextStore {
 
     /// Refresh and store a point‑in‑time `SystemSnapshot`.
     pub fn update_system_snapshot(&self) {
-        let mut sys = System::new_all();
-        sys.refresh_memory();
+        let mut sys = self.sys.lock().unwrap();
+        sys.refresh_all();
 
         let cpu_percent = sys.global_cpu_usage();
         let mem_percent = if sys.total_memory() > 0 {
@@ -281,6 +289,10 @@ impl ContextStore {
             read_bytes += disk_usage.read_bytes;
             write_bytes += disk_usage.written_bytes;
         }
+        // PSI (Pressure Stall Information) - measures stall time, not just usage
+        // Gracefully degrades to zeros if kernel doesn't support PSI (< 4.20)
+        let psi = PsiMetrics::read().unwrap_or_default();
+
         let mut snapshot = self.system_snapshot.lock().unwrap();
         *snapshot = SystemSnapshot {
             timestamp: SystemTime::now()
@@ -294,6 +306,11 @@ impl ContextStore {
             disk_write_bytes: write_bytes,
             net_rx_bytes: rx,
             net_tx_bytes: tx,
+            psi_cpu_some_avg10: psi.cpu_some_avg10,
+            psi_memory_some_avg10: psi.memory_some_avg10,
+            psi_memory_full_avg10: psi.memory_full_avg10,
+            psi_io_some_avg10: psi.io_some_avg10,
+            psi_io_full_avg10: psi.io_full_avg10,
         };
     }
 
@@ -303,7 +320,7 @@ impl ContextStore {
 
     /// Update per‑process CPU/memory usage.
     pub fn update_process_stats(&self) {
-        let mut sys = System::new_all();
+        let mut sys = self.sys.lock().unwrap();
         sys.refresh_all();
 
         let mut live = self.get_live_map();
@@ -318,6 +335,39 @@ impl ContextStore {
                 event.set_mem_percent(mem_pct);
             }
         }
+    }
+
+    /// Get top CPU processes from the entire system (not just eBPF-tracked ones).
+    /// This is a fallback for circuit breaker when no eBPF-tracked processes exist.
+    pub fn top_cpu_processes_systemwide(&self, limit: usize) -> Vec<ProcessMemorySummary> {
+        use std::cmp::Ordering;
+
+        let sys = self.sys.lock().unwrap();
+        let mut entries: Vec<ProcessMemorySummary> = sys
+            .processes()
+            .values()
+            .filter_map(|proc| {
+                let cpu = proc.cpu_usage();
+                if cpu <= 0.0 {
+                    return None;
+                }
+                Some(ProcessMemorySummary {
+                    pid: proc.pid().as_u32(),
+                    comm: proc.name().to_string_lossy().to_string(),
+                    mem_percent: cpu,
+                })
+            })
+            .collect();
+
+        entries.sort_by(|a, b| {
+            b.mem_percent
+                .partial_cmp(&a.mem_percent)
+                .unwrap_or(Ordering::Equal)
+        });
+        if entries.len() > limit {
+            entries.truncate(limit);
+        }
+        entries
     }
 }
 

@@ -43,6 +43,7 @@ mod notifications;
 mod routes;
 mod types;
 mod ui;
+mod utils;
 
 #[repr(transparent)]
 #[derive(Copy, Clone)]
@@ -538,6 +539,84 @@ async fn main() -> Result<(), Box<dyn Error>> {
         };
         Arc::new(InsightStore::new(INSIGHT_STORE_CAPACITY, path))
     };
+
+    // Initialize incident store for circuit breaker events
+    let incident_db_path = std::env::var("LINNIX_INCIDENT_DB")
+        .unwrap_or_else(|_| "/var/lib/linnix/incidents.db".to_string());
+
+    let incident_db_path = std::path::Path::new(&incident_db_path)
+        .canonicalize()
+        .unwrap_or_else(|_| {
+            if std::path::Path::new(&incident_db_path).is_absolute() {
+                std::path::PathBuf::from(&incident_db_path)
+            } else {
+                std::env::current_dir()
+                    .unwrap_or_default()
+                    .join(&incident_db_path)
+            }
+        });
+
+    let mut db_path_valid = true;
+    if let Some(parent) = incident_db_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            warn!(
+                "[cognitod] Failed to create incident DB directory {}: {}",
+                parent.display(),
+                e
+            );
+            db_path_valid = false;
+        } else {
+            let test_file = parent.join(".write_test");
+            if let Err(e) = std::fs::write(&test_file, "") {
+                warn!(
+                    "[cognitod] Incident DB directory {} not writable: {}",
+                    parent.display(),
+                    e
+                );
+                db_path_valid = false;
+            } else {
+                let _ = std::fs::remove_file(&test_file);
+            }
+        }
+    }
+
+    let incident_store: Option<Arc<cognitod::IncidentStore>> = if db_path_valid {
+        let db_path_str = incident_db_path.to_string_lossy().to_string();
+        match cognitod::IncidentStore::new(&db_path_str).await {
+            Ok(store) => {
+                info!(
+                    "[cognitod] Incident store initialized at {}",
+                    incident_db_path.display()
+                );
+                Some(Arc::new(store))
+            }
+            Err(e) => {
+                warn!("[cognitod] Failed to initialize incident store: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let incident_analyzer = if config.reasoner.enabled && !config.reasoner.endpoint.is_empty() {
+        match cognitod::IncidentAnalyzer::new(
+            config.reasoner.endpoint.clone(),
+            Duration::from_millis(config.reasoner.timeout_ms),
+        ) {
+            Ok(analyzer) => {
+                info!("[incident_analyzer] LLM analysis enabled for incidents");
+                Some(Arc::new(analyzer))
+            }
+            Err(e) => {
+                warn!("[incident_analyzer] Failed to initialize: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Handlers specified on the command line
     let mut handler_list = HandlerList::new();
     let enforcement_queue = Some(Arc::new(enforcement::EnforcementQueue::new(300)));
@@ -807,6 +886,166 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
+    // PSI-based circuit breaker with grace period
+    if let Some(ref queue) = enforcement_queue {
+        let cb_cfg = config.circuit_breaker.clone();
+        let ctx_clone = Arc::clone(&context);
+        let metrics_clone = Arc::clone(&metrics);
+        let queue_clone = Arc::clone(queue);
+        let incident_store_clone = incident_store.clone();
+        let incident_analyzer_clone = incident_analyzer.clone();
+
+        tokio::spawn(async move {
+            if !cb_cfg.enabled {
+                info!("[circuit_breaker] disabled by config");
+                return;
+            }
+
+            info!(
+                "[circuit_breaker] enabled - CPU>{}% AND PSI>{}% sustained for {}s triggers kill",
+                cb_cfg.cpu_usage_threshold, cb_cfg.cpu_psi_threshold, cb_cfg.grace_period_secs
+            );
+
+            let mut breach_started_at: Option<std::time::Instant> = None;
+
+            loop {
+                let snapshot = ctx_clone.get_system_snapshot();
+
+                metrics_clone.set_psi_cpu(snapshot.psi_cpu_some_avg10);
+                metrics_clone.set_psi_memory_some(snapshot.psi_memory_some_avg10);
+                metrics_clone.set_psi_memory_full(snapshot.psi_memory_full_avg10);
+
+                let is_breaching = snapshot.cpu_percent > cb_cfg.cpu_usage_threshold
+                    && snapshot.psi_cpu_some_avg10 > cb_cfg.cpu_psi_threshold;
+
+                if is_breaching {
+                    if breach_started_at.is_none() {
+                        breach_started_at = Some(std::time::Instant::now());
+                        info!(
+                            "[circuit_breaker] BREACH DETECTED - CPU={:.1}% PSI={:.1}% - grace period started",
+                            snapshot.cpu_percent, snapshot.psi_cpu_some_avg10
+                        );
+                    } else {
+                        let duration = breach_started_at.unwrap().elapsed().as_secs();
+                        info!(
+                            "[circuit_breaker] BREACH SUSTAINED - CPU={:.1}% PSI={:.1}% - {}s/{}s",
+                            snapshot.cpu_percent,
+                            snapshot.psi_cpu_some_avg10,
+                            duration,
+                            cb_cfg.grace_period_secs
+                        );
+
+                        if duration >= cb_cfg.grace_period_secs {
+                            metrics_clone.inc_circuit_breaker_cpu_trip();
+                            breach_started_at = None;
+
+                            let mut top_cpu_procs = ctx_clone.top_cpu_processes(1);
+                            if top_cpu_procs.is_empty() {
+                                top_cpu_procs = ctx_clone.top_cpu_processes_systemwide(1);
+                            }
+
+                            if let Some(proc) = top_cpu_procs.first() {
+                                let reason = format!(
+                                    "CPU thrashing sustained {}s: CPU={:.1}% PSI={:.1}%",
+                                    duration, snapshot.cpu_percent, snapshot.psi_cpu_some_avg10
+                                );
+
+                                match queue_clone
+                                    .propose_auto(
+                                        enforcement::ActionType::KillProcess {
+                                            pid: proc.pid,
+                                            signal: 9,
+                                        },
+                                        reason.clone(),
+                                        "circuit_breaker".to_string(),
+                                        None,
+                                        !cb_cfg.require_human_approval,
+                                    )
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        warn!(
+                                            "[circuit_breaker] AUTO-KILLED {}({}): {}",
+                                            proc.comm, proc.pid, reason
+                                        );
+
+                                        if let Some(store) = incident_store_clone.as_ref() {
+                                            let incident = cognitod::Incident {
+                                                id: None,
+                                                timestamp: chrono::Utc::now().timestamp(),
+                                                event_type: "circuit_breaker_cpu".to_string(),
+                                                psi_cpu: snapshot.psi_cpu_some_avg10,
+                                                psi_memory: snapshot.psi_memory_full_avg10,
+                                                cpu_percent: snapshot.cpu_percent,
+                                                load_avg: format!(
+                                                    "{:.2},{:.2},{:.2}",
+                                                    snapshot.load_avg[0],
+                                                    snapshot.load_avg[1],
+                                                    snapshot.load_avg[2]
+                                                ),
+                                                action: "auto_kill".to_string(),
+                                                target_pid: Some(proc.pid as i32),
+                                                target_name: Some(proc.comm.clone()),
+                                                system_snapshot: serde_json::to_string(&snapshot)
+                                                    .ok(),
+                                                llm_analysis: None,
+                                                llm_analyzed_at: None,
+                                                recovery_time_ms: None,
+                                                psi_after: None,
+                                            };
+
+                                            let store_clone = Arc::clone(store);
+                                            let analyzer_clone = incident_analyzer_clone.clone();
+                                            tokio::spawn(async move {
+                                                if let Ok(id) = store_clone.insert(&incident).await
+                                                {
+                                                    info!(
+                                                        "[circuit_breaker] Incident #{} recorded",
+                                                        id
+                                                    );
+
+                                                    if let Some(analyzer) = analyzer_clone {
+                                                        tokio::spawn(async move {
+                                                            match analyzer.analyze(&incident).await
+                                                            {
+                                                                Ok(analysis) => {
+                                                                    let _ = store_clone
+                                                                        .add_llm_analysis(
+                                                                            id, analysis,
+                                                                        )
+                                                                        .await;
+                                                                }
+                                                                Err(e) => warn!(
+                                                                    "[incident_analyzer] Failed: {}",
+                                                                    e
+                                                                ),
+                                                            }
+                                                        });
+                                                    }
+                                                }
+                                            });
+                                        }
+
+                                        sleep(Duration::from_secs(30)).await;
+                                    }
+                                    Err(e) => {
+                                        metrics_clone.inc_circuit_breaker_safety_veto();
+                                        warn!("[circuit_breaker] safety veto: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if breach_started_at.is_some() {
+                    info!("[circuit_breaker] conditions normalized - grace period reset");
+                    breach_started_at = None;
+                }
+
+                sleep(Duration::from_secs(cb_cfg.check_interval_secs)).await;
+            }
+        });
+    }
+
     // Resource monitoring loop
     {
         let runtime_cfg = config.runtime.clone();
@@ -830,6 +1069,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                     if rss_mb > runtime_cfg.rss_cap_mb {
                         warn!("rss {}MB exceeds cap {}", rss_mb, runtime_cfg.rss_cap_mb);
+                    }
+                }
+                sleep(Duration::from_secs(1)).await;
+            }
+        });
+    }
+
+    // Enforcement executor loop - actually executes approved actions
+    if let Some(ref queue) = enforcement_queue {
+        let queue_clone = Arc::clone(queue);
+        tokio::spawn(async move {
+            loop {
+                for action in queue_clone.get_all().await {
+                    if action.status == enforcement::ActionStatus::Approved {
+                        match action.action {
+                            enforcement::ActionType::KillProcess { pid, signal } => {
+                                info!("[enforcement] EXECUTING KILL pid={} signal={}", pid, signal);
+                                unsafe {
+                                    libc::kill(pid as i32, signal);
+                                }
+                                let _ = queue_clone.complete(&action.id).await;
+                            }
+                        }
                     }
                 }
                 sleep(Duration::from_secs(1)).await;
@@ -871,7 +1133,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         prometheus_enabled: config.outputs.prometheus,
         alert_history: Arc::clone(&alert_history),
         auth_token: auth_token.clone(),
-        enforcement: enforcement_queue,
+        enforcement: enforcement_queue.clone(),
+        incident_store: incident_store.clone(),
     });
 
     let api = all_routes(app_state.clone());

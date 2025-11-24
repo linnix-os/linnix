@@ -1,4 +1,5 @@
 use std::sync::RwLock;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::SystemTime;
 
@@ -34,6 +35,18 @@ pub struct Metrics {
     ilm_schema_errors: AtomicU64,
     ilm_enabled: AtomicBool,
     ilm_disabled_reason: RwLock<String>,
+    // PSI (Pressure Stall Information) gauges - stored as f32 * 100 to use AtomicU32
+    psi_cpu_some_avg10: AtomicU32, // CPU pressure (0-10000 = 0.00%-100.00%)
+    psi_memory_some_avg10: AtomicU32, // Memory pressure
+    psi_memory_full_avg10: AtomicU32, // Memory thrashing (all tasks stalled)
+    psi_io_some_avg10: AtomicU32,  // I/O pressure
+    psi_io_full_avg10: AtomicU32,  // I/O saturation
+    // Circuit breaker counters
+    circuit_breaker_cpu_trips: AtomicU64, // Times CPU+PSI threshold exceeded
+    circuit_breaker_memory_trips: AtomicU64, // Times memory PSI threshold exceeded
+    circuit_breaker_io_trips: AtomicU64,  // Times I/O PSI threshold exceeded
+    circuit_breaker_auto_kills: AtomicU64, // Automatic kills executed
+    circuit_breaker_safety_vetoes: AtomicU64, // Kills blocked by safety checks
 }
 
 impl Metrics {
@@ -63,6 +76,16 @@ impl Metrics {
             ilm_schema_errors: AtomicU64::new(0),
             ilm_enabled: AtomicBool::new(false),
             ilm_disabled_reason: RwLock::new(String::new()),
+            psi_cpu_some_avg10: AtomicU32::new(0),
+            psi_memory_some_avg10: AtomicU32::new(0),
+            psi_memory_full_avg10: AtomicU32::new(0),
+            psi_io_some_avg10: AtomicU32::new(0),
+            psi_io_full_avg10: AtomicU32::new(0),
+            circuit_breaker_cpu_trips: AtomicU64::new(0),
+            circuit_breaker_memory_trips: AtomicU64::new(0),
+            circuit_breaker_io_trips: AtomicU64::new(0),
+            circuit_breaker_auto_kills: AtomicU64::new(0),
+            circuit_breaker_safety_vetoes: AtomicU64::new(0),
         }
     }
 
@@ -240,6 +263,98 @@ impl Metrics {
             .read()
             .ok()
             .and_then(|v| if v.is_empty() { None } else { Some(v.clone()) })
+    }
+
+    // PSI gauge setters/getters (stored as f32 * 100)
+    pub fn set_psi_cpu(&self, value: f32) {
+        self.psi_cpu_some_avg10
+            .store((value * 100.0) as u32, Ordering::Relaxed);
+    }
+
+    pub fn psi_cpu(&self) -> f32 {
+        self.psi_cpu_some_avg10.load(Ordering::Relaxed) as f32 / 100.0
+    }
+
+    pub fn set_psi_memory_some(&self, value: f32) {
+        self.psi_memory_some_avg10
+            .store((value * 100.0) as u32, Ordering::Relaxed);
+    }
+
+    pub fn psi_memory_some(&self) -> f32 {
+        self.psi_memory_some_avg10.load(Ordering::Relaxed) as f32 / 100.0
+    }
+
+    pub fn set_psi_memory_full(&self, value: f32) {
+        self.psi_memory_full_avg10
+            .store((value * 100.0) as u32, Ordering::Relaxed);
+    }
+
+    pub fn psi_memory_full(&self) -> f32 {
+        self.psi_memory_full_avg10.load(Ordering::Relaxed) as f32 / 100.0
+    }
+
+    pub fn set_psi_io_some(&self, value: f32) {
+        self.psi_io_some_avg10
+            .store((value * 100.0) as u32, Ordering::Relaxed);
+    }
+
+    pub fn psi_io_some(&self) -> f32 {
+        self.psi_io_some_avg10.load(Ordering::Relaxed) as f32 / 100.0
+    }
+
+    pub fn set_psi_io_full(&self, value: f32) {
+        self.psi_io_full_avg10
+            .store((value * 100.0) as u32, Ordering::Relaxed);
+    }
+
+    pub fn psi_io_full(&self) -> f32 {
+        self.psi_io_full_avg10.load(Ordering::Relaxed) as f32 / 100.0
+    }
+
+    // Circuit breaker counters
+    pub fn inc_circuit_breaker_cpu_trip(&self) {
+        self.circuit_breaker_cpu_trips
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn circuit_breaker_cpu_trips(&self) -> u64 {
+        self.circuit_breaker_cpu_trips.load(Ordering::Relaxed)
+    }
+
+    pub fn inc_circuit_breaker_memory_trip(&self) {
+        self.circuit_breaker_memory_trips
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn circuit_breaker_memory_trips(&self) -> u64 {
+        self.circuit_breaker_memory_trips.load(Ordering::Relaxed)
+    }
+
+    pub fn inc_circuit_breaker_io_trip(&self) {
+        self.circuit_breaker_io_trips
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn circuit_breaker_io_trips(&self) -> u64 {
+        self.circuit_breaker_io_trips.load(Ordering::Relaxed)
+    }
+
+    pub fn inc_circuit_breaker_auto_kill(&self) {
+        self.circuit_breaker_auto_kills
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn circuit_breaker_auto_kills(&self) -> u64 {
+        self.circuit_breaker_auto_kills.load(Ordering::Relaxed)
+    }
+
+    pub fn inc_circuit_breaker_safety_veto(&self) {
+        self.circuit_breaker_safety_vetoes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn circuit_breaker_safety_vetoes(&self) -> u64 {
+        self.circuit_breaker_safety_vetoes.load(Ordering::Relaxed)
     }
 }
 impl Default for Metrics {

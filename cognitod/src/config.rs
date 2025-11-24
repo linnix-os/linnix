@@ -61,6 +61,8 @@ pub struct Config {
     pub probes: ProbesConfig,
     #[serde(default)]
     pub notifications: Option<NotificationConfig>,
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerConfig,
 }
 
 impl Config {
@@ -300,6 +302,94 @@ impl OfflineGuard {
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct ProbesConfig {
     // Configuration for probe settings (reserved for future use)
+}
+
+/// Circuit breaker configuration for automatic remediation based on PSI (Pressure Stall Information)
+///
+/// PSI measures resource contention (stall time), not just usage.
+/// Key insight: 100% CPU + low PSI = efficient worker. 40% CPU + high PSI = disaster.
+#[derive(Debug, Deserialize, Clone)]
+pub struct CircuitBreakerConfig {
+    /// Enable automatic circuit breaking (disabled by default for safety)
+    #[serde(default = "default_circuit_breaker_enabled")]
+    pub enabled: bool,
+
+    /// CPU usage threshold (percent). Only trigger if BOTH usage and PSI are high.
+    #[serde(default = "default_cpu_usage_threshold")]
+    pub cpu_usage_threshold: f32,
+
+    /// CPU PSI threshold (percent). Dual-signal: high usage + high PSI = thrashing.
+    #[serde(default = "default_cpu_psi_threshold")]
+    pub cpu_psi_threshold: f32,
+
+    /// Memory PSI "full" threshold (percent). All tasks stalled = complete thrashing.
+    #[serde(default = "default_memory_psi_full_threshold")]
+    pub memory_psi_full_threshold: f32,
+
+    /// I/O PSI "full" threshold (percent). Alert only, don't auto-kill.
+    #[serde(default = "default_io_psi_full_threshold")]
+    pub io_psi_full_threshold: f32,
+
+    /// Check interval in seconds (aligned with system snapshot updates)
+    #[serde(default = "default_check_interval_secs")]
+    pub check_interval_secs: u64,
+
+    /// Grace period in seconds - thresholds must be exceeded continuously for this duration
+    /// before the circuit breaker will trigger. This prevents transient spikes from causing kills.
+    /// Set to 0 to trigger immediately (not recommended).
+    #[serde(default = "default_grace_period_secs")]
+    pub grace_period_secs: u64,
+
+    /// Require human approval even when circuit breaker triggers (override safety)
+    #[serde(default = "default_require_human_approval")]
+    pub require_human_approval: bool,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_circuit_breaker_enabled(),
+            cpu_usage_threshold: default_cpu_usage_threshold(),
+            cpu_psi_threshold: default_cpu_psi_threshold(),
+            memory_psi_full_threshold: default_memory_psi_full_threshold(),
+            io_psi_full_threshold: default_io_psi_full_threshold(),
+            check_interval_secs: default_check_interval_secs(),
+            grace_period_secs: default_grace_period_secs(),
+            require_human_approval: default_require_human_approval(),
+        }
+    }
+}
+
+fn default_circuit_breaker_enabled() -> bool {
+    true // Enabled by default when config present
+}
+
+fn default_cpu_usage_threshold() -> f32 {
+    90.0 // Only consider high CPU usage
+}
+
+fn default_cpu_psi_threshold() -> f32 {
+    40.0 // 40% stall time = 4 seconds out of every 10 wasted waiting
+}
+
+fn default_memory_psi_full_threshold() -> f32 {
+    30.0 // 30% full stalls = entire system thrashing
+}
+
+fn default_io_psi_full_threshold() -> f32 {
+    50.0 // Alert threshold for I/O saturation (don't auto-kill)
+}
+
+fn default_check_interval_secs() -> u64 {
+    5 // Aligned with system snapshot update frequency
+}
+
+fn default_grace_period_secs() -> u64 {
+    15 // Require 15 seconds of sustained breach before triggering
+}
+
+fn default_require_human_approval() -> bool {
+    false // Auto-approve when circuit breaker triggers (but still requires enabled=true)
 }
 
 #[cfg(test)]

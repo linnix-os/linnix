@@ -251,6 +251,21 @@ async fn run_worker(
                         use std::fmt::Write as _;
                         let _ = write!(telemetry_prompt, " load={:.2},{:.2},{:.2}", snap.load_avg[0], snap.load_avg[1], snap.load_avg[2]);
                     }
+                    // PSI (Pressure Stall Information) - the KEY signal for circuit breaking
+                    // High CPU% + High PSI = thrashing (KILL). High CPU% + Low PSI = efficient (KEEP).
+                    // Only include non-zero PSI values to keep prompt concise
+                    {
+                        use std::fmt::Write as _;
+                        if snap.psi_cpu_some_avg10 > 0.0 {
+                            let _ = write!(telemetry_prompt, " psi_cpu={:.1}", snap.psi_cpu_some_avg10);
+                        }
+                        if snap.psi_memory_full_avg10 > 0.0 {
+                            let _ = write!(telemetry_prompt, " psi_mem_full={:.1}", snap.psi_memory_full_avg10);
+                        }
+                        if snap.psi_io_some_avg10 > 0.0 {
+                            let _ = write!(telemetry_prompt, " psi_io={:.1}", snap.psi_io_some_avg10);
+                        }
+                    }
                     if pf_count > 0 {
                         use std::fmt::Write as _;
                         let _ = write!(telemetry_prompt, " pf={}", pf_count);

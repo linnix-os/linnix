@@ -35,10 +35,11 @@ use crate::context::ContextStore;
 #[cfg(feature = "fake-events")]
 use crate::fake_events;
 use crate::handler::local_ilm::schema::insight_json_schema;
-use crate::insights::{InsightRecord, InsightStore};
+use crate::insights::{InsightRecord, InsightStore as InsightsStore};
 use crate::metrics::Metrics;
 use crate::types::ProcessAlert;
 use crate::types::SystemSnapshot;
+use cognitod::{Incident, IncidentStats, IncidentStore};
 use linnix_ai_ebpf_common::EventType;
 use sysinfo::{Pid, System};
 use tokio::sync::broadcast;
@@ -1630,7 +1631,7 @@ pub struct AppState {
     pub context: Arc<ContextStore>,
     pub metrics: Arc<Metrics>,
     pub alerts: Option<broadcast::Sender<Alert>>,
-    pub insights: Arc<InsightStore>,
+    pub insights: Arc<InsightsStore>,
     pub offline: Arc<OfflineGuard>,
     pub transport: &'static str,
     pub probe_state: ProbeState,
@@ -1639,6 +1640,7 @@ pub struct AppState {
     pub alert_history: Arc<AlertHistory>,
     pub auth_token: Option<String>,
     pub enforcement: Option<Arc<crate::enforcement::EnforcementQueue>>,
+    pub incident_store: Option<Arc<IncidentStore>>,
 }
 
 pub fn all_routes(app_state: Arc<AppState>) -> Router {
@@ -1663,6 +1665,10 @@ pub fn all_routes(app_state: Arc<AppState>) -> Router {
         .route("/alerts/{id}", get(get_alert_by_id))
         .route("/insights", get(get_insights))
         .route("/insights/recent", get(get_recent_insights))
+        .route("/incidents", get(get_incidents))
+        .route("/incidents/summary", get(get_incident_summary))
+        .route("/incidents/stats", get(get_incident_stats))
+        .route("/incidents/{id}", get(get_incident_by_id))
         .route("/metrics", get(metrics_handler))
         .route("/status", get(status_handler))
         .route("/healthz", get(healthz))
@@ -1727,6 +1733,143 @@ fn dependency_version(target: &str) -> Option<String> {
         return current_version;
     }
     None
+}
+
+// ========================================
+// Incident API Endpoints
+// ========================================
+
+#[derive(Deserialize)]
+struct IncidentQueryParams {
+    #[serde(default = "default_limit")]
+    limit: i64,
+    #[serde(default)]
+    event_type: Option<String>,
+    #[serde(default)]
+    analyzed: Option<bool>,
+}
+
+fn default_limit() -> i64 {
+    10
+}
+
+/// GET /incidents - List recent incidents
+async fn get_incidents(
+    Query(params): Query<IncidentQueryParams>,
+    State(app): State<Arc<AppState>>,
+) -> Result<Json<Vec<Incident>>, (StatusCode, String)> {
+    let store = app.incident_store.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Incident store not available".to_string(),
+        )
+    })?;
+
+    let incidents = store
+        .recent(params.limit)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Filter by analyzed status if requested
+    let filtered = if let Some(analyzed) = params.analyzed {
+        incidents
+            .into_iter()
+            .filter(|i| analyzed == i.llm_analysis.is_some())
+            .collect()
+    } else {
+        incidents
+    };
+
+    Ok(Json(filtered))
+}
+
+/// GET /incidents/:id - Get incident by ID
+async fn get_incident_by_id(
+    Path(id): Path<i64>,
+    State(app): State<Arc<AppState>>,
+) -> Result<Json<Incident>, (StatusCode, String)> {
+    let store = app.incident_store.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Incident store not available".to_string(),
+        )
+    })?;
+
+    let incident = store
+        .get(id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Incident not found".to_string()))?;
+
+    Ok(Json(incident))
+}
+
+/// GET /incidents/stats - Get incident statistics
+async fn get_incident_stats(
+    State(app): State<Arc<AppState>>,
+) -> Result<Json<IncidentStats>, (StatusCode, String)> {
+    let store = app.incident_store.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Incident store not available".to_string(),
+        )
+    })?;
+
+    let stats = store
+        .stats()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(stats))
+}
+
+#[derive(Serialize)]
+struct IncidentSummary {
+    total: u64,
+    analyzed: u64,
+    pending_analysis: u64,
+    by_event_type: std::collections::HashMap<String, u64>,
+    recent: Vec<Incident>,
+}
+
+/// GET /incidents/summary - Get comprehensive incident summary
+async fn get_incident_summary(
+    State(app): State<Arc<AppState>>,
+) -> Result<Json<IncidentSummary>, (StatusCode, String)> {
+    let store = app.incident_store.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Incident store not available".to_string(),
+        )
+    })?;
+
+    let stats = store
+        .stats()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let recent = store
+        .recent(10)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let analyzed = recent.iter().filter(|i| i.llm_analysis.is_some()).count() as u64;
+    let pending = recent.len() as u64 - analyzed;
+
+    let mut by_event_type = std::collections::HashMap::new();
+    for incident in &recent {
+        *by_event_type
+            .entry(incident.event_type.clone())
+            .or_insert(0) += 1;
+    }
+
+    Ok(Json(IncidentSummary {
+        total: stats.total,
+        analyzed,
+        pending_analysis: pending,
+        by_event_type,
+        recent,
+    }))
 }
 
 #[cfg(test)]
