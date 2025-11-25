@@ -36,3 +36,21 @@ Linnix mounts:
 - `/sys/kernel/btf/vmlinux`: For BTF type information (required for CO-RE).
 - `/sys/kernel/debug`: For debugfs (tracepoints).
 - `hostPID: true`: To correlate events with host processes.
+
+## Cloud Provider Notes
+
+### AWS EKS
+
+1. **Connect to Cluster**:
+   ```bash
+   aws eks update-kubeconfig --region region-code --name my-cluster
+   ```
+
+2. **Kernel Support**:
+   Ensure your node group uses **Amazon Linux 2023** or a recent **Bottlerocket** OS (Kernel 5.10+ with BTF enabled).
+   Older Amazon Linux 2 might require a kernel upgrade for full eBPF support.
+
+3. **Deploy**:
+   ```bash
+   kubectl apply -f k8s/
+   ```
