@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: linnix-agent
+  namespace: default
+  labels:
+    app: linnix
+spec:
+  selector:
+    matchLabels:
+      app: linnix
+  template:
+    metadata:
+      labels:
+        app: linnix
+    spec:
+      serviceAccountName: linnix-agent
+      hostPID: true  # Required to monitor host processes
+      containers:
+        - name: cognitod
+          image: ghcr.io/linnix-os/cognitod:latest
+          imagePullPolicy: Always
+          args: ["--config", "/etc/linnix/linnix.toml"]
+          securityContext:
+            privileged: true  # Simplest for eBPF. Can be refined with caps.
+            # capabilities:
+            #   add: ["BPF", "PERFMON", "SYS_RESOURCE", "SYS_ADMIN"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/linnix
+              readOnly: true
+            - name: sys-btf
+              mountPath: /sys/kernel/btf/vmlinux
+              readOnly: true
+            - name: debugfs
+              mountPath: /sys/kernel/debug
+            # Mount host /proc to monitor processes
+            # Note: In container, this might be mounted at /host/proc if configured,
+            # but standard hostPID: true makes /proc the host's /proc?
+            # No, hostPID: true means we see host PIDs in our /proc.
+          resources:
+            limits:
+              memory: 512Mi
+              cpu: 500m
+            requests:
+              memory: 128Mi
+              cpu: 100m
+          ports:
+            - containerPort: 3000
+              hostPort: 3000
+              name: http
+      volumes:
+        - name: config
+          configMap:
+            name: linnix-config
+        - name: sys-btf
+          hostPath:
+            path: /sys/kernel/btf/vmlinux
+            type: File
+        - name: debugfs
+          hostPath:
+            path: /sys/kernel/debug
+            type: Directory

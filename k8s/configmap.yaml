@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: linnix-config
+  namespace: default
+  labels:
+    app: linnix
+data:
+  linnix.toml: |
+    [api]
+    listen_addr = "0.0.0.0:3000"
+
+    [runtime]
+    offline = false
+    cpu_target_pct = 25
+    rss_cap_mb = 512
+
+    [circuit_breaker]
+    enabled = true
+    mode = "monitor"  # Safe by default
+    cpu_usage_threshold = 90.0
+    cpu_psi_threshold = 40.0
+    grace_period_secs = 15
+    require_human_approval = true
+
+    [reasoner]
+    enabled = false  # Disable LLM by default in K8s to save resources
+    endpoint = "http://localhost:8090/v1/chat/completions"
+
+    [prometheus]
+    enabled = true

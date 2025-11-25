@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: linnix-agent
+  namespace: default
+  labels:
+    app: linnix
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: linnix-agent
+rules:
+  # Future: Allow Linnix to query Pods/Nodes for metadata enrichment
+  - apiGroups: [""]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: linnix-agent
+subjects:
+  - kind: ServiceAccount
+    name: linnix-agent
+    namespace: default
+roleRef:
+  kind: ClusterRole
+  name: linnix-agent
+  apiGroup: rbac.authorization.k8s.io

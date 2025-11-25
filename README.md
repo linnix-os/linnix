@@ -108,7 +108,21 @@ Prevents system thrashing by monitoring **Pressure Stall Information (PSI)**.
 - **Grace Period**: Configurable delay (default 15s) prevents killing processes during transient spikes.
 - **Incident Analysis**: Automatically captures system state and uses LLM to analyze the root cause.
 
-**Configuration:**
+### Deploy to Kubernetes
+
+Linnix can be deployed as a DaemonSet to monitor every node in your cluster.
+
+```bash
+# Apply the manifests
+kubectl apply -f k8s/
+
+# Check status
+kubectl get daemonset -n default linnix-agent
+```
+
+See [k8s/README.md](k8s/README.md) for advanced configuration (RBAC, capabilities).
+
+## Configuration:
 ```toml
 [circuit_breaker]
 enabled = true
