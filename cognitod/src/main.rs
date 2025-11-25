@@ -328,6 +328,11 @@ fn init_rss_trace(bpf_bytes: &[u8]) -> anyhow::Result<BpfRuntimeGuards> {
 }
 
 fn check_capabilities() -> anyhow::Result<()> {
+    if std::env::var("LINNIX_SKIP_CAP_CHECK").is_ok() {
+        warn!("Skipping capability check (LINNIX_SKIP_CAP_CHECK set)");
+        return Ok(());
+    }
+
     let has_bpf = caps::has_cap(None, CapSet::Effective, Capability::CAP_BPF)
         .context("failed to query CAP_BPF")?;
     let has_perfmon = caps::has_cap(None, CapSet::Effective, Capability::CAP_PERFMON)

@@ -203,7 +203,9 @@ Monitors at the kernel level using eBPF:
 - File descriptor tracking
 - Network connection monitoring
 
-**<1% CPU overhead** - no polling `/proc`, direct kernel events via perf buffers.
+- Network connection monitoring
+
+**<1% CPU overhead** - no polling `/proc`, direct kernel events via perf buffers. See [Performance Benchmarks](docs/OVERHEAD.md).
 
 ### Detection (Rules Engine)
 
