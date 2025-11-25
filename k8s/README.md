@@ -41,6 +41,20 @@ Linnix mounts:
 
 ### AWS EKS
 
+**Option A: Quick Start with `eksctl` (Recommended)**
+
+We provide a configuration file to spin up a compatible cluster (Amazon Linux 2023, Kernel 6.1+):
+
+```bash
+# Create cluster (takes ~15 mins)
+eksctl create cluster -f infrastructure/eks-cluster.yaml
+
+# Deploy Linnix
+kubectl apply -f k8s/
+```
+
+**Option B: Existing Cluster**
+
 1. **Connect to Cluster**:
    ```bash
    aws eks update-kubeconfig --region region-code --name my-cluster

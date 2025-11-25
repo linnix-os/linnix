@@ -1,0 +1,26 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: linnix-demo
+  region: us-east-1
+  version: "1.30"
+
+managedNodeGroups:
+  - name: linnix-nodes
+    instanceType: t3.medium
+    minSize: 2
+    maxSize: 3
+    desiredCapacity: 2
+    volumeSize: 20
+    # Amazon Linux 2023 has kernel 6.1+ with BTF enabled by default
+    amiFamily: AmazonLinux2023
+    iam:
+      withAddonPolicies:
+        cloudWatch: true
+        autoScaler: true
+
+addons:
+  - name: vpc-cni
+  - name: coredns
+  - name: kube-proxy
