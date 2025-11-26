@@ -20,7 +20,6 @@ spec:
         - name: cognitod
           image: ghcr.io/linnix-os/cognitod:latest
           imagePullPolicy: Always
-          args: ["--config", "/etc/linnix/linnix.toml"]
           securityContext:
             privileged: true  # Simplest for eBPF. Can be refined with caps.
             # capabilities:
