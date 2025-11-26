@@ -9,6 +9,7 @@ data:
   linnix.toml: |
     [api]
     listen_addr = "0.0.0.0:3000"
+    # auth_token = "your-secret-token"  # IMPORTANT: Set this for production!
 
     [runtime]
     offline = false

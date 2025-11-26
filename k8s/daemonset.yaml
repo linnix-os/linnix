@@ -46,7 +46,6 @@ spec:
               cpu: 100m
           ports:
             - containerPort: 3000
-              hostPort: 3000
               name: http
       volumes:
         - name: config
