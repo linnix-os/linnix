@@ -85,7 +85,7 @@ services:
       interval: 15s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 120s
 
   # Web Dashboard
   dashboard:
@@ -99,10 +99,11 @@ services:
       - cognitod
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:80"]
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
       interval: 10s
       timeout: 5s
       retries: 3
+      start_period: 10s
 
 volumes:
   linnix-data:

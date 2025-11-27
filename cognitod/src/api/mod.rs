@@ -124,6 +124,10 @@ struct ProcessEventSse {
     exit_time_ns: u64,
     cpu_pct_milli: u16,
     mem_pct_milli: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_percent: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mem_percent: Option<f32>,
     data: u64,
     data2: u64,
     aux: u32,
@@ -740,6 +744,8 @@ pub async fn stream_events(
                         exit_time_ns: event.exit_time_ns,
                         cpu_pct_milli: event.cpu_pct_milli,
                         mem_pct_milli: event.mem_pct_milli,
+                        cpu_percent: event.cpu_percent(),
+                        mem_percent: event.mem_percent(),
                         data: event.data,
                         data2: event.data2,
                         aux: event.aux,

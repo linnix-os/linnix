@@ -102,21 +102,86 @@ check_prerequisites() {
     fi
 }
 
-# Check for the LLM model file
+# Check for and download the LLM model file if needed
 check_model() {
     echo -e "\n${BLUE}[2/5]${NC} Checking for demo model..."
     local model_path="./models/linnix-3b-distilled-q5_k_m.gguf"
+    local model_url="https://huggingface.co/parth21shah/linnix-3b-distilled/resolve/main/linnix-3b-distilled-q5_k_m.gguf"
+    
     if [ -f "$model_path" ]; then
         echo -e "${GREEN}✅ Model already downloaded.${NC}"
     else
         mkdir -p ./models
-        echo -e "${YELLOW}⚠️  Demo model not found. It will be downloaded when containers start (2.1GB).${NC}"
+        echo -e "${YELLOW}⚠️  Demo model not found. Downloading now (2.1GB)...${NC}"
+        echo "   This may take a few minutes depending on your connection."
+        
+        # Try wget first, then curl
+        if command -v wget &> /dev/null; then
+            if wget --show-progress -q -O "$model_path" "$model_url"; then
+                echo -e "${GREEN}✅ Model downloaded successfully.${NC}"
+            else
+                echo -e "${RED}❌ Download failed. Please check your internet connection.${NC}"
+                echo "   You can manually download from: $model_url"
+                exit 1
+            fi
+        elif command -v curl &> /dev/null; then
+            if curl -L --progress-bar -o "$model_path" "$model_url"; then
+                echo -e "${GREEN}✅ Model downloaded successfully.${NC}"
+            else
+                echo -e "${RED}❌ Download failed. Please check your internet connection.${NC}"
+                echo "   You can manually download from: $model_url"
+                exit 1
+            fi
+        else
+            echo -e "${RED}❌ Neither wget nor curl found. Cannot download model.${NC}"
+            echo "   Please install wget or curl, or manually download from: $model_url"
+            exit 1
+        fi
+    fi
+}
+
+# Check if required ports are available
+check_ports() {
+    echo -e "\n${BLUE}[3/5]${NC} Checking port availability..."
+    local ports_in_use=()
+    local required_ports=(3000 8080 8090)
+    
+    for port in "${required_ports[@]}"; do
+        if command -v lsof &> /dev/null; then
+            if lsof -i ":$port" -sTCP:LISTEN -t >/dev/null 2>&1; then
+                ports_in_use+=("$port")
+            fi
+        elif command -v ss &> /dev/null; then
+            if ss -tlnp 2>/dev/null | grep -q ":$port "; then
+                ports_in_use+=("$port")
+            fi
+        elif command -v netstat &> /dev/null; then
+            if netstat -tlnp 2>/dev/null | grep -q ":$port "; then
+                ports_in_use+=("$port")
+            fi
+        fi
+    done
+    
+    if [ ${#ports_in_use[@]} -gt 0 ]; then
+        echo -e "${RED}❌ The following required ports are already in use:${NC}"
+        for port in "${ports_in_use[@]}"; do
+            echo -e "   ${RED}•${NC} Port $port"
+            echo -e "     Find process: ${YELLOW}lsof -i :$port${NC} or ${YELLOW}ss -tlnp | grep :$port${NC}"
+        done
+        echo ""
+        echo -e "${YELLOW}To fix this:${NC}"
+        echo "   1. Stop the conflicting service(s)"
+        echo "   2. Or run: ./quickstart.sh stop (to stop any existing Linnix containers)"
+        echo "   3. Then try starting Linnix again"
+        exit 1
+    else
+        echo -e "${GREEN}✅ All required ports are available.${NC}"
     fi
 }
 
 # Create a default configuration if one doesn't exist
 setup_config() {
-    echo -e "\n${BLUE}[3/5]${NC} Setting up configuration..."
+    echo -e "\n${BLUE}[4/5]${NC} Setting up configuration..."
     mkdir -p ./configs
     if [ ! -f "./configs/linnix.toml" ]; then
         cat > ./configs/linnix.toml << 'EOF'
@@ -157,7 +222,7 @@ EOF
 
 # Start all Docker containers
 start_services() {
-    echo -e "\n${BLUE}[4/5]${NC} Starting Docker containers..."
+    echo -e "\n${BLUE}[5/5]${NC} Starting Docker containers..."
     echo "   This will pull required images and start all services."
     if ! $COMPOSE_CMD up -d; then
         echo -e "${RED}❌ Docker Compose failed to start.${NC}"
@@ -251,6 +316,7 @@ main() {
     banner
     check_prerequisites
     check_model
+    check_ports
     setup_config
     start_services
     wait_for_health
