@@ -85,25 +85,6 @@ services:
       interval: 15s
       timeout: 10s
       retries: 3
-      start_period: 120s
-
-  # Web Dashboard
-  dashboard:
-    image: nginx:alpine
-    container_name: linnix-dashboard
-    network_mode: host
-    volumes:
-      - ./dashboard:/usr/share/nginx/html:ro
-      - ./dashboard/nginx.conf:/etc/nginx/conf.d/default.conf:ro
-    depends_on:
-      - cognitod
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
 
 volumes:
   linnix-data:

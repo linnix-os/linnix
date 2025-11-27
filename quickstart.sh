@@ -144,7 +144,7 @@ check_model() {
 check_ports() {
     echo -e "\n${BLUE}[3/5]${NC} Checking port availability..."
     local ports_in_use=()
-    local required_ports=(3000 8080 8090)
+    local required_ports=(3000 8090)
     
     for port in "${required_ports[@]}"; do
         if command -v lsof &> /dev/null; then
