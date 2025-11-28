@@ -68,8 +68,8 @@ impl IncidentAnalyzer {
         });
 
         debug!("[incident_analyzer] Requesting LLM analysis for incident");
-        info!(target: "audit", "Sending incident analysis request to LLM. Endpoint: {}, Event: {}, Target: {:?}", 
-            self.endpoint, 
+        info!(target: "audit", "Sending incident analysis request to LLM. Endpoint: {}, Event: {}, Target: {:?}",
+            self.endpoint,
             incident.event_type,
             incident.target_name
         );
@@ -100,7 +100,7 @@ impl IncidentAnalyzer {
             "[incident_analyzer] Received analysis ({} chars)",
             analysis.len()
         );
-        
+
         info!(target: "audit", "LLM analysis completed successfully. Response length: {} chars", analysis.len());
 
         Ok(analysis)

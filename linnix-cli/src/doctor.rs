@@ -1,7 +1,7 @@
+use colored::*;
 use reqwest::Client;
 use serde::Deserialize;
 use std::error::Error;
-use colored::*;
 
 #[derive(Deserialize, Debug)]
 struct HealthResponse {
@@ -66,7 +66,10 @@ pub async fn run_doctor(url: &str) -> Result<(), Box<dyn Error>> {
     // 3. Check Uptime
     print!("• Uptime:             ");
     if metrics.uptime_seconds < 60 {
-        println!("{}", format!("{}s (Just started)", metrics.uptime_seconds).yellow());
+        println!(
+            "{}",
+            format!("{}s (Just started)", metrics.uptime_seconds).yellow()
+        );
     } else {
         println!("{}", format!("{}s", metrics.uptime_seconds).green());
     }
@@ -74,7 +77,10 @@ pub async fn run_doctor(url: &str) -> Result<(), Box<dyn Error>> {
     // 4. Check BPF Status
     print!("• BPF Probes:         ");
     if metrics.events_per_sec > 0 {
-        println!("{}", format!("Active ({} events/sec)", metrics.events_per_sec).green());
+        println!(
+            "{}",
+            format!("Active ({} events/sec)", metrics.events_per_sec).green()
+        );
     } else {
         println!("{}", "Idle (0 events/sec)".yellow());
     }
@@ -102,7 +108,10 @@ pub async fn run_doctor(url: &str) -> Result<(), Box<dyn Error>> {
     // 7. Check Errors
     print!("• Perf Poll Errors:   ");
     if metrics.perf_poll_errors > 0 {
-        println!("{}", format!("{} (Warning)", metrics.perf_poll_errors).yellow());
+        println!(
+            "{}",
+            format!("{} (Warning)", metrics.perf_poll_errors).yellow()
+        );
     } else {
         println!("{}", "0".green());
     }
@@ -110,7 +119,10 @@ pub async fn run_doctor(url: &str) -> Result<(), Box<dyn Error>> {
     // 8. Check Dropped Events
     print!("• Dropped Events:     ");
     if metrics.dropped_events_total > 1000 {
-        println!("{}", format!("{} (High Load)", metrics.dropped_events_total).yellow());
+        println!(
+            "{}",
+            format!("{} (High Load)", metrics.dropped_events_total).yellow()
+        );
     } else {
         println!("{}", metrics.dropped_events_total.to_string().green());
     }
@@ -118,7 +130,10 @@ pub async fn run_doctor(url: &str) -> Result<(), Box<dyn Error>> {
     // 9. Check Alerts
     print!("• Alerts Generated:   ");
     if metrics.alerts_generated > 0 {
-        println!("{}", format!("{} (Check 'linnix-cli alerts')", metrics.alerts_generated).yellow());
+        println!(
+            "{}",
+            format!("{} (Check 'linnix-cli alerts')", metrics.alerts_generated).yellow()
+        );
     } else {
         println!("{}", "0".green());
     }
@@ -133,7 +148,10 @@ pub async fn run_doctor(url: &str) -> Result<(), Box<dyn Error>> {
 
     println!();
     if all_good {
-        println!("{}", "✅ System is healthy and ready for triage.".bold().green());
+        println!(
+            "{}",
+            "✅ System is healthy and ready for triage.".bold().green()
+        );
     } else {
         println!("{}", "⚠️  System has issues. See above.".bold().yellow());
     }

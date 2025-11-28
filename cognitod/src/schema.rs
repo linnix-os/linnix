@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::k8s::K8sMetadata;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -54,8 +54,8 @@ pub struct Insight {
 
 impl Insight {
     pub fn redact(&mut self) {
-        use sha2::{Sha256, Digest};
-        
+        use sha2::{Digest, Sha256};
+
         let hash = |s: &str| -> String {
             let mut hasher = Sha256::new();
             hasher.update(s);

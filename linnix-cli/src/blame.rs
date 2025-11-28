@@ -1,10 +1,10 @@
-use std::process::{Command, Stdio};
-use std::time::Duration;
-use std::error::Error;
+use colored::*;
 use reqwest::Client;
 use serde::Deserialize;
-use colored::*;
+use std::error::Error;
 use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 #[derive(Deserialize, Debug)]
 struct InsightRecord {
@@ -46,18 +46,31 @@ pub async fn run_blame(node_name: &str) -> Result<(), Box<dyn Error>> {
     println!("{} {}...", "Analyzing node".bold().blue(), node_name);
 
     // 1. Find the pod
-    println!("{} Finding cognitod pod on node {}...", "Step 1:".bold(), node_name);
+    println!(
+        "{} Finding cognitod pod on node {}...",
+        "Step 1:".bold(),
+        node_name
+    );
     let output = Command::new("kubectl")
         .args(&[
-            "get", "pods", "-A", 
-            "--field-selector", &format!("spec.nodeName={}", node_name),
-            "-l", "app=cognitod",
-            "-o", "jsonpath={.items[0].metadata.name}/{.items[0].metadata.namespace}"
+            "get",
+            "pods",
+            "-A",
+            "--field-selector",
+            &format!("spec.nodeName={}", node_name),
+            "-l",
+            "app=cognitod",
+            "-o",
+            "jsonpath={.items[0].metadata.name}/{.items[0].metadata.namespace}",
         ])
         .output()?;
 
     if !output.status.success() {
-        return Err(format!("Failed to find cognitod pod: {}", String::from_utf8_lossy(&output.stderr)).into());
+        return Err(format!(
+            "Failed to find cognitod pod: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
     }
 
     let pod_info = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -71,26 +84,26 @@ pub async fn run_blame(node_name: &str) -> Result<(), Box<dyn Error>> {
     }
     let pod_name = parts[0];
     let namespace = parts[1];
-    println!("{} Found pod {} in namespace {}", "Success:".bold().green(), pod_name, namespace);
+    println!(
+        "{} Found pod {} in namespace {}",
+        "Success:".bold().green(),
+        pod_name,
+        namespace
+    );
 
     // 2. Port-forward
     println!("{} Establishing secure tunnel...", "Step 2:".bold());
     let mut child = Command::new("kubectl")
-        .args(&[
-            "port-forward", 
-            "-n", namespace,
-            pod_name,
-            ":3000" 
-        ])
+        .args(&["port-forward", "-n", namespace, pod_name, ":3000"])
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped()) 
+        .stderr(Stdio::piped())
         .spawn()?;
 
     let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
     let reader = BufReader::new(stdout);
-    
+
     let (tx, rx) = std::sync::mpsc::channel();
-    
+
     std::thread::spawn(move || {
         for line in reader.lines() {
             if let Ok(l) = line {
@@ -116,72 +129,83 @@ pub async fn run_blame(node_name: &str) -> Result<(), Box<dyn Error>> {
         }
     };
 
-    println!("{} Tunnel established on port {}", "Success:".bold().green(), local_port);
+    println!(
+        "{} Tunnel established on port {}",
+        "Success:".bold().green(),
+        local_port
+    );
 
     // 3. Query API
     println!("{} Fetching recent insights...", "Step 3:".bold());
     let client = Client::new();
     let url = format!("http://127.0.0.1:{}/insights/recent?limit=5", local_port);
-    
+
     let resp = client.get(&url).send().await;
-    
+
     match resp {
         Ok(r) => {
             if r.status().is_success() {
-                 let insights: Vec<InsightRecord> = r.json().await?;
-                 println!("\n{}", "Recent Insights:".bold().underline());
-                 if insights.is_empty() {
-                     println!("  No recent insights found.");
-                 } else {
-                     for record in insights {
-                         let i = record.insight;
-                         let color = match i.reason_code.as_str() {
-                             "normal" => "green",
-                             "fork_storm" | "cpu_spin" | "runaway_tree" => "red",
-                             _ => "yellow",
-                         };
-                         
-                         // Header: Reason | Confidence
-                         println!("  [{}] (Confidence: {:.0}%)", 
-                            i.reason_code.color(color).bold(), 
+                let insights: Vec<InsightRecord> = r.json().await?;
+                println!("\n{}", "Recent Insights:".bold().underline());
+                if insights.is_empty() {
+                    println!("  No recent insights found.");
+                } else {
+                    for record in insights {
+                        let i = record.insight;
+                        let color = match i.reason_code.as_str() {
+                            "normal" => "green",
+                            "fork_storm" | "cpu_spin" | "runaway_tree" => "red",
+                            _ => "yellow",
+                        };
+
+                        // Header: Reason | Confidence
+                        println!(
+                            "  [{}] (Confidence: {:.0}%)",
+                            i.reason_code.color(color).bold(),
                             i.confidence * 100.0
-                         );
-                         
-                         // Summary
-                         println!("    {}", i.summary);
+                        );
 
-                         // Top Pods
-                         if !i.top_pods.is_empty() {
-                             println!("\n    {}", "Top Contributing Pods:".bold());
-                             for pod in i.top_pods {
-                                 println!("    • {}/{} (CPU: {:.1}%, PSI: {:.1}%)", 
-                                    pod.namespace, pod.pod, pod.cpu_usage, pod.psi_contribution);
-                             }
-                         }
+                        // Summary
+                        println!("    {}", i.summary);
 
-                         // Suggested Next Step
-                         println!("\n    {}: {}", "Suggested Next Step".bold(), i.suggested_next_step);
+                        // Top Pods
+                        if !i.top_pods.is_empty() {
+                            println!("\n    {}", "Top Contributing Pods:".bold());
+                            for pod in i.top_pods {
+                                println!(
+                                    "    • {}/{} (CPU: {:.1}%, PSI: {:.1}%)",
+                                    pod.namespace, pod.pod, pod.cpu_usage, pod.psi_contribution
+                                );
+                            }
+                        }
 
-                         // Compat: Primary Process
-                         if let Some(proc) = i.primary_process {
-                             print!("\n    Process: {}", proc.bold());
-                             if let Some(k8s) = i.k8s {
-                                 print!(" (Pod: {}/{})", k8s.namespace, k8s.pod_name);
-                             }
-                             println!();
-                         }
-                         
-                         println!();
-                         println!("{}", "-".repeat(60).dimmed());
-                         println!();
-                     }
-                 }
+                        // Suggested Next Step
+                        println!(
+                            "\n    {}: {}",
+                            "Suggested Next Step".bold(),
+                            i.suggested_next_step
+                        );
+
+                        // Compat: Primary Process
+                        if let Some(proc) = i.primary_process {
+                            print!("\n    Process: {}", proc.bold());
+                            if let Some(k8s) = i.k8s {
+                                print!(" (Pod: {}/{})", k8s.namespace, k8s.pod_name);
+                            }
+                            println!();
+                        }
+
+                        println!();
+                        println!("{}", "-".repeat(60).dimmed());
+                        println!();
+                    }
+                }
             } else {
                 println!("{} API Error: {}", "Error:".bold().red(), r.status());
             }
         }
         Err(e) => {
-             println!("{} Connection failed: {}", "Error:".bold().red(), e);
+            println!("{} Connection failed: {}", "Error:".bold().red(), e);
         }
     }
 

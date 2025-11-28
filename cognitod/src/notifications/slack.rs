@@ -98,12 +98,12 @@ impl SlackNotifier {
 
     pub async fn send_insight(&self, insight: &Insight, action_ids: &[String]) -> Result<()> {
         // Note: Redaction should be applied by caller before calling this method
-        
+
         info!(target: "audit", "Sending insight notification to Slack. Reason: {:?}, ID: {}", insight.reason_code, insight.id);
-        
+
         let color = match insight.reason_code {
             crate::schema::InsightReason::Normal => "#36a64f", // Green
-            _ => "#FF0000", // Red for anomalies
+            _ => "#FF0000",                                    // Red for anomalies
         };
 
         let mut blocks = vec![
@@ -128,8 +128,10 @@ impl SlackNotifier {
         if !insight.top_pods.is_empty() {
             let mut pod_text = String::from("*Top Contributing Pods:*\n");
             for pod in &insight.top_pods {
-                pod_text.push_str(&format!("• `{}/{}` (CPU: {:.1}%, PSI: {:.1}%)\n", 
-                    pod.namespace, pod.pod, pod.cpu_usage, pod.psi_contribution));
+                pod_text.push_str(&format!(
+                    "• `{}/{}` (CPU: {:.1}%, PSI: {:.1}%)\n",
+                    pod.namespace, pod.pod, pod.cpu_usage, pod.psi_contribution
+                ));
             }
             blocks.push(json!({
                 "type": "section",
@@ -151,7 +153,7 @@ impl SlackNotifier {
 
         // Deprecated compat: Primary Process (if still populated)
         if let Some(proc) = &insight.primary_process {
-             blocks.push(json!({
+            blocks.push(json!({
                 "type": "context",
                 "elements": [{
                     "type": "mrkdwn",
@@ -159,15 +161,15 @@ impl SlackNotifier {
                 }]
             }));
         }
-        
+
         // Add interactive buttons
         let mut elements = Vec::new();
-        
+
         // Add Approve/Deny buttons if there are enforcement actions
         if !action_ids.is_empty() {
             let approve_value = format!("approve:{}", action_ids.join("|"));
             let deny_value = format!("deny:{}", action_ids.join("|"));
-            
+
             elements.push(json!({
                 "type": "button",
                 "text": {
@@ -179,7 +181,7 @@ impl SlackNotifier {
                 "value": approve_value,
                 "action_id": "approve_action"
             }));
-            
+
             elements.push(json!({
                 "type": "button",
                 "text": {
@@ -192,7 +194,7 @@ impl SlackNotifier {
                 "action_id": "deny_action"
             }));
         }
-        
+
         // View Dashboard & Feedback (ID is now mandatory)
         elements.push(json!({
             "type": "button",
@@ -203,7 +205,7 @@ impl SlackNotifier {
             },
             "url": format!("{}/insights/{}", self.dashboard_base_url, insight.id)
         }));
-        
+
         elements.push(json!({
             "type": "button",
             "text": {
@@ -214,7 +216,7 @@ impl SlackNotifier {
             "value": format!("useful:{}", insight.id),
             "action_id": "feedback_useful"
         }));
-        
+
         elements.push(json!({
             "type": "button",
             "text": {
@@ -225,7 +227,7 @@ impl SlackNotifier {
             "value": format!("noise:{}", insight.id),
             "action_id": "feedback_noise"
         }));
-        
+
         blocks.push(json!({
             "type": "actions",
             "elements": elements
@@ -240,13 +242,15 @@ impl SlackNotifier {
         });
 
         self.post_to_slack(&payload).await?;
-        
+
         info!(target: "audit", "Successfully sent insight notification to Slack. Reason: {:?}, ID: {}", insight.reason_code, insight.id);
         Ok(())
     }
 
     async fn post_to_slack(&self, payload: &serde_json::Value) -> Result<()> {
-        let res = self.client.post(&self.webhook_url)
+        let res = self
+            .client
+            .post(&self.webhook_url)
             .json(payload)
             .send()
             .await
@@ -256,7 +260,7 @@ impl SlackNotifier {
             let text = res.text().await.unwrap_or_default();
             anyhow::bail!("Slack API error: {}", text);
         }
-        
+
         debug!("Successfully sent notification to Slack");
         Ok(())
     }
