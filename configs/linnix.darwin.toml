@@ -1,0 +1,41 @@
+# Linnix Configuration for macOS/Docker Desktop
+# This config is used automatically when running on macOS
+# Key difference: binds to 0.0.0.0 instead of 127.0.0.1 for bridge networking
+
+[api]
+listen_addr = "0.0.0.0:3000"  # Bind to all interfaces for macOS bridge network
+# auth_token = "your-secret-token"
+
+[runtime]
+offline = false
+
+[telemetry]
+# Sample interval for CPU/memory metrics (milliseconds)
+sample_interval_ms = 1000
+
+# Event retention window (seconds)
+retention_seconds = 60
+
+[reasoner]
+# AI-powered incident detection
+enabled = true
+endpoint = "http://llama-server:8090/v1/chat/completions"  # Use service name for bridge network
+model = "linnix-3b-distilled"
+window_seconds = 10
+timeout_ms = 30000
+min_eps_to_enable = 10  # Enable for testing
+
+[prometheus]
+# Prometheus metrics endpoint
+enabled = true
+
+[probes]
+# eBPF probe configuration
+btf_path = "/sys/kernel/btf/vmlinux"
+
+[circuit_breaker]
+enabled = true
+mode = "monitor"  # Options: monitor, enforce
+psi_threshold = 40.0
+cpu_threshold = 90.0
+sustained_seconds = 15

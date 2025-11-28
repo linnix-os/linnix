@@ -20,7 +20,16 @@ services:
     # Can't use pid: host on macOS
     pid: null
     
-    # HTTP server needs to bind to 0.0.0.0 instead of 127.0.0.1
+    # Use macOS-specific config that binds to 0.0.0.0
+    volumes:
+      - ./configs/linnix.darwin.toml:/etc/linnix/linnix.toml:ro
+    
+    # Override config path
     environment:
-      - RUST_LOG=info
       - LINNIX_CONFIG=/etc/linnix/linnix.toml
+  
+  llama-server:
+    # Also need to fix llama-server network mode
+    network_mode: bridge
+    ports:
+      - "8090:8090"
