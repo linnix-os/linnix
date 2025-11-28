@@ -33,6 +33,8 @@ mod runtime;
 // mod routes; // Deleted (dead code cleanup)
 #[cfg(feature = "fake-events")]
 mod fake_events;
+#[cfg(feature = "fake-events")]
+use fake_events::DemoProfile;
 
 use cognitod::config;
 use cognitod::context;
