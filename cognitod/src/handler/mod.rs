@@ -1,7 +1,3 @@
-pub mod local_ilm;
-
-pub use local_ilm::LocalIlmHandlerRag;
-
 #[cfg(test)]
 use crate::ProcessEventWire;
 use crate::{ProcessEvent, types::SystemSnapshot};

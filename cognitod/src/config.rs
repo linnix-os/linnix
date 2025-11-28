@@ -30,6 +30,7 @@ fn default_listen_addr() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NotificationConfig {
     pub apprise: Option<AppriseConfig>,
+    pub slack: Option<SlackConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +38,19 @@ pub struct AppriseConfig {
     pub urls: Vec<String>,
     #[serde(default)]
     pub min_severity: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlackConfig {
+    pub webhook_url: String,
+    #[serde(default)]
+    pub channel: Option<String>,
+    #[serde(default = "default_dashboard_url")]
+    pub dashboard_base_url: String,
+}
+
+fn default_dashboard_url() -> String {
+    "http://localhost:3000".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -63,6 +77,56 @@ pub struct Config {
     pub notifications: Option<NotificationConfig>,
     #[serde(default)]
     pub circuit_breaker: CircuitBreakerConfig,
+    #[serde(default)]
+    pub noise_budget: NoiseBudgetConfig,
+    #[serde(default)]
+    pub privacy: PrivacyConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct PrivacyConfig {
+    /// If true, sensitive fields (pod names, namespaces) will be hashed in alerts.
+    #[serde(default = "default_redact_sensitive_data")]
+    pub redact_sensitive_data: bool,
+}
+
+impl Default for PrivacyConfig {
+    fn default() -> Self {
+        Self {
+            redact_sensitive_data: default_redact_sensitive_data(),
+        }
+    }
+}
+
+fn default_redact_sensitive_data() -> bool {
+    false
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct NoiseBudgetConfig {
+    /// Maximum number of alerts allowed per hour
+    #[serde(default = "default_max_alerts_per_hour")]
+    pub max_alerts_per_hour: u32,
+    /// If true, suppress alerts when budget is exceeded (default: true)
+    #[serde(default = "default_noise_budget_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for NoiseBudgetConfig {
+    fn default() -> Self {
+        Self {
+            max_alerts_per_hour: default_max_alerts_per_hour(),
+            enabled: default_noise_budget_enabled(),
+        }
+    }
+}
+
+fn default_max_alerts_per_hour() -> u32 {
+    10 // Default to 10 alerts per hour to prevent spam
+}
+
+fn default_noise_budget_enabled() -> bool {
+    true
 }
 
 impl Config {
@@ -74,7 +138,17 @@ impl Config {
             std::env::var(ENV_CONFIG_PATH).unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
         let path = PathBuf::from(path);
         match fs::read_to_string(&path) {
-            Ok(contents) => toml::from_str(&contents).unwrap_or_default(),
+            Ok(contents) => match toml::from_str(&contents) {
+                Ok(config) => config,
+                Err(e) => {
+                    log::warn!(
+                        "Failed to parse config file at {}: {}. Using defaults.",
+                        path.display(),
+                        e
+                    );
+                    Config::default()
+                }
+            },
             Err(_) => Config::default(),
         }
     }
@@ -177,18 +251,8 @@ pub struct ReasonerConfig {
     pub enabled: bool,
     #[serde(default = "default_reasoner_endpoint")]
     pub endpoint: String,
-    #[serde(default = "default_reasoner_window")]
-    pub window_seconds: u64,
     #[serde(default = "default_reasoner_timeout")]
     pub timeout_ms: u64,
-    #[serde(default = "default_reasoner_min_eps")]
-    pub min_eps_to_enable: u64,
-    #[serde(default = "default_reasoner_topk_kb")]
-    pub topk_kb: usize,
-    #[serde(default = "default_reasoner_tools_enabled")]
-    pub tools_enabled: bool,
-    #[serde(default)]
-    pub kb: ReasonerKbConfig,
 }
 
 impl Default for ReasonerConfig {
@@ -196,12 +260,7 @@ impl Default for ReasonerConfig {
         Self {
             enabled: default_reasoner_enabled(),
             endpoint: default_reasoner_endpoint(),
-            window_seconds: default_reasoner_window(),
             timeout_ms: default_reasoner_timeout(),
-            min_eps_to_enable: default_reasoner_min_eps(),
-            topk_kb: default_reasoner_topk_kb(),
-            tools_enabled: default_reasoner_tools_enabled(),
-            kb: ReasonerKbConfig::default(),
         }
     }
 }
@@ -214,57 +273,8 @@ fn default_reasoner_endpoint() -> String {
     "http://127.0.0.1:8087/v1/chat/completions".to_string()
 }
 
-fn default_reasoner_window() -> u64 {
-    5
-}
-
 fn default_reasoner_timeout() -> u64 {
     150
-}
-
-fn default_reasoner_min_eps() -> u64 {
-    20
-}
-
-fn default_reasoner_topk_kb() -> usize {
-    3
-}
-
-fn default_reasoner_tools_enabled() -> bool {
-    true
-}
-
-#[derive(Debug, Deserialize, Clone)]
-#[allow(dead_code)]
-pub struct ReasonerKbConfig {
-    #[serde(default = "default_reasoner_kb_dir")]
-    pub dir: Option<PathBuf>,
-    #[serde(default = "default_reasoner_kb_max_docs")]
-    pub max_docs: usize,
-    #[serde(default = "default_reasoner_kb_max_doc_bytes")]
-    pub max_doc_bytes: usize,
-}
-
-impl Default for ReasonerKbConfig {
-    fn default() -> Self {
-        Self {
-            dir: default_reasoner_kb_dir(),
-            max_docs: default_reasoner_kb_max_docs(),
-            max_doc_bytes: default_reasoner_kb_max_doc_bytes(),
-        }
-    }
-}
-
-fn default_reasoner_kb_dir() -> Option<PathBuf> {
-    Some(PathBuf::from("/etc/linnix/kb"))
-}
-
-fn default_reasoner_kb_max_docs() -> usize {
-    10
-}
-
-fn default_reasoner_kb_max_doc_bytes() -> usize {
-    5_000
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -399,7 +409,7 @@ fn default_grace_period_secs() -> u64 {
 }
 
 fn default_require_human_approval() -> bool {
-    false // Auto-approve when circuit breaker triggers (but still requires enabled=true)
+    true // SAFETY: Always require human approval by default, even if mode is "enforce"
 }
 
 fn default_circuit_breaker_mode() -> String {

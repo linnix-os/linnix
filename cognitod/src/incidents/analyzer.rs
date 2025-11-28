@@ -10,17 +10,24 @@ use super::Incident;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::time::Duration;
-use tracing::debug;
+use tracing::{debug, error, info};
 
 /// Analysis result from LLM
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IncidentAnalysis {
-    pub action_summary: String,
-    pub root_cause: String,
-    pub impact: String,
-    pub severity: String, // "low", "medium", "high", "critical"
-    pub recommendation: String,
-    pub confidence: f32, // 0.0 to 1.0
+    pub reason_code: String, // "fork_storm", "cpu_spin", etc.
+    pub summary: String,
+    pub confidence: f32,
+    pub suggested_next_step: String,
+    pub top_pods: Vec<PodContribution>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PodContribution {
+    pub namespace: String,
+    pub pod: String,
+    pub cpu_usage: f32,
+    pub psi_contribution: f32,
 }
 
 /// Incident analyzer using local LLM
@@ -61,6 +68,11 @@ impl IncidentAnalyzer {
         });
 
         debug!("[incident_analyzer] Requesting LLM analysis for incident");
+        info!(target: "audit", "Sending incident analysis request to LLM. Endpoint: {}, Event: {}, Target: {:?}", 
+            self.endpoint, 
+            incident.event_type,
+            incident.target_name
+        );
 
         let response = self
             .client
@@ -72,6 +84,7 @@ impl IncidentAnalyzer {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
+            error!(target: "audit", "LLM request failed. Status: {}, Error: {}", status, body);
             return Err(format!("LLM request failed: {} - {}", status, body).into());
         }
 
@@ -87,6 +100,8 @@ impl IncidentAnalyzer {
             "[incident_analyzer] Received analysis ({} chars)",
             analysis.len()
         );
+        
+        info!(target: "audit", "LLM analysis completed successfully. Response length: {} chars", analysis.len());
 
         Ok(analysis)
     }
@@ -119,22 +134,22 @@ ANALYSIS TASK:
 You are analyzing a circuit breaker incident where an automated action was taken to protect system stability.
 
 Provide a concise analysis covering:
+1. REASON_CODE: One of [fork_storm, short_job_flood, runaway_tree, cpu_spin, io_saturation, oom_risk, normal]
+2. SUMMARY: A concise explanation of what happened and why (1-2 sentences)
+3. CONFIDENCE: Your confidence level (0.0-1.0)
+4. SUGGESTED_NEXT_STEP: What should the operator do next? (1 sentence)
+5. TOP_PODS: JSON array of pods contributing to the issue (if applicable)
 
-1. ACTION_SUMMARY: Clearly state what action was taken and to which process (1 sentence)
-2. ROOT_CAUSE: Why did this process cause the circuit breaker to trigger? (1-2 sentences)
-3. IMPACT: What would have happened if we didn't kill this process? (1 sentence)
-4. SEVERITY: Rate as "low", "medium", "high", or "critical"
-5. RECOMMENDATION: What should be investigated or changed to prevent this? (2-3 sentences)
-6. CONFIDENCE: Your confidence level (0.0-1.0)
-
-Format your response as:
-
-ACTION_SUMMARY: <what we did>
-ROOT_CAUSE: <why it happened>
-IMPACT: <consequences of inaction>
-SEVERITY: <level>
-RECOMMENDATION: <suggestion>
-CONFIDENCE: <0.0-1.0>
+Format your response as a JSON object:
+{{
+  "reason_code": "fork_storm",
+  "summary": "Process foo spawned 200 children...",
+  "confidence": 0.95,
+  "suggested_next_step": "Check deployment config for replicas",
+  "top_pods": [
+    {{"namespace": "default", "pod": "foo-123", "cpu_usage": 80.5, "psi_contribution": 10.2}}
+  ]
+}}
 "#,
             timestamp,
             incident.event_type,
@@ -171,39 +186,18 @@ CONFIDENCE: <0.0-1.0>
 
     /// Parse structured analysis from LLM response
     pub fn parse_analysis(text: &str) -> Option<IncidentAnalysis> {
-        let mut action_summary = None;
-        let mut root_cause = None;
-        let mut impact = None;
-        let mut severity = None;
-        let mut recommendation = None;
-        let mut confidence = None;
+        // Find the first '{' and last '}' to extract JSON
+        let start = text.find('{')?;
+        let end = text.rfind('}')?;
+        let json_str = &text[start..=end];
 
-        for line in text.lines() {
-            let line = line.trim();
-            if line.starts_with("ACTION_SUMMARY:") {
-                action_summary = Some(line.strip_prefix("ACTION_SUMMARY:")?.trim().to_string());
-            } else if line.starts_with("ROOT_CAUSE:") {
-                root_cause = Some(line.strip_prefix("ROOT_CAUSE:")?.trim().to_string());
-            } else if line.starts_with("IMPACT:") {
-                impact = Some(line.strip_prefix("IMPACT:")?.trim().to_string());
-            } else if line.starts_with("SEVERITY:") {
-                severity = Some(line.strip_prefix("SEVERITY:")?.trim().to_lowercase());
-            } else if line.starts_with("RECOMMENDATION:") {
-                recommendation = Some(line.strip_prefix("RECOMMENDATION:")?.trim().to_string());
-            } else if line.starts_with("CONFIDENCE:") {
-                let conf_str = line.strip_prefix("CONFIDENCE:")?.trim();
-                confidence = conf_str.parse::<f32>().ok();
+        match serde_json::from_str::<IncidentAnalysis>(json_str) {
+            Ok(analysis) => Some(analysis),
+            Err(e) => {
+                debug!("[incident_analyzer] Failed to parse LLM JSON: {}", e);
+                None
             }
         }
-
-        Some(IncidentAnalysis {
-            action_summary: action_summary?,
-            root_cause: root_cause?,
-            impact: impact?,
-            severity: severity?,
-            recommendation: recommendation?,
-            confidence: confidence?,
-        })
     }
 }
 
@@ -214,19 +208,20 @@ mod tests {
     #[test]
     fn test_parse_analysis() {
         let response = r#"
-ACTION_SUMMARY: Auto-killed aggressive process causing system thrashing
-ROOT_CAUSE: Process fork bomb created 200 competing processes, overwhelming scheduler
-IMPACT: System became unresponsive
-SEVERITY: critical
-RECOMMENDATION: Implement process limits (ulimit -u) and monitor fork rates
-CONFIDENCE: 0.95
+Here is the analysis:
+{
+  "reason_code": "fork_storm",
+  "summary": "Process fork bomb created 200 competing processes",
+  "confidence": 0.95,
+  "suggested_next_step": "Implement process limits",
+  "top_pods": []
+}
 "#;
 
         let analysis = IncidentAnalyzer::parse_analysis(response).unwrap();
-        assert_eq!(analysis.severity, "critical");
+        assert_eq!(analysis.reason_code, "fork_storm");
         assert_eq!(analysis.confidence, 0.95);
-        assert!(analysis.root_cause.contains("fork bomb"));
-        assert!(analysis.action_summary.contains("Auto-killed"));
+        assert!(analysis.summary.contains("fork bomb"));
     }
 
     #[test]

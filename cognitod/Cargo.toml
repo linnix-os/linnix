@@ -43,6 +43,8 @@ jsonschema = "0.17"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 chrono = "0.4"
 tracing = "0.1"
+uuid = { version = "1.18.1", features = ["v4", "serde"] }
+sha2 = "0.10.9"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }

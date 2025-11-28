@@ -232,99 +232,109 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_propose_and_approve() {
+    async fn kill_action_requires_approval_by_operator() {
+        // Given: An SRE proposes killing a noisy process
         let queue = EnforcementQueue::new(300);
-        let id = queue
+        let action_id = queue
             .propose(
                 ActionType::KillProcess {
                     pid: 123,
                     signal: 9,
                 },
-                "test".to_string(),
-                "test".to_string(),
+                "consuming 90% CPU".to_string(),
+                "circuit_breaker".to_string(),
                 None,
             )
             .await
             .unwrap();
 
-        let pending = queue.get_pending().await;
-        assert_eq!(pending.len(), 1);
+        // When: The operator approves the action
+        let result = queue.approve(&action_id, "alice".to_string()).await;
 
-        let result = queue.approve(&id, "alice".to_string()).await;
+        // Then: The action is marked as approved and ready for execution
         assert!(result.is_ok());
-
-        let action = queue.get_by_id(&id).await.unwrap();
+        let action = queue.get_by_id(&action_id).await.unwrap();
         assert_eq!(action.status, ActionStatus::Approved);
         assert_eq!(action.approved_by, Some("alice".to_string()));
     }
 
     #[tokio::test]
-    async fn test_expiration() {
-        let queue = EnforcementQueue::new(0); // Expire immediately (0 seconds TTL)
-        let id = queue
+    async fn expired_actions_cannot_be_approved() {
+        // Given: A kill action with a 0-second TTL (expires immediately)
+        let queue = EnforcementQueue::new(0);
+        let action_id = queue
             .propose(
                 ActionType::KillProcess {
                     pid: 123,
                     signal: 9,
                 },
-                "test".to_string(),
-                "test".to_string(),
+                "high CPU usage".to_string(),
+                "circuit_breaker".to_string(),
                 None,
             )
             .await
             .unwrap();
 
+        // When: An operator tries to approve after waiting 1 second
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        let result = queue.approve(&action_id, "alice".to_string()).await;
 
-        let result = queue.approve(&id, "alice".to_string()).await;
+        // Then: Approval fails with an expiration error
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("expired"));
     }
 
     #[tokio::test]
-    async fn test_reject() {
+    async fn rejected_actions_cannot_be_approved_later() {
+        // Given: A proposed kill action
         let queue = EnforcementQueue::new(300);
-        let id = queue
+        let action_id = queue
             .propose(
                 ActionType::KillProcess {
                     pid: 123,
                     signal: 9,
                 },
-                "test".to_string(),
-                "test".to_string(),
+                "suspected false positive".to_string(),
+                "circuit_breaker".to_string(),
                 None,
             )
             .await
             .unwrap();
 
-        queue.reject(&id, "bob".to_string()).await.unwrap();
+        // When: An operator rejects it
+        queue.reject(&action_id, "bob".to_string()).await.unwrap();
 
-        let action = queue.get_by_id(&id).await.unwrap();
+        // Then: The action is marked rejected
+        let action = queue.get_by_id(&action_id).await.unwrap();
         assert_eq!(action.status, ActionStatus::Rejected);
 
-        let result = queue.approve(&id, "alice".to_string()).await;
+        // And: Another operator cannot approve it
+        let result = queue.approve(&action_id, "alice".to_string()).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn test_reject_already_approved() {
+    async fn approved_actions_cannot_be_rejected() {
+        // Given: A kill action approved by an operator
         let queue = EnforcementQueue::new(300);
-        let id = queue
+        let action_id = queue
             .propose(
                 ActionType::KillProcess {
                     pid: 123,
                     signal: 9,
                 },
-                "test".to_string(),
-                "test".to_string(),
+                "high memory usage".to_string(),
+                "circuit_breaker".to_string(),
                 None,
             )
             .await
             .unwrap();
+        queue.approve(&action_id, "alice".to_string()).await.unwrap();
 
-        queue.approve(&id, "alice".to_string()).await.unwrap();
+        // When: Another operator tries to reject it
+        let result = queue.reject(&action_id, "bob".to_string()).await;
 
-        let result = queue.reject(&id, "bob".to_string()).await;
+        // Then: Rejection fails because the action is no longer pending
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not pending"));
     }

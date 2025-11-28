@@ -20,30 +20,28 @@ use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::broadcast;
 use tokio::time::{sleep, timeout};
 
+use crate::insights::InsightStore;
+use crate::runtime::start_perf_listener;
 pub use linnix_ai_ebpf_common::PERCENT_MILLI_UNKNOWN;
 pub use linnix_ai_ebpf_common::ProcessEvent as ProcessEventWire;
 pub use linnix_ai_ebpf_common::ProcessEventExt as ProcessEvent;
 use linnix_ai_ebpf_common::TelemetryConfig;
-mod runtime;
-use crate::insights::InsightStore;
-use crate::runtime::start_perf_listener;
 
-mod alerts;
 mod api;
 mod bpf_config;
-mod config;
-mod context;
-mod enforcement;
+mod runtime;
+// mod routes; // Deleted (dead code cleanup)
 #[cfg(feature = "fake-events")]
 mod fake_events;
-mod handler;
-mod insights;
-mod metrics;
-mod notifications;
-mod routes;
-mod types;
-mod ui;
-mod utils;
+
+use cognitod::config;
+use cognitod::context;
+use cognitod::enforcement;
+use cognitod::handler;
+use cognitod::insights;
+use cognitod::metrics;
+use cognitod::types;
+use cognitod::ui;
 
 #[repr(transparent)]
 #[derive(Copy, Clone)]
@@ -95,16 +93,14 @@ fn attach_tracepoint_optional(bpf: &mut Ebpf, program: &str, category: &str, nam
     }
 }
 
-use crate::alerts::RuleEngine;
 use crate::api::{AppState, all_routes};
 use crate::bpf_config::{CoreRssMode, derive_telemetry_config};
-use crate::config::{Config, OfflineGuard};
-#[cfg(feature = "fake-events")]
-use crate::fake_events::DemoProfile;
-use crate::handler::{HandlerList, JsonlHandler, LocalIlmHandlerRag};
-use crate::metrics::Metrics;
 use crate::runtime::probes::{ProbeState, RssProbeMode};
 use clap::Parser;
+use cognitod::alerts::RuleEngine;
+use cognitod::config::{Config, OfflineGuard};
+use cognitod::handler::{HandlerList, JsonlHandler};
+use cognitod::metrics::Metrics;
 use serde_json::json;
 use std::{fs, path::Path};
 
@@ -129,7 +125,7 @@ fn spawn_metrics_tasks(metrics: Arc<Metrics>) {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
                 interval.tick().await;
-                log::info!(
+                log::debug!(
                     "metrics: events/s={} rb_overflows={} rate_limited={}",
                     metrics_clone.events_per_sec(),
                     metrics_clone.rb_overflows(),
@@ -752,15 +748,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // Spawn Apprise notifier if configured
-    if let Some(notif_config) = config.notifications
-        && let Some(apprise_config) = notif_config.apprise
+    if let Some(ref notif_config) = config.notifications
+        && let Some(ref apprise_config) = notif_config.apprise
     {
         if let Some(alert_tx) = &alert_tx {
             let apprise_rx = alert_tx.subscribe();
             let url_count = apprise_config.urls.len();
 
+            let apprise_config_owned = apprise_config.clone();
             tokio::spawn(async move {
-                let notifier = notifications::AppriseNotifier::new(apprise_config, apprise_rx);
+                let notifier =
+                    cognitod::notifications::AppriseNotifier::new(apprise_config_owned, apprise_rx);
                 notifier.run().await;
             });
 
@@ -773,62 +771,56 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let kb_index = if let Some(dir) = config.reasoner.kb.dir.as_deref() {
-        if let Err(err) = std::fs::create_dir_all(dir) {
-            warn!(
-                "[cognitod] unable to create knowledge base directory {}: {err}",
-                dir.display()
-            );
-            None
-        } else {
-            match handler::local_ilm::rag::KbIndex::from_dir(
-                dir,
-                config.reasoner.kb.max_docs,
-                config.reasoner.kb.max_doc_bytes,
-            ) {
-                Ok(index) => {
-                    if index.is_empty() {
-                        info!(
-                            "[cognitod] knowledge base directory {} is empty",
-                            dir.display()
-                        );
-                    }
-                    Some(index)
-                }
-                Err(err) => {
-                    warn!(
-                        "[cognitod] failed to load knowledge base from {}: {err}",
-                        dir.display()
-                    );
-                    None
-                }
+    // KB Index removed (YAGNI cleanup)
+
+    let k8s_context = cognitod::k8s::K8sContext::new();
+    if let Some(ctx) = &k8s_context {
+        info!(
+            "[cognitod] K8s context initialized (node: {})",
+            ctx.node_name
+        );
+        ctx.clone().start_watcher();
+    } else {
+        info!("[cognitod] K8s context not available (missing env/tokens)");
+    }
+
+    // Initialize Slack Notifier
+    let _slack_notifier = if let Some(ref notif_cfg) = config.notifications {
+        if let Some(ref slack_cfg) = notif_cfg.slack {
+            if let Some(ref tx) = alert_tx {
+                // SlackNotifier workaround: create two instances because run() consumes self.
+                // One for the alert loop, one for ILM insights (with dummy channel).
+                let (_dummy_tx, dummy_rx) = tokio::sync::broadcast::channel(1);
+                let notifier_ilm = Arc::new(cognitod::notifications::SlackNotifier::new(
+                    slack_cfg.clone(),
+                    dummy_rx,
+                ));
+
+                let notifier_alerts =
+                    cognitod::notifications::SlackNotifier::new(slack_cfg.clone(), tx.subscribe());
+                tokio::spawn(async move {
+                    notifier_alerts.run().await;
+                });
+
+                Some(notifier_ilm)
+            } else {
+                // No alert_tx (e.g. rules disabled), but we might still want ILM insights to go to Slack.
+                // We still need a dummy rx.
+                let (_dummy_tx, dummy_rx) = tokio::sync::broadcast::channel(1);
+                let notifier = Arc::new(cognitod::notifications::SlackNotifier::new(
+                    slack_cfg.clone(),
+                    dummy_rx,
+                ));
+                Some(notifier)
             }
+        } else {
+            None
         }
     } else {
         None
     };
 
-    if config.reasoner.enabled {
-        if let Some(h) = LocalIlmHandlerRag::try_new(
-            &config.reasoner,
-            Arc::clone(&metrics),
-            kb_index,
-            Arc::clone(&context),
-            Arc::clone(&insight_store),
-            enforcement_queue.clone(),
-        )
-        .await
-        {
-            handler_list.register(h);
-            metrics.set_ilm_enabled(true);
-        } else {
-            warn!("ILM disabled: endpoint unreachable or config invalid");
-            metrics.set_ilm_enabled(false);
-        }
-    } else {
-        metrics.set_ilm_enabled(false);
-        metrics.set_ilm_disabled_reason(Some("disabled_in_config".to_string()));
-    }
+    // LocalIlmHandlerRag removed (YAGNI cleanup)
 
     let handlers = Arc::new(handler_list);
     #[cfg(feature = "fake-events")]
@@ -856,12 +848,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let ctx_clone = Arc::clone(&context);
     let handlers_clone = Arc::clone(&handlers);
     let metrics_clone = Arc::clone(&metrics);
-    let reasoner_cfg = config.reasoner.clone();
+    // let reasoner_cfg = config.reasoner.clone(); // Unused
     tokio::spawn(async move {
         loop {
             // Only update when system is active (events/sec >= reasoner threshold)
             let eps = metrics_clone.events_per_sec();
-            let is_active = eps >= reasoner_cfg.min_eps_to_enable;
+            let is_active = eps >= 20; // Hardcoded default (YAGNI cleanup)
 
             // Always update system snapshot for dashboard
             ctx_clone.update_system_snapshot();
@@ -878,12 +870,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // 🔁 Periodically update process stats (conditional on activity)
     let ctx_clone = Arc::clone(&context);
     let metrics_clone = Arc::clone(&metrics);
-    let reasoner_cfg = config.reasoner.clone();
+    // let reasoner_cfg = config.reasoner.clone(); // Unused
     tokio::spawn(async move {
         loop {
             // Only update when system is active (events/sec >= reasoner threshold)
             let eps = metrics_clone.events_per_sec();
-            let is_active = eps >= reasoner_cfg.min_eps_to_enable;
+            let is_active = eps >= 20; // Hardcoded default (YAGNI cleanup)
 
             if is_active {
                 ctx_clone.update_process_stats();
@@ -936,7 +928,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             snapshot.cpu_percent, snapshot.psi_cpu_some_avg10
                         );
                     } else {
-                        let duration = breach_started_at.unwrap().elapsed().as_secs();
+                        let duration = breach_started_at
+                            .expect("breach_started_at should be Some when in breach")
+                            .elapsed()
+                            .as_secs();
                         info!(
                             "[circuit_breaker] BREACH SUSTAINED - CPU={:.1}% PSI={:.1}% - {}s/{}s",
                             snapshot.cpu_percent,
@@ -962,7 +957,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                                 match queue_clone
                                     .propose_auto(
-                                        enforcement::ActionType::KillProcess {
+                                        cognitod::enforcement::ActionType::KillProcess {
                                             pid: proc.pid,
                                             signal: 9,
                                         },
@@ -1099,9 +1094,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tokio::spawn(async move {
             loop {
                 for action in queue_clone.get_all().await {
-                    if action.status == enforcement::ActionStatus::Approved {
+                    if action.status == cognitod::enforcement::ActionStatus::Approved {
                         match action.action {
-                            enforcement::ActionType::KillProcess { pid, signal } => {
+                            cognitod::enforcement::ActionType::KillProcess { pid, signal } => {
                                 info!("[enforcement] EXECUTING KILL pid={} signal={}", pid, signal);
                                 unsafe {
                                     libc::kill(pid as i32, signal);

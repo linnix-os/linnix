@@ -3,20 +3,20 @@ mod auth;
 use crate::runtime::probes::ProbeState;
 use axum::{
     Router,
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, Form},
     http::{StatusCode, header},
     response::{
         IntoResponse, Json, Response,
         sse::{Event, Sse},
     },
-    routing::get,
+    routing::{get, post},
 };
 use futures_util::stream::{BoxStream, Stream, StreamExt};
 use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde::Deserialize;
 use serde::Serialize;
-use serde_json::{Value, json, to_string};
+use serde_json::{json, to_string};
 use std::collections::VecDeque;
 use std::fmt::Write as FmtWrite;
 use std::fs;
@@ -29,12 +29,12 @@ use tokio_stream::wrappers::{BroadcastStream, IntervalStream, errors::BroadcastS
 use crate::ProcessEvent;
 #[cfg(test)]
 use crate::ProcessEventWire;
-use crate::alerts::Alert;
+use cognitod::alerts::Alert;
 use crate::config::{OfflineGuard, ReasonerConfig};
 use crate::context::ContextStore;
 #[cfg(feature = "fake-events")]
 use crate::fake_events;
-use crate::handler::local_ilm::schema::insight_json_schema;
+// use crate::handler::local_ilm::schema::insight_json_schema; // Removed (YAGNI cleanup)
 use crate::insights::{InsightRecord, InsightStore as InsightsStore};
 use crate::metrics::Metrics;
 use crate::types::ProcessAlert;
@@ -159,17 +159,6 @@ pub(crate) struct AlertRecord {
     host: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct AlertDetail {
-    id: String,
-    timestamp: u64,
-    severity: String,
-    rule: String,
-    message: String,
-    host: String,
-    explanation: String,
-    remediation: String,
-}
 
 // System metrics structure
 #[derive(Serialize)]
@@ -223,15 +212,6 @@ impl AlertHistory {
     pub async fn get_all(&self) -> Vec<AlertRecord> {
         self.records.read().await.iter().cloned().collect()
     }
-
-    pub async fn get_by_id(&self, id: &str) -> Option<AlertRecord> {
-        self.records
-            .read()
-            .await
-            .iter()
-            .find(|r| r.id == id)
-            .cloned()
-    }
 }
 
 #[derive(Serialize)]
@@ -266,11 +246,7 @@ struct ReasonerStatus {
     endpoint: Option<String>,
     ilm_enabled: bool,
     ilm_disabled_reason: Option<String>,
-    window_seconds: u64,
     timeout_ms: u64,
-    min_eps_to_enable: u64,
-    topk_kb: usize,
-    tools_enabled: bool,
     ilm_windows: u64,
     ilm_timeouts: u64,
     ilm_insights: u64,
@@ -328,11 +304,7 @@ async fn status_handler(State(app_state): State<Arc<AppState>>) -> Json<StatusRe
         },
         ilm_enabled: metrics.ilm_enabled(),
         ilm_disabled_reason: metrics.ilm_disabled_reason(),
-        window_seconds: reasoner_cfg.window_seconds,
         timeout_ms: reasoner_cfg.timeout_ms,
-        min_eps_to_enable: reasoner_cfg.min_eps_to_enable,
-        topk_kb: reasoner_cfg.topk_kb,
-        tools_enabled: reasoner_cfg.tools_enabled,
         ilm_windows: metrics.ilm_windows(),
         ilm_timeouts: metrics.ilm_timeouts(),
         ilm_insights: metrics.ilm_insights(),
@@ -702,6 +674,8 @@ async fn get_graph(
     }
 }
 
+
+
 pub async fn stream_events(
     State(app_state): State<Arc<AppState>>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
@@ -915,51 +889,6 @@ async fn get_timeline(
     alerts.truncate(1000);
 
     Json(alerts)
-}
-
-// GET /api/alerts/:id - Get alert details by ID
-async fn get_alert_by_id(
-    State(app_state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    if let Some(alert) = app_state.alert_history.get_by_id(&id).await {
-        // Create detailed response with additional fields
-        let detail = AlertDetail {
-            id: alert.id.clone(),
-            timestamp: alert.timestamp,
-            severity: alert.severity.clone(),
-            rule: alert.rule.clone(),
-            message: alert.message.clone(),
-            host: alert.host.clone(),
-            explanation: format!("Alert triggered by rule: {}", alert.rule),
-            remediation: generate_remediation(&alert.rule, &alert.message),
-        };
-        (StatusCode::OK, Json(detail)).into_response()
-    } else {
-        (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "Alert not found"})),
-        )
-            .into_response()
-    }
-}
-
-// Helper function to generate remediation suggestions
-fn generate_remediation(rule: &str, message: &str) -> String {
-    match rule {
-        r if r.contains("fork") => {
-            "Identify and terminate the process causing excessive forks. Use 'kill -9 <pid>' or set process limits with ulimit.".to_string()
-        }
-        r if r.contains("cpu") => {
-            "Investigate high CPU usage. Check process with 'top' or 'htop', consider restarting or throttling the process.".to_string()
-        }
-        r if r.contains("memory") || r.contains("rss") => {
-            "Monitor memory usage. Check for memory leaks, restart the process, or increase available memory.".to_string()
-        }
-        _ => {
-            format!("Review alert message: {}", message)
-        }
-    }
 }
 
 // GET /api/metrics/system - Get current system metrics
@@ -1271,10 +1200,6 @@ pub async fn healthz() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({ "status": "ok" }))
 }
 
-async fn get_insight_schema_route() -> Json<Value> {
-    Json(insight_json_schema().clone())
-}
-
 async fn get_actions(
     State(state): State<Arc<AppState>>,
 ) -> Json<Vec<crate::enforcement::EnforcementAction>> {
@@ -1366,8 +1291,11 @@ pub struct MetricsResponse {
     ilm_timeouts: u64,
     ilm_insights: u64,
     ilm_schema_errors: u64,
-    ilm_enabled: bool,
-    ilm_disabled_reason: Option<String>,
+    pub ilm_enabled: bool,
+    pub ilm_disabled_reason: Option<String>,
+    pub slack_sent: u64,
+    pub slack_failed: u64,
+    pub alerts_generated: u64,
 }
 
 pub async fn prometheus_metrics(State(app_state): State<Arc<AppState>>) -> Response {
@@ -1620,6 +1548,9 @@ pub async fn metrics_handler(State(app_state): State<Arc<AppState>>) -> Json<Met
         ilm_schema_errors: metrics.ilm_schema_errors(),
         ilm_enabled: metrics.ilm_enabled(),
         ilm_disabled_reason: metrics.ilm_disabled_reason(),
+        slack_sent: metrics.slack_sent(),
+        slack_failed: metrics.slack_failed(),
+        alerts_generated: metrics.alerts_generated(),
     };
     Json(resp)
 }
@@ -1668,9 +1599,11 @@ pub fn all_routes(app_state: Arc<AppState>) -> Router {
         .route("/timeline", get(get_timeline))
         .route("/metrics/system", get(get_system_metrics))
         .route("/alerts", get(stream_alerts))
-        .route("/alerts/{id}", get(get_alert_by_id))
         .route("/insights", get(get_insights))
         .route("/insights/recent", get(get_recent_insights))
+        .route("/insights/{id}", get(get_insight_by_id))
+        .route("/insights/{id}/feedback", post(submit_feedback))
+        .route("/api/slack/interactions", post(handle_slack_interaction))
         .route("/incidents", get(get_incidents))
         .route("/incidents/summary", get(get_incident_summary))
         .route("/incidents/stats", get(get_incident_stats))
@@ -1678,7 +1611,7 @@ pub fn all_routes(app_state: Arc<AppState>) -> Router {
         .route("/metrics", get(metrics_handler))
         .route("/status", get(status_handler))
         .route("/healthz", get(healthz))
-        .route("/schema/insight", get(get_insight_schema_route))
+        // .route("/insights/schema", get(get_insight_schema_route)) // Removed (YAGNI cleanup)
         .route("/actions", get(get_actions))
         .route("/actions/{id}", get(get_action_by_id))
         .route("/actions/{id}/approve", axum::routing::post(approve_action))
@@ -1879,6 +1812,195 @@ async fn get_incident_summary(
     }))
 }
 
+#[derive(Debug, Deserialize)]
+struct SlackInteractionPayload {
+    payload: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackAction {
+    action_id: String,
+    value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackPayload {
+    actions: Vec<SlackAction>,
+}
+
+async fn get_insight_by_id(
+    Path(id): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    State(app): State<Arc<AppState>>,
+) -> Response {
+    let record = app.insights.get_by_id(&id);
+    
+    match record {
+        Some(rec) => {
+            // Check if HTML format is requested
+            if params.get("format") == Some(&"html".to_string()) {
+                let insight = &rec.insight;
+                let html = format!(
+                    r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Incident {}</title>
+    <style>
+        body {{ font-family: system-ui; max-width: 800px; margin: 40px auto; padding: 20px; }}
+        .header {{ background: #f5f5f5; padding: 20px; border-radius: 8px; margin-bottom: 20px; }}
+        .reason {{ color: #d32f2f; font-size: 24px; font-weight: bold; }}
+        .confidence {{ color: #666; }}
+        table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
+        th, td {{ text-align: left; padding: 12px; border-bottom: 1px solid #ddd; }}
+        th {{ background: #f5f5f5; font-weight: 600; }}
+        .summary {{ background: #fff3cd; padding: 15px; border-left: 4px solid #ffc107; margin: 20px 0; }}
+        .next-step {{ background: #d1ecf1; padding: 15px; border-left: 4px solid #0c5460; margin: 20px 0; }}
+        .footer {{ margin-top: 40px; padding-top: 20px; border-top: 1px solid #ddd; color: #666; }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="reason">🚨 {}</div>
+        <div class="confidence">Confidence: {:.0}%</div>
+        <div style="margin-top: 10px; color: #666;">ID: {}</div>
+    </div>
+    
+    <div class="summary">
+        <strong>Summary:</strong><br>
+        {}
+    </div>
+    
+    <h3>Top Contributing Pods</h3>
+    <table>
+        <tr>
+            <th>Namespace</th>
+            <th>Pod</th>
+            <th>CPU Usage</th>
+            <th>PSI Contribution</th>
+        </tr>
+        {}
+    </table>
+    
+    <div class="next-step">
+        <strong>Suggested Next Step:</strong><br>
+        {}
+    </div>
+    
+    <div class="footer">
+        <a href="/insights/{}">View as JSON</a> | 
+        Generated by Linnix v0.2.0
+    </div>
+</body>
+</html>"#,
+                    id,
+                    insight.reason_code.as_str(),
+                    insight.confidence * 100.0,
+                    id,
+                    insight.summary,
+                    insight.top_pods.iter()
+                        .map(|p| format!(
+                            "<tr><td>{}</td><td>{}</td><td>{:.1}%</td><td>{:.1}%</td></tr>",
+                            p.namespace, p.pod, p.cpu_usage, p.psi_contribution
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    insight.suggested_next_step,
+                    id
+                );
+                
+                (StatusCode::OK, [("content-type", "text/html")], html).into_response()
+            } else {
+                // Default: JSON
+                Json(rec).into_response()
+            }
+        }
+        None => (StatusCode::NOT_FOUND, "Insight not found").into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct FeedbackPayload {
+    feedback: crate::insights::Feedback,
+}
+
+async fn submit_feedback(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<FeedbackPayload>,
+) -> impl IntoResponse {
+    if state.insights.update_feedback(&id, payload.feedback.clone()) {
+        log::info!("Received feedback {:?} for insight {}", payload.feedback, id);
+        (StatusCode::OK, Json(json!({"status": "ok"}))).into_response()
+    } else {
+        (StatusCode::NOT_FOUND, Json(json!({"error": "Insight not found"}))).into_response()
+    }
+}
+
+async fn handle_slack_interaction(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<SlackInteractionPayload>,
+) -> impl IntoResponse {
+    let payload: SlackPayload = match serde_json::from_str(&form.payload) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("Failed to parse Slack payload: {}", e);
+            return (StatusCode::BAD_REQUEST, "Invalid payload").into_response();
+        }
+    };
+
+
+
+    if let Some(enforcement) = &state.enforcement {
+        for action in payload.actions {
+            if action.action_id == "approve_action" {
+                if let Some(ids_str) = action.value.strip_prefix("approve:") {
+                    for id in ids_str.split('|') {
+                        if !id.is_empty() {
+                            match enforcement.approve(id, "slack_user".to_string()).await {
+                                Ok(_) => {
+                                    log::info!("Approved action {} via Slack", id);
+                                    state.metrics.inc_slack_approved();
+                                }
+                                Err(e) => log::warn!("Failed to approve action {} via Slack: {}", id, e),
+                            }
+                        }
+                    }
+                }
+            } else if action.action_id == "deny_action" {
+                if let Some(ids_str) = action.value.strip_prefix("deny:") {
+                    for id in ids_str.split('|') {
+                        if !id.is_empty() {
+                            match enforcement.reject(id, "slack_user".to_string()).await {
+                                Ok(_) => {
+                                    log::info!("Rejected action {} via Slack", id);
+                                    state.metrics.inc_slack_denied();
+                                }
+                                Err(e) => log::warn!("Failed to reject action {} via Slack: {}", id, e),
+                            }
+                        }
+                    }
+                }
+            } else if action.action_id == "feedback_useful" {
+                if let Some(id) = action.value.strip_prefix("useful:") {
+                    if state.insights.update_feedback(id, crate::insights::Feedback::Useful) {
+                        log::info!("Marked insight {} as Useful", id);
+                    }
+                }
+            } else if action.action_id == "feedback_noise" {
+                if let Some(id) = action.value.strip_prefix("noise:") {
+                    if state.insights.update_feedback(id, crate::insights::Feedback::Noise) {
+                        log::info!("Marked insight {} as Noise", id);
+                    }
+                }
+            }
+        }
+    } else {
+        log::warn!("Received Slack interaction but enforcement is disabled");
+    }
+
+    (StatusCode::OK, "").into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2003,6 +2125,8 @@ mod tests {
         }
     }
 
+
+
     #[tokio::test]
     async fn metrics_includes_probe_state() {
         let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10));
@@ -2038,20 +2162,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn insight_schema_route_exposes_required_properties() {
-        let Json(schema) = super::get_insight_schema_route().await;
-        let props = schema
-            .get("properties")
-            .and_then(Value::as_object)
-            .expect("schema properties object");
-        for key in ["class", "confidence", "primary_process", "why", "actions"] {
-            assert!(
-                props.contains_key(key),
-                "schema properties must contain {key}"
-            );
-        }
-    }
+
 
     #[tokio::test]
     async fn prometheus_endpoint_respects_flag() {
