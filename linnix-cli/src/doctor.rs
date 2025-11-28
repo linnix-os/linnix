@@ -35,7 +35,7 @@ pub async fn run_doctor(url: &str) -> Result<(), Box<dyn Error>> {
     match client.get(format!("{}/healthz", url)).send().await {
         Ok(resp) => {
             if resp.status().is_success() {
-                if let Ok(_) = resp.json::<HealthResponse>().await {
+                if resp.json::<HealthResponse>().await.is_ok() {
                     println!("{}", "OK".green());
                 } else {
                     println!("{}", "OK (Invalid JSON)".yellow());

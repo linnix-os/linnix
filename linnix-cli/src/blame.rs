@@ -22,7 +22,6 @@ struct Insight {
     suggested_next_step: String,
     // Compat
     primary_process: Option<String>,
-    actions: Vec<String>,
     k8s: Option<K8sMetadata>,
 }
 
@@ -52,7 +51,7 @@ pub async fn run_blame(node_name: &str) -> Result<(), Box<dyn Error>> {
         node_name
     );
     let output = Command::new("kubectl")
-        .args(&[
+        .args([
             "get",
             "pods",
             "-A",
@@ -94,7 +93,7 @@ pub async fn run_blame(node_name: &str) -> Result<(), Box<dyn Error>> {
     // 2. Port-forward
     println!("{} Establishing secure tunnel...", "Step 2:".bold());
     let mut child = Command::new("kubectl")
-        .args(&["port-forward", "-n", namespace, pod_name, ":3000"])
+        .args(["port-forward", "-n", namespace, pod_name, ":3000"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
@@ -105,15 +104,13 @@ pub async fn run_blame(node_name: &str) -> Result<(), Box<dyn Error>> {
     let (tx, rx) = std::sync::mpsc::channel();
 
     std::thread::spawn(move || {
-        for line in reader.lines() {
-            if let Ok(l) = line {
-                if l.starts_with("Forwarding from") {
-                    if let Some(part) = l.split("127.0.0.1:").nth(1) {
-                        if let Some(port_str) = part.split(" ->").next() {
-                            if let Ok(p) = port_str.parse::<u16>() {
-                                let _ = tx.send(p);
-                                break;
-                            }
+        for line in reader.lines().map_while(Result::ok) {
+            if line.starts_with("Forwarding from") {
+                if let Some(part) = line.split("127.0.0.1:").nth(1) {
+                    if let Some(port_str) = part.split(" ->").next() {
+                        if let Ok(p) = port_str.parse::<u16>() {
+                            let _ = tx.send(p);
+                            break;
                         }
                     }
                 }

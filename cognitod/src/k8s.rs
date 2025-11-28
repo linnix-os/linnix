@@ -152,7 +152,7 @@ impl K8sContext {
 
         for line in content.lines() {
             // Simple heuristic: look for last part that looks like a container ID
-            if let Some(last_part) = line.split('/').last() {
+            if let Some(last_part) = line.split('/').next_back() {
                 // Remove .scope suffix if present
                 let clean = last_part.trim_end_matches(".scope");
                 // Remove prefix like "cri-containerd-" or "docker-"
