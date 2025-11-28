@@ -55,6 +55,30 @@ parse_args() {
     done
 }
 
+# Detect compose command (v1 or v2) and add macOS override if needed
+detect_compose() {
+    if docker compose version &> /dev/null; then
+        COMPOSE_CMD="docker compose"
+    elif docker-compose --version &> /dev/null; then
+        echo -e "${YELLOW}⚠️  Detected legacy 'docker-compose' (V1). Upgrade to 'docker compose' (V2) for better stability.${NC}"
+        COMPOSE_CMD="docker-compose"
+    else
+        echo -e "${RED}❌ Neither 'docker compose' nor 'docker-compose' found.${NC}"
+        echo "   Please install Docker Compose: https://docs.docker.com/compose/install/"
+        exit 1
+    fi
+    
+    # Detect macOS and add override file for network compatibility
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        if [ -f "docker-compose.darwin.yml" ]; then
+            COMPOSE_CMD="$COMPOSE_CMD -f docker-compose.yml -f docker-compose.darwin.yml"
+            echo -e "${BLUE}ℹ️  Detected macOS - using network override (bridge mode)${NC}"
+            echo "   Note: eBPF will monitor Docker VM processes only, not macOS processes."
+            echo ""
+        fi
+    fi
+}
+
 # Check for all necessary prerequisites
 check_prerequisites() {
     echo -e "${BLUE}[1/5]${NC} Checking prerequisites..."
@@ -66,15 +90,7 @@ check_prerequisites() {
     fi
 
     # Check Docker Compose
-    if docker compose version &> /dev/null; then
-        COMPOSE_CMD="docker compose"
-    elif command -v docker-compose &> /dev/null; then
-        COMPOSE_CMD="docker-compose"
-        echo -e "${YELLOW}⚠️  Detected legacy 'docker-compose' (V1). Upgrade to 'docker compose' (V2) for better stability.${NC}"
-    else
-        echo -e "${RED}❌ Docker Compose not found. Please install it: https://docs.docker.com/compose/install/${NC}"
-        exit 1
-    fi
+    detect_compose
     echo -e "${GREEN}✅ Docker and Docker Compose are installed.${NC}"
 
     # Check Docker permissions
