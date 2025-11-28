@@ -10,13 +10,12 @@
 #   - API & Dashboard: http://localhost:3000
 #   - LLM Server: http://localhost:8090
 
-version: '3.8'
-
 services:
   # Cognitod - eBPF monitoring daemon
   # Security: root + minimal caps (CAP_BPF + CAP_PERFMON only)
   cognitod:
     image: ghcr.io/linnix-os/cognitod:latest
+    platform: linux/amd64  # Force x86_64 (eBPF requires x86_64, will emulate on ARM)
     pull_policy: always
     container_name: linnix-cognitod
 
