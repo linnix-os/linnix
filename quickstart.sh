@@ -66,15 +66,7 @@ check_prerequisites() {
     fi
 
     # Check Docker Compose
-    if docker compose version &> /dev/null; then
-        COMPOSE_CMD="docker compose"
-    elif command -v docker-compose &> /dev/null; then
-        COMPOSE_CMD="docker-compose"
-        echo -e "${YELLOW}⚠️  Detected legacy 'docker-compose' (V1). Upgrade to 'docker compose' (V2) for better stability.${NC}"
-    else
-        echo -e "${RED}❌ Docker Compose not found. Please install it: https://docs.docker.com/compose/install/${NC}"
-        exit 1
-    fi
+    detect_compose
     echo -e "${GREEN}✅ Docker and Docker Compose are installed.${NC}"
 
     # Check Docker permissions

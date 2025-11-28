@@ -1,0 +1,26 @@
+# Docker Compose Override for macOS/Darwin
+#
+# Docker Desktop for Mac doesn't support network_mode: host or pid: host
+# This override file uses bridge networking with port mapping instead
+#
+# Usage:
+#   docker-compose -f docker-compose.yml -f docker-compose.darwin.yml up -d
+#
+# Note: eBPF will only see processes inside Docker's Linux VM, not macOS processes
+
+services:
+  cognitod:
+    # Override network mode from host to bridge
+    network_mode: bridge
+    
+    # Map port 3000 to macOS host
+    ports:
+      - "3000:3000"
+    
+    # Can't use pid: host on macOS
+    pid: null
+    
+    # HTTP server needs to bind to 0.0.0.0 instead of 127.0.0.1
+    environment:
+      - RUST_LOG=info
+      - LINNIX_CONFIG=/etc/linnix/linnix.toml
