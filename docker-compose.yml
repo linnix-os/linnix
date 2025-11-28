@@ -17,10 +17,7 @@ services:
   # Security: root + minimal caps (CAP_BPF + CAP_PERFMON only)
   cognitod:
     image: ghcr.io/linnix-os/cognitod:latest
-    # Fallback: build locally if image pull fails
-    build:
-      context: .
-      dockerfile: Dockerfile
+    pull_policy: always
     container_name: linnix-cognitod
 
     network_mode: host
