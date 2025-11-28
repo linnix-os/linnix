@@ -9,6 +9,11 @@
 # Access:
 #   - API & Dashboard: http://localhost:3000
 #   - LLM Server: http://localhost:8090
+#
+# Platform Notes:
+#   - Linux x86_64: Full eBPF kernel instrumentation (recommended)
+#   - macOS: eBPF monitors Docker VM processes only (via bridge network)
+#   - ARM64: x86_64 emulation via Rosetta/QEMU (slower performance)
 
 services:
   # Cognitod - eBPF monitoring daemon
