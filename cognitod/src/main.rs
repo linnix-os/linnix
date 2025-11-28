@@ -863,8 +863,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let eps = metrics_clone.events_per_sec();
             let is_active = eps >= reasoner_cfg.min_eps_to_enable;
 
+            // Always update system snapshot for dashboard
+            ctx_clone.update_system_snapshot();
+
             if is_active {
-                ctx_clone.update_system_snapshot();
                 let snap = ctx_clone.get_system_snapshot();
                 handlers_clone.on_snapshot(&snap).await;
             }
@@ -1070,18 +1072,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 if let Ok(stat) = Process::myself().and_then(|proc| proc.stat()) {
                     let total = stat.utime + stat.stime;
                     let dt = total.saturating_sub(prev_total);
+
+                    if prev_total > 0 {
+                        let cpu_pct = (dt as f64 / ticks) * 100.0;
+                        let rss_mb = stat.rss * page_kb / 1024;
+                        if cpu_pct > runtime_cfg.cpu_target_pct as f64 {
+                            warn!(
+                                "cpu usage {:.1}% exceeds target {}",
+                                cpu_pct, runtime_cfg.cpu_target_pct
+                            );
+                        }
+                        if rss_mb > runtime_cfg.rss_cap_mb {
+                            warn!("rss {}MB exceeds cap {}", rss_mb, runtime_cfg.rss_cap_mb);
+                        }
+                    }
                     prev_total = total;
-                    let cpu_pct = (dt as f64 / ticks) * 100.0;
-                    let rss_mb = stat.rss * page_kb / 1024;
-                    if cpu_pct > runtime_cfg.cpu_target_pct as f64 {
-                        warn!(
-                            "cpu usage {:.1}% exceeds target {}",
-                            cpu_pct, runtime_cfg.cpu_target_pct
-                        );
-                    }
-                    if rss_mb > runtime_cfg.rss_cap_mb {
-                        warn!("rss {}MB exceeds cap {}", rss_mb, runtime_cfg.rss_cap_mb);
-                    }
                 }
                 sleep(Duration::from_secs(1)).await;
             }

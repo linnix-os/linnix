@@ -257,7 +257,9 @@ impl ContextStore {
     /// Refresh and store a point‑in‑time `SystemSnapshot`.
     pub fn update_system_snapshot(&self) {
         let mut sys = self.sys.lock().unwrap();
-        sys.refresh_all();
+        // Only refresh global stats, not process list (expensive)
+        sys.refresh_cpu_all();
+        sys.refresh_memory();
 
         let cpu_percent = sys.global_cpu_usage();
         let mem_percent = if sys.total_memory() > 0 {

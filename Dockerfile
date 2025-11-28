@@ -57,7 +57,7 @@ COPY linnix-reasoner/Cargo.toml ./linnix-reasoner/
 COPY . .
 
 # Build release binaries with demo feature
-RUN cargo build --release -p cognitod --features fake-events
+RUN cargo build --release -p cognitod
 
 # Stage 3: Runtime image (minimal Debian)
 FROM debian:bookworm-slim

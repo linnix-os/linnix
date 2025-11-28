@@ -30,9 +30,15 @@ services:
     cap_add:
       - BPF
       - PERFMON
+      - SYS_ADMIN
+    
+    ulimits:
+      memlock: -1
 
     security_opt:
       - no-new-privileges:true
+      # - apparmor:unconfined
+      # - seccomp:unconfined
 
     read_only: true
     tmpfs:
@@ -42,6 +48,7 @@ services:
     volumes:
       - /sys/kernel/btf:/sys/kernel/btf:ro
       - /sys/kernel/debug:/sys/kernel/debug:ro
+      - /sys/fs/bpf:/sys/fs/bpf:rw
       - ./configs:/etc/linnix:ro
       - linnix-data:/var/lib/linnix:rw
 

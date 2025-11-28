@@ -22,7 +22,7 @@ endpoint = "http://localhost:8090/v1/chat/completions"
 model = "linnix-3b-distilled"
 window_seconds = 10
 timeout_ms = 30000
-min_eps_to_enable = 0  # Enable for testing
+min_eps_to_enable = 10  # Enable for testing
 
 [prometheus]
 # Prometheus metrics endpoint
