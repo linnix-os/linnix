@@ -87,9 +87,9 @@ impl InsightStore {
                 Feedback::Useful => "useful",
                 Feedback::Noise => "noise",
             };
-            
+
             record.feedback = Some(rating);
-            
+
             // Persist feedback to disk
             if let Some(path) = &self.file_path {
                 let path_str = path.to_string_lossy();
@@ -100,7 +100,7 @@ impl InsightStore {
                     "label": rating_label,
                     "source": "unknown", // Caller should provide this
                 });
-                
+
                 // Append to feedback log
                 if let Ok(mut file) = std::fs::OpenOptions::new()
                     .create(true)
@@ -110,7 +110,7 @@ impl InsightStore {
                     let _ = writeln!(file, "{}", feedback_entry);
                 }
             }
-            
+
             true
         } else {
             false
@@ -165,7 +165,7 @@ mod tests {
     fn insight_store_enforces_capacity_limit() {
         // Given: A store with capacity for only 2 insights
         let store = InsightStore::new(2, None);
-        
+
         // When: Three insights are recorded
         store.record(sample_insight(0));
         store.record(sample_insight(1));
@@ -184,7 +184,7 @@ mod tests {
         let temp = NamedTempFile::new().unwrap();
         let path = temp.path().to_path_buf();
         let store = InsightStore::new(4, Some(path.clone()));
-        
+
         // When: An insight is recorded
         store.record(sample_insight(42));
 

@@ -3,7 +3,7 @@ mod auth;
 use crate::runtime::probes::ProbeState;
 use axum::{
     Router,
-    extract::{Path, Query, State, Form},
+    extract::{Form, Path, Query, State},
     http::{StatusCode, header},
     response::{
         IntoResponse, Json, Response,
@@ -29,11 +29,11 @@ use tokio_stream::wrappers::{BroadcastStream, IntervalStream, errors::BroadcastS
 use crate::ProcessEvent;
 #[cfg(test)]
 use crate::ProcessEventWire;
-use cognitod::alerts::Alert;
 use crate::config::{OfflineGuard, ReasonerConfig};
 use crate::context::ContextStore;
 #[cfg(feature = "fake-events")]
 use crate::fake_events;
+use cognitod::alerts::Alert;
 // use crate::handler::local_ilm::schema::insight_json_schema; // Removed (YAGNI cleanup)
 use crate::insights::{InsightRecord, InsightStore as InsightsStore};
 use crate::metrics::Metrics;
@@ -158,7 +158,6 @@ pub(crate) struct AlertRecord {
     message: String,
     host: String,
 }
-
 
 // System metrics structure
 #[derive(Serialize)]
@@ -673,8 +672,6 @@ async fn get_graph(
         }
     }
 }
-
-
 
 pub async fn stream_events(
     State(app_state): State<Arc<AppState>>,
@@ -1834,7 +1831,7 @@ async fn get_insight_by_id(
     State(app): State<Arc<AppState>>,
 ) -> Response {
     let record = app.insights.get_by_id(&id);
-    
+
     match record {
         Some(rec) => {
             // Check if HTML format is requested
@@ -1897,7 +1894,9 @@ async fn get_insight_by_id(
                     insight.confidence * 100.0,
                     id,
                     insight.summary,
-                    insight.top_pods.iter()
+                    insight
+                        .top_pods
+                        .iter()
                         .map(|p| format!(
                             "<tr><td>{}</td><td>{}</td><td>{:.1}%</td><td>{:.1}%</td></tr>",
                             p.namespace, p.pod, p.cpu_usage, p.psi_contribution
@@ -1907,7 +1906,7 @@ async fn get_insight_by_id(
                     insight.suggested_next_step,
                     id
                 );
-                
+
                 (StatusCode::OK, [("content-type", "text/html")], html).into_response()
             } else {
                 // Default: JSON
@@ -1928,11 +1927,22 @@ async fn submit_feedback(
     Path(id): Path<String>,
     Json(payload): Json<FeedbackPayload>,
 ) -> impl IntoResponse {
-    if state.insights.update_feedback(&id, payload.feedback.clone()) {
-        log::info!("Received feedback {:?} for insight {}", payload.feedback, id);
+    if state
+        .insights
+        .update_feedback(&id, payload.feedback.clone())
+    {
+        log::info!(
+            "Received feedback {:?} for insight {}",
+            payload.feedback,
+            id
+        );
         (StatusCode::OK, Json(json!({"status": "ok"}))).into_response()
     } else {
-        (StatusCode::NOT_FOUND, Json(json!({"error": "Insight not found"}))).into_response()
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Insight not found"})),
+        )
+            .into_response()
     }
 }
 
@@ -1948,8 +1958,6 @@ async fn handle_slack_interaction(
         }
     };
 
-
-
     if let Some(enforcement) = &state.enforcement {
         for action in payload.actions {
             if action.action_id == "approve_action" {
@@ -1961,7 +1969,9 @@ async fn handle_slack_interaction(
                                     log::info!("Approved action {} via Slack", id);
                                     state.metrics.inc_slack_approved();
                                 }
-                                Err(e) => log::warn!("Failed to approve action {} via Slack: {}", id, e),
+                                Err(e) => {
+                                    log::warn!("Failed to approve action {} via Slack: {}", id, e)
+                                }
                             }
                         }
                     }
@@ -1975,20 +1985,28 @@ async fn handle_slack_interaction(
                                     log::info!("Rejected action {} via Slack", id);
                                     state.metrics.inc_slack_denied();
                                 }
-                                Err(e) => log::warn!("Failed to reject action {} via Slack: {}", id, e),
+                                Err(e) => {
+                                    log::warn!("Failed to reject action {} via Slack: {}", id, e)
+                                }
                             }
                         }
                     }
                 }
             } else if action.action_id == "feedback_useful" {
                 if let Some(id) = action.value.strip_prefix("useful:") {
-                    if state.insights.update_feedback(id, crate::insights::Feedback::Useful) {
+                    if state
+                        .insights
+                        .update_feedback(id, crate::insights::Feedback::Useful)
+                    {
                         log::info!("Marked insight {} as Useful", id);
                     }
                 }
             } else if action.action_id == "feedback_noise" {
                 if let Some(id) = action.value.strip_prefix("noise:") {
-                    if state.insights.update_feedback(id, crate::insights::Feedback::Noise) {
+                    if state
+                        .insights
+                        .update_feedback(id, crate::insights::Feedback::Noise)
+                    {
                         log::info!("Marked insight {} as Noise", id);
                     }
                 }
@@ -2125,8 +2143,6 @@ mod tests {
         }
     }
 
-
-
     #[tokio::test]
     async fn metrics_includes_probe_state() {
         let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10));
@@ -2161,8 +2177,6 @@ mod tests {
             &serde_json::json!(true)
         );
     }
-
-
 
     #[tokio::test]
     async fn prometheus_endpoint_respects_flag() {
