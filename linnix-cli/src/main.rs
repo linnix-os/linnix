@@ -6,6 +6,8 @@ use std::collections::HashSet;
 use std::error::Error;
 
 mod alert;
+mod blame;
+mod doctor;
 mod event;
 mod export;
 mod pretty;
@@ -52,6 +54,29 @@ enum Command {
         #[clap(long, value_enum, default_value = "txt")]
         format: Format,
     },
+    /// Blame a node for performance issues (requires kubectl)
+    Blame {
+        /// Node name to analyze
+        node_name: String,
+    },
+    /// Provide feedback on an insight
+    Feedback {
+        /// Insight ID
+        id: String,
+        /// Feedback type (useful/noise)
+        #[clap(value_enum)]
+        #[clap(rename_all = "snake_case")]
+        rating: FeedbackRating,
+    },
+    /// Check system health and connectivity
+    Doctor,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FeedbackRating {
+    Useful,
+    Noise,
 }
 
 #[derive(Deserialize, Debug)]
@@ -79,6 +104,32 @@ async fn main() -> Result<(), Box<dyn Error>> {
     {
         let report = export_incident(&client, &args.url, &since, &rule, format).await?;
         println!("{report}");
+        return Ok(());
+    }
+
+    if let Some(Command::Blame { node_name }) = args.command {
+        blame::run_blame(&node_name).await?;
+        return Ok(());
+    }
+
+    if let Some(Command::Feedback { id, rating }) = args.command {
+        let url = format!("{}/insights/{}/feedback", args.url, id);
+        let resp = client
+            .post(&url)
+            .json(&serde_json::json!({ "feedback": rating }))
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            println!("Feedback submitted successfully.");
+        } else {
+            eprintln!("Failed to submit feedback: {}", resp.status());
+        }
+        return Ok(());
+    }
+
+    if let Some(Command::Doctor) = args.command {
+        doctor::run_doctor(&args.url).await?;
         return Ok(());
     }
 

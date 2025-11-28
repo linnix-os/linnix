@@ -329,7 +329,10 @@ mod tests {
             )
             .await
             .unwrap();
-        queue.approve(&action_id, "alice".to_string()).await.unwrap();
+        queue
+            .approve(&action_id, "alice".to_string())
+            .await
+            .unwrap();
 
         // When: Another operator tries to reject it
         let result = queue.reject(&action_id, "bob".to_string()).await;
