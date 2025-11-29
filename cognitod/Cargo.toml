@@ -53,7 +53,6 @@ reqwest-eventsource = "0.4"
 
 [features]
 default = []
-fake-events = ["rand"]
 ilm-test = []
 
 # Metadata for cargo-deb and cargo-generate-rpm

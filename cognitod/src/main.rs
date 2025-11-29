@@ -31,10 +31,6 @@ mod api;
 mod bpf_config;
 mod runtime;
 // mod routes; // Deleted (dead code cleanup)
-#[cfg(feature = "fake-events")]
-mod fake_events;
-#[cfg(feature = "fake-events")]
-use fake_events::DemoProfile;
 
 use cognitod::config;
 use cognitod::context;
@@ -153,10 +149,6 @@ struct Args {
     dry_run: bool,
     #[arg(long)]
     probe_only: bool,
-    #[cfg(feature = "fake-events")]
-    /// Run synthetic process demo profile (fork-storm, short-jobs, runaway-tree)
-    #[arg(long, value_enum)]
-    demo: Option<DemoProfile>,
 }
 
 /// Generate search paths for BPF objects in canonical order:
@@ -825,15 +817,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // LocalIlmHandlerRag removed (YAGNI cleanup)
 
     let handlers = Arc::new(handler_list);
-    #[cfg(feature = "fake-events")]
-    if let Some(profile) = args.demo.clone() {
-        let handlers_clone = Arc::clone(&handlers);
-        let cap = config.runtime.events_rate_cap;
-        tokio::spawn(async move {
-            fake_events::run_demo(profile, handlers_clone, cap).await;
-        });
-    }
-
     // Pass metrics to your listener
     if !perf_buffers.is_empty() {
         start_perf_listener(

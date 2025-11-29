@@ -31,8 +31,6 @@ use crate::ProcessEvent;
 use crate::ProcessEventWire;
 use crate::config::{OfflineGuard, ReasonerConfig};
 use crate::context::ContextStore;
-#[cfg(feature = "fake-events")]
-use crate::fake_events;
 use cognitod::alerts::Alert;
 // use crate::handler::local_ilm::schema::insight_json_schema; // Removed (YAGNI cleanup)
 use crate::insights::{InsightRecord, InsightStore as InsightsStore};
@@ -736,9 +734,6 @@ pub async fn stream_events(
 
     let keepalive = IntervalStream::new(tokio::time::interval(Duration::from_secs(10)))
         .map(|_| Ok(Event::default().comment("keep-alive")));
-
-    #[cfg(feature = "fake-events")]
-    let event_stream = futures_util::stream::select(event_stream, fake_events::sse_stream());
 
     let merged = futures_util::stream::select(event_stream, keepalive);
 
