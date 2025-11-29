@@ -92,8 +92,14 @@ impl InsightStore {
 
             // Persist feedback to disk
             if let Some(path) = &self.file_path {
-                let path_str = path.to_string_lossy();
-                let feedback_path = path_str.replace(".json", "_feedback.json");
+                // Convert PathBuf to parent dir + stem, then append _feedback.json
+                let parent = path.parent().unwrap_or_else(|| Path::new("."));
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("insights");
+                let feedback_path = parent.join(format!("{}_feedback.json", stem));
+
                 let feedback_entry = serde_json::json!({
                     "insight_id": id,
                     "timestamp": current_epoch_secs(),
