@@ -235,9 +235,9 @@ pub async fn run_demo(profile: DemoProfile, handlers: Arc<HandlerList>, cap: u64
 #[cfg(all(test, feature = "fake-events"))]
 mod tests {
     use super::*;
-    use crate::alerts::RuleEngine;
     use crate::handler::HandlerList;
     use crate::metrics::Metrics;
+    use cognitod::alerts::RuleEngine;
     use std::sync::Arc;
     use tempfile::NamedTempFile;
     use tokio::time::{self, Duration};
