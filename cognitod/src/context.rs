@@ -71,7 +71,7 @@ impl ContextStore {
     pub fn add(&self, mut event: ProcessEvent) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_nanos() as u64;
 
         {

@@ -1,6 +1,6 @@
-use crate::handler::local_ilm::schema::Insight;
+use crate::schema::Insight;
 use log::warn;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -8,10 +8,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Feedback {
+    Useful,
+    Noise,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct InsightRecord {
     pub timestamp: u64,
     pub insight: Insight,
+    pub feedback: Option<Feedback>,
 }
 
 pub struct InsightStore {
@@ -33,6 +41,7 @@ impl InsightStore {
         let record = InsightRecord {
             timestamp: current_epoch_secs(),
             insight: insight.clone(),
+            feedback: None,
         };
 
         {
@@ -65,6 +74,54 @@ impl InsightStore {
         let inner = self.inner.lock().unwrap();
         inner.iter().rev().take(limit).cloned().collect::<Vec<_>>()
     }
+
+    pub fn get_by_id(&self, id: &str) -> Option<InsightRecord> {
+        let inner = self.inner.lock().unwrap();
+        inner.iter().find(|r| r.insight.id == id).cloned()
+    }
+
+    pub fn update_feedback(&self, id: &str, rating: Feedback) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(record) = inner.iter_mut().find(|r| r.insight.id == id) {
+            let rating_label = match &rating {
+                Feedback::Useful => "useful",
+                Feedback::Noise => "noise",
+            };
+
+            record.feedback = Some(rating);
+
+            // Persist feedback to disk
+            if let Some(path) = &self.file_path {
+                // Convert PathBuf to parent dir + stem, then append _feedback.json
+                let parent = path.parent().unwrap_or_else(|| Path::new("."));
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("insights");
+                let feedback_path = parent.join(format!("{}_feedback.json", stem));
+
+                let feedback_entry = serde_json::json!({
+                    "insight_id": id,
+                    "timestamp": current_epoch_secs(),
+                    "label": rating_label,
+                    "source": "unknown", // Caller should provide this
+                });
+
+                // Append to feedback log
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&feedback_path)
+                {
+                    let _ = writeln!(file, "{}", feedback_entry);
+                }
+            }
+
+            true
+        } else {
+            false
+        }
+    }
 }
 
 fn current_epoch_secs() -> u64 {
@@ -94,43 +151,54 @@ fn append_record(path: &Path, record: &InsightRecord) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handler::local_ilm::schema::{Insight, InsightClass};
+    use crate::schema::{Insight, InsightReason};
     use tempfile::NamedTempFile;
 
     fn sample_insight(suffix: usize) -> Insight {
         Insight {
-            class: InsightClass::Normal,
+            reason_code: InsightReason::Normal,
             confidence: 0.5,
+            id: format!("test-id-{}", suffix),
             primary_process: None,
-            why: format!("why-{suffix}"),
-            actions: Vec::new(),
+            summary: format!("why-{}", suffix),
+            k8s: None,
+            top_pods: Vec::new(),
+            suggested_next_step: "Do nothing".to_string(),
         }
     }
 
     #[test]
-    fn retains_recent_records() {
+    fn insight_store_enforces_capacity_limit() {
+        // Given: A store with capacity for only 2 insights
         let store = InsightStore::new(2, None);
+
+        // When: Three insights are recorded
         store.record(sample_insight(0));
         store.record(sample_insight(1));
         store.record(sample_insight(2));
 
+        // Then: Only the 2 most recent insights are retained (FIFO eviction)
         let recent = store.recent(10);
         assert_eq!(recent.len(), 2);
-        assert_eq!(recent[0].insight.why, "why-2");
-        assert_eq!(recent[1].insight.why, "why-1");
+        assert_eq!(recent[0].insight.summary, "why-2"); // Most recent first
+        assert_eq!(recent[1].insight.summary, "why-1");
     }
 
     #[test]
-    fn writes_records_to_disk() {
+    fn insights_are_persisted_for_audit_trail() {
+        // Given: A store configured to write to disk
         let temp = NamedTempFile::new().unwrap();
         let path = temp.path().to_path_buf();
         let store = InsightStore::new(4, Some(path.clone()));
+
+        // When: An insight is recorded
         store.record(sample_insight(42));
 
+        // Then: The serialized insight appears in the file
         let content = std::fs::read_to_string(path).unwrap();
         assert!(
-            content.contains("\"why\":\"why-42\""),
-            "serialized insight should land in file"
+            content.contains("\"summary\":\"why-42\""),
+            "Audit trail should contain the insight explanation"
         );
     }
 }

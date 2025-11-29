@@ -47,6 +47,12 @@ pub struct Metrics {
     circuit_breaker_io_trips: AtomicU64,  // Times I/O PSI threshold exceeded
     circuit_breaker_auto_kills: AtomicU64, // Automatic kills executed
     circuit_breaker_safety_vetoes: AtomicU64, // Kills blocked by safety checks
+    slack_interactions_approved: AtomicU64,
+    slack_interactions_denied: AtomicU64,
+    // Internal Observability
+    pub slack_sent_total: AtomicU64,
+    pub slack_failed_total: AtomicU64,
+    pub alerts_generated_total: AtomicU64,
 }
 
 #[allow(dead_code)]
@@ -87,6 +93,11 @@ impl Metrics {
             circuit_breaker_io_trips: AtomicU64::new(0),
             circuit_breaker_auto_kills: AtomicU64::new(0),
             circuit_breaker_safety_vetoes: AtomicU64::new(0),
+            slack_interactions_approved: AtomicU64::new(0),
+            slack_interactions_denied: AtomicU64::new(0),
+            slack_sent_total: AtomicU64::new(0),
+            slack_failed_total: AtomicU64::new(0),
+            alerts_generated_total: AtomicU64::new(0),
         }
     }
 
@@ -356,6 +367,49 @@ impl Metrics {
 
     pub fn circuit_breaker_safety_vetoes(&self) -> u64 {
         self.circuit_breaker_safety_vetoes.load(Ordering::Relaxed)
+    }
+
+    // Slack interaction metrics
+    pub fn inc_slack_approved(&self) {
+        self.slack_interactions_approved
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn slack_approved(&self) -> u64 {
+        self.slack_interactions_approved.load(Ordering::Relaxed)
+    }
+
+    pub fn inc_slack_denied(&self) {
+        self.slack_interactions_denied
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn slack_denied(&self) -> u64 {
+        self.slack_interactions_denied.load(Ordering::Relaxed)
+    }
+
+    pub fn inc_slack_sent(&self) {
+        self.slack_sent_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn slack_sent(&self) -> u64 {
+        self.slack_sent_total.load(Ordering::Relaxed)
+    }
+
+    pub fn inc_slack_failed(&self) {
+        self.slack_failed_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn slack_failed(&self) -> u64 {
+        self.slack_failed_total.load(Ordering::Relaxed)
+    }
+
+    pub fn inc_alerts_generated(&self) {
+        self.alerts_generated_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn alerts_generated(&self) -> u64 {
+        self.alerts_generated_total.load(Ordering::Relaxed)
     }
 }
 impl Default for Metrics {
