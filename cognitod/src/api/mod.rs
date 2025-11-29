@@ -1992,24 +1992,20 @@ async fn handle_slack_interaction(
                         }
                     }
                 }
-            } else if action.action_id == "feedback_useful" {
-                if let Some(id) = action.value.strip_prefix("useful:") {
-                    if state
-                        .insights
-                        .update_feedback(id, crate::insights::Feedback::Useful)
-                    {
-                        log::info!("Marked insight {} as Useful", id);
-                    }
-                }
-            } else if action.action_id == "feedback_noise" {
-                if let Some(id) = action.value.strip_prefix("noise:") {
-                    if state
-                        .insights
-                        .update_feedback(id, crate::insights::Feedback::Noise)
-                    {
-                        log::info!("Marked insight {} as Noise", id);
-                    }
-                }
+            } else if action.action_id == "feedback_useful"
+                && let Some(id) = action.value.strip_prefix("useful:")
+                && state
+                    .insights
+                    .update_feedback(id, crate::insights::Feedback::Useful)
+            {
+                log::info!("Marked insight {} as Useful", id);
+            } else if action.action_id == "feedback_noise"
+                && let Some(id) = action.value.strip_prefix("noise:")
+                && state
+                    .insights
+                    .update_feedback(id, crate::insights::Feedback::Noise)
+            {
+                log::info!("Marked insight {} as Noise", id);
             }
         }
     } else {
