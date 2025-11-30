@@ -42,8 +42,8 @@ pub async fn run_processes(client: &Client, url: &str) -> Result<(), Box<dyn Err
         .await?;
 
     println!(
-        "{:<8} {:<8} {:<6} {:<6} {:<10} {}",
-        "PID", "PPID", "CPU%", "MEM%", "PRIORITY", "CMD"
+        "{:<8} {:<8} {:<6} {:<6} {:<10} CMD",
+        "PID", "PPID", "CPU%", "MEM%", "PRIORITY"
     );
 
     for p in processes {
