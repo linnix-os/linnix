@@ -19,8 +19,7 @@ services:
   # Cognitod - eBPF monitoring daemon
   # Security: root + minimal caps (CAP_BPF + CAP_PERFMON only)
   cognitod:
-    image: linnix-cognitod
-    pull_policy: never
+    image: ${COGNITOD_IMAGE:-linnix-cognitod}
     container_name: linnix-cognitod
 
     network_mode: host
@@ -71,7 +70,7 @@ services:
 
   # LLM Server - Linnix 3B distilled model
   llama-server:
-    image: ghcr.io/ggerganov/llama.cpp:server
+    image: ${LLAMA_IMAGE:-ghcr.io/ggerganov/llama.cpp:server}
     container_name: linnix-llm
     volumes:
       - ./models:/models:ro
