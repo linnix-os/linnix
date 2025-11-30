@@ -11,6 +11,7 @@ mod doctor;
 mod event;
 mod export;
 mod pretty;
+mod processes;
 mod sse;
 use alert::Alert;
 use event::ProcessEvent;
@@ -70,6 +71,8 @@ enum Command {
     },
     /// Check system health and connectivity
     Doctor,
+    /// List running processes with priority
+    Processes,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug, serde::Serialize)]
@@ -130,6 +133,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     if let Some(Command::Doctor) = args.command {
         doctor::run_doctor(&args.url).await?;
+        return Ok(());
+    }
+
+    if let Some(Command::Processes) = args.command {
+        processes::run_processes(&client, &args.url).await?;
         return Ok(());
     }
 

@@ -89,6 +89,33 @@ struct ProcessInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<String>,
     k8s: Option<cognitod::k8s::K8sMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    priority: Option<cognitod::k8s::Priority>,
+}
+
+impl ProcessInfo {
+    fn from_event(e: &ProcessEvent, app_state: &AppState) -> Self {
+        let k8s = app_state
+            .k8s
+            .as_ref()
+            .and_then(|k| k.get_metadata_for_pid(e.pid));
+        Self {
+            pid: e.pid,
+            ppid: e.ppid,
+            uid: e.uid,
+            gid: e.gid,
+            comm: String::from_utf8_lossy(&e.comm)
+                .trim_end_matches('\0')
+                .to_string(),
+            event_type: e.event_type.into(),
+            cpu_pct: e.cpu_percent(),
+            mem_pct: e.mem_percent(),
+            age_sec: calculate_age_sec(e.ts_ns),
+            state: Some(process_state_str(e.event_type, e.exit_time_ns)),
+            k8s: k8s.clone(),
+            priority: k8s.map(|m| m.priority),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -382,24 +409,7 @@ async fn get_context_route(State(app_state): State<Arc<AppState>>) -> Json<Vec<P
     let events = ctx.get_recent();
     let data: Vec<ProcessInfo> = events
         .into_iter()
-        .map(|e| ProcessInfo {
-            pid: e.pid,
-            ppid: e.ppid,
-            uid: e.uid,
-            gid: e.gid,
-            comm: String::from_utf8_lossy(&e.comm)
-                .trim_end_matches('\0')
-                .to_string(),
-            event_type: e.event_type.into(),
-            cpu_pct: e.cpu_percent(),
-            mem_pct: e.mem_percent(),
-            age_sec: calculate_age_sec(e.ts_ns),
-            state: Some(process_state_str(e.event_type, e.exit_time_ns)),
-            k8s: app_state
-                .k8s
-                .as_ref()
-                .and_then(|k| k.get_metadata_for_pid(e.pid)),
-        })
+        .map(|e| ProcessInfo::from_event(&e, &app_state))
         .collect();
     Json(data)
 }
@@ -444,24 +454,7 @@ async fn get_processes(
     let snapshots = ctx.live_snapshot();
     let mut data: Vec<ProcessInfo> = snapshots
         .into_iter()
-        .map(|e| ProcessInfo {
-            pid: e.pid,
-            ppid: e.ppid,
-            uid: e.uid,
-            gid: e.gid,
-            comm: String::from_utf8_lossy(&e.comm)
-                .trim_end_matches('\0')
-                .to_string(),
-            event_type: e.event_type.into(),
-            cpu_pct: e.cpu_percent(),
-            mem_pct: e.mem_percent(),
-            age_sec: calculate_age_sec(e.ts_ns),
-            state: Some(process_state_str(e.event_type, e.exit_time_ns)),
-            k8s: app_state
-                .k8s
-                .as_ref()
-                .and_then(|k| k.get_metadata_for_pid(e.pid)),
-        })
+        .map(|e| ProcessInfo::from_event(&e, &app_state))
         .collect();
 
     // Apply filtering if specified
@@ -506,24 +499,7 @@ async fn get_process_by_pid(
 ) -> impl IntoResponse {
     let ctx = &app_state.context;
     if let Some(e) = ctx.get_process_by_pid(pid) {
-        let info = ProcessInfo {
-            pid: e.pid,
-            ppid: e.ppid,
-            uid: e.uid,
-            gid: e.gid,
-            comm: String::from_utf8_lossy(&e.comm)
-                .trim_end_matches('\0')
-                .to_string(),
-            event_type: e.event_type.into(),
-            cpu_pct: e.cpu_percent(),
-            mem_pct: e.mem_percent(),
-            age_sec: calculate_age_sec(e.ts_ns),
-            state: Some(process_state_str(e.event_type, e.exit_time_ns)),
-            k8s: app_state
-                .k8s
-                .as_ref()
-                .and_then(|k| k.get_metadata_for_pid(e.pid)),
-        };
+        let info = ProcessInfo::from_event(&e, &app_state);
         (axum::http::StatusCode::OK, Json(info)).into_response()
     } else {
         (
@@ -543,24 +519,7 @@ async fn get_by_ppid(
         .live_snapshot()
         .into_iter()
         .filter(|e| e.ppid == ppid)
-        .map(|e| ProcessInfo {
-            pid: e.pid,
-            ppid: e.ppid,
-            uid: e.uid,
-            gid: e.gid,
-            comm: String::from_utf8_lossy(&e.comm)
-                .trim_end_matches('\0')
-                .to_string(),
-            event_type: e.event_type.into(),
-            cpu_pct: e.cpu_percent(),
-            mem_pct: e.mem_percent(),
-            age_sec: calculate_age_sec(e.ts_ns),
-            state: Some(process_state_str(e.event_type, e.exit_time_ns)),
-            k8s: app_state
-                .k8s
-                .as_ref()
-                .and_then(|k| k.get_metadata_for_pid(e.pid)),
-        })
+        .map(|e| ProcessInfo::from_event(&e, &app_state))
         .collect();
     Json(matches)
 }
@@ -866,24 +825,7 @@ pub async fn stream_processes_live(
             let snapshots = ctx.live_snapshot();
             let data: Vec<ProcessInfo> = snapshots
                 .into_iter()
-                .map(|e| ProcessInfo {
-                    pid: e.pid,
-                    ppid: e.ppid,
-                    uid: e.uid,
-                    gid: e.gid,
-                    comm: String::from_utf8_lossy(&e.comm)
-                        .trim_end_matches('\0')
-                        .to_string(),
-                    event_type: e.event_type.into(),
-                    cpu_pct: e.cpu_percent(),
-                    mem_pct: e.mem_percent(),
-                    age_sec: calculate_age_sec(e.ts_ns),
-                    state: Some(process_state_str(e.event_type, e.exit_time_ns)),
-                    k8s: app_state
-                        .k8s
-                        .as_ref()
-                        .and_then(|k| k.get_metadata_for_pid(e.pid)),
-                })
+                .map(|e| ProcessInfo::from_event(&e, &app_state))
                 .collect();
 
             let json = to_string(&json!({ "event": "update", "processes": data })).unwrap();

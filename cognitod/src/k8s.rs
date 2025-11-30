@@ -6,6 +6,33 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::time::sleep;
 
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Priority {
+    Critical,
+    High,
+    Medium,
+    Low,
+}
+
+impl Default for Priority {
+    fn default() -> Self {
+        Self::Medium
+    }
+}
+
+impl From<&str> for Priority {
+    fn from(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "critical" => Self::Critical,
+            "high" => Self::High,
+            "medium" => Self::Medium,
+            "low" => Self::Low,
+            _ => Self::Medium,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct K8sMetadata {
     pub pod_name: String,
@@ -13,6 +40,8 @@ pub struct K8sMetadata {
     pub container_name: String,
     pub owner_kind: Option<String>,
     pub owner_name: Option<String>,
+    pub priority: Priority,
+    pub slo_tier: Option<String>,
 }
 
 pub struct K8sContext {
@@ -99,6 +128,17 @@ impl K8sContext {
                 (None, None)
             };
 
+            let (priority, slo_tier) = if let Some(labels) = &pod.metadata.labels {
+                let p = labels
+                    .get("linnix.dev/priority")
+                    .map(|s| Priority::from(s.as_str()))
+                    .unwrap_or_default();
+                let s = labels.get("linnix.dev/slo-tier").cloned();
+                (p, s)
+            } else {
+                (Priority::default(), None)
+            };
+
             if let Some(statuses) = pod.status.container_statuses {
                 for status in statuses {
                     if let Some(container_id) = status.container_id {
@@ -112,6 +152,8 @@ impl K8sContext {
                                     container_name: status.name.clone(),
                                     owner_kind: owner_kind.clone(),
                                     owner_name: owner_name.clone(),
+                                    priority: priority.clone(),
+                                    slo_tier: slo_tier.clone(),
                                 },
                             );
                         } else if let Some(stripped) = container_id.strip_prefix("docker://") {
@@ -123,6 +165,8 @@ impl K8sContext {
                                     container_name: status.name.clone(),
                                     owner_kind: owner_kind.clone(),
                                     owner_name: owner_name.clone(),
+                                    priority: priority.clone(),
+                                    slo_tier: slo_tier.clone(),
                                 },
                             );
                         }
@@ -191,6 +235,7 @@ struct PodMetadata {
     namespace: Option<String>,
     #[serde(rename = "ownerReferences")]
     owner_references: Option<Vec<OwnerReference>>,
+    labels: Option<HashMap<String, String>>,
 }
 
 #[derive(Deserialize)]
@@ -210,4 +255,32 @@ struct ContainerStatus {
     name: String,
     #[serde(rename = "containerID")]
     container_id: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_priority_parsing() {
+        assert_eq!(Priority::from("critical"), Priority::Critical);
+        assert_eq!(Priority::from("High"), Priority::High);
+        assert_eq!(Priority::from("MEDIUM"), Priority::Medium);
+        assert_eq!(Priority::from("low"), Priority::Low);
+        assert_eq!(Priority::from("unknown"), Priority::Medium);
+    }
+
+    #[test]
+    fn test_priority_serialization() {
+        assert_eq!(
+            serde_json::to_string(&Priority::Critical).unwrap(),
+            "\"critical\""
+        );
+        assert_eq!(serde_json::to_string(&Priority::High).unwrap(), "\"high\"");
+        assert_eq!(
+            serde_json::to_string(&Priority::Medium).unwrap(),
+            "\"medium\""
+        );
+        assert_eq!(serde_json::to_string(&Priority::Low).unwrap(), "\"low\"");
+    }
 }
