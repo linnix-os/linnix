@@ -109,7 +109,7 @@ impl ContextStore {
                 proc.event_type != 2
                     || proc
                         .exit_time()
-                        .is_none_or(|t| now - t < self.max_age.as_nanos() as u64)
+                        .is_none_or(|t| now.saturating_sub(t) < self.max_age.as_nanos() as u64)
             });
         }
 

@@ -55,13 +55,21 @@ pub struct K8sContext {
 
 impl K8sContext {
     pub fn new() -> Option<Arc<Self>> {
-        let host = std::env::var("KUBERNETES_SERVICE_HOST").ok()?;
-        let port = std::env::var("KUBERNETES_SERVICE_PORT").ok()?;
-        let api_url = format!("https://{}:{}", host, port);
-
-        let token =
-            std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/token").ok()?;
-        let ca_cert = std::fs::read("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt").ok()?;
+        let (api_url, token, ca_cert) = if let (Ok(url), Ok(t)) =
+            (std::env::var("K8S_API_URL"), std::env::var("K8S_TOKEN"))
+        {
+            // Local/Manual mode
+            (url, t, None)
+        } else {
+            // In-cluster mode
+            let host = std::env::var("KUBERNETES_SERVICE_HOST").ok()?;
+            let port = std::env::var("KUBERNETES_SERVICE_PORT").ok()?;
+            let url = format!("https://{}:{}", host, port);
+            let t = std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/token")
+                .ok()?;
+            let ca = std::fs::read("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt").ok()?;
+            (url, t, Some(ca))
+        };
 
         // Try to get node name from env (downward API) or hostname
         let node_name = std::env::var("NODE_NAME")
@@ -69,10 +77,15 @@ impl K8sContext {
             .or_else(|| std::env::var("HOSTNAME").ok())
             .unwrap_or_else(|| "localhost".to_string());
 
-        let client = Client::builder()
-            .add_root_certificate(reqwest::Certificate::from_pem(&ca_cert).ok()?)
-            .build()
-            .ok()?;
+        let mut builder = Client::builder();
+        if let Some(ca) = ca_cert {
+            builder = builder.add_root_certificate(reqwest::Certificate::from_pem(&ca).ok()?);
+        } else {
+            // In local mode, we might be using self-signed certs (like kind)
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+
+        let client = builder.build().ok()?;
 
         Some(Arc::new(Self {
             container_map: RwLock::new(HashMap::new()),

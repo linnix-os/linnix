@@ -100,5 +100,9 @@ docs/images/README.md
 !docs/AWS_EC2_DEPLOYMENT.md
 ROADMAP.md
 run_manual.sh
-docs/onboarding.md
-docs/onboarding.md
+run-cognitod-k8s.sh
+kind
+kubectl
+
+verification.yaml
+run-cognitod-k8s.sh
