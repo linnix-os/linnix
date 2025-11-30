@@ -19,9 +19,8 @@ services:
   # Cognitod - eBPF monitoring daemon
   # Security: root + minimal caps (CAP_BPF + CAP_PERFMON only)
   cognitod:
-    image: ghcr.io/linnix-os/cognitod:latest
-    platform: linux/amd64  # Force x86_64 (eBPF requires x86_64, will emulate on ARM)
-    pull_policy: always
+    image: linnix-cognitod
+    pull_policy: never
     container_name: linnix-cognitod
 
     network_mode: host

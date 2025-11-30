@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -10,14 +11,14 @@
             padding: 0;
             box-sizing: border-box;
         }
-        
+
         body {
             font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: linear-gradient(135deg, #1a1a1a 0%, #2d2d30 100%);
             color: #ffffff;
             min-height: 100vh;
         }
-        
+
         .header {
             background: rgba(0, 0, 0, 0.3);
             backdrop-filter: blur(10px);
@@ -27,7 +28,7 @@
             top: 0;
             z-index: 100;
         }
-        
+
         .header-content {
             max-width: 1200px;
             margin: 0 auto;
@@ -35,13 +36,13 @@
             align-items: center;
             justify-content: space-between;
         }
-        
+
         .logo {
             display: flex;
             align-items: center;
             gap: 0.75rem;
         }
-        
+
         .logo-icon {
             width: 32px;
             height: 32px;
@@ -53,7 +54,7 @@
             font-weight: bold;
             color: #000;
         }
-        
+
         .logo-text {
             font-size: 1.5rem;
             font-weight: 600;
@@ -62,43 +63,60 @@
             -webkit-text-fill-color: transparent;
             background-clip: text;
         }
-        
+
         .status-indicators {
             display: flex;
             gap: 1rem;
             align-items: center;
         }
-        
+
         .status-dot {
             width: 8px;
             height: 8px;
             border-radius: 50%;
             margin-right: 0.5rem;
         }
-        
-        .status-dot.online { background-color: #28a745; }
-        .status-dot.offline { background-color: #dc3545; }
-        .status-dot.loading { background-color: #ffc107; animation: pulse 2s infinite; }
-        
-        @keyframes pulse {
-            0% { opacity: 1; }
-            50% { opacity: 0.5; }
-            100% { opacity: 1; }
+
+        .status-dot.online {
+            background-color: #28a745;
         }
-        
+
+        .status-dot.offline {
+            background-color: #dc3545;
+        }
+
+        .status-dot.loading {
+            background-color: #ffc107;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% {
+                opacity: 1;
+            }
+
+            50% {
+                opacity: 0.5;
+            }
+
+            100% {
+                opacity: 1;
+            }
+        }
+
         .container {
             max-width: 1200px;
             margin: 0 auto;
             padding: 2rem;
         }
-        
+
         .grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
             gap: 2rem;
             margin-bottom: 2rem;
         }
-        
+
         .card {
             background: rgba(255, 255, 255, 0.05);
             backdrop-filter: blur(10px);
@@ -107,44 +125,44 @@
             padding: 1.5rem;
             transition: all 0.3s ease;
         }
-        
+
         .card:hover {
             transform: translateY(-2px);
             border-color: rgba(0, 102, 204, 0.3);
             box-shadow: 0 8px 32px rgba(0, 102, 204, 0.1);
         }
-        
+
         .card-header {
             display: flex;
             align-items: center;
             justify-content: between;
             margin-bottom: 1rem;
         }
-        
+
         .card-title {
             font-size: 1.1rem;
             font-weight: 600;
             color: #ffffff;
         }
-        
+
         .metric-value {
             font-size: 2rem;
             font-weight: 700;
             color: #0066CC;
             line-height: 1;
         }
-        
+
         .metric-label {
             font-size: 0.9rem;
             color: #888;
             margin-top: 0.25rem;
         }
-        
+
         .process-list {
             max-height: 300px;
             overflow-y: auto;
         }
-        
+
         .process-item {
             display: flex;
             justify-content: space-between;
@@ -155,28 +173,28 @@
             border-radius: 8px;
             border-left: 3px solid transparent;
         }
-        
+
         .process-item.high-cpu {
             border-left-color: #ff6600;
         }
-        
+
         .process-info {
             display: flex;
             flex-direction: column;
             gap: 0.25rem;
         }
-        
+
         .process-name {
             font-weight: 500;
             color: #ffffff;
         }
-        
+
         .process-pid {
             font-size: 0.8rem;
             color: #888;
             font-family: 'JetBrains Mono', 'Courier New', monospace;
         }
-        
+
         .process-cpu {
             font-family: 'JetBrains Mono', 'Courier New', monospace;
             font-weight: 600;
@@ -184,11 +202,22 @@
             border-radius: 4px;
             font-size: 0.8rem;
         }
-        
-        .cpu-high { background-color: rgba(255, 102, 0, 0.2); color: #ff6600; }
-        .cpu-medium { background-color: rgba(255, 193, 7, 0.2); color: #ffc107; }
-        .cpu-low { background-color: rgba(40, 167, 69, 0.2); color: #28a745; }
-        
+
+        .cpu-high {
+            background-color: rgba(255, 102, 0, 0.2);
+            color: #ff6600;
+        }
+
+        .cpu-medium {
+            background-color: rgba(255, 193, 7, 0.2);
+            color: #ffc107;
+        }
+
+        .cpu-low {
+            background-color: rgba(40, 167, 69, 0.2);
+            color: #28a745;
+        }
+
         .events-stream {
             height: 300px;
             overflow-y: auto;
@@ -196,7 +225,7 @@
             font-size: 0.85rem;
             line-height: 1.4;
         }
-        
+
         .event-item {
             padding: 0.75rem;
             margin: 0.5rem 0;
@@ -206,36 +235,37 @@
             transition: all 0.2s ease;
             animation: slideIn 0.3s ease;
         }
-        
+
         .event-item:hover {
             background: rgba(0, 102, 204, 0.15);
             transform: translateX(4px);
         }
-        
+
         @keyframes slideIn {
             from {
                 opacity: 0;
                 transform: translateX(-10px);
             }
+
             to {
                 opacity: 1;
                 transform: translateX(0);
             }
         }
-        
+
         .event-time {
             color: #888;
         }
-        
+
         .event-type {
             color: #0066CC;
             font-weight: 600;
         }
-        
+
         .insights-panel {
             grid-column: 1 / -1;
         }
-        
+
         .insight-item {
             background: rgba(0, 255, 0, 0.05);
             border: 1px solid rgba(0, 255, 0, 0.2);
@@ -243,14 +273,14 @@
             padding: 1rem;
             margin: 1rem 0;
         }
-        
+
         .insight-header {
             display: flex;
             align-items: center;
             gap: 0.5rem;
             margin-bottom: 0.75rem;
         }
-        
+
         .insight-icon {
             width: 24px;
             height: 24px;
@@ -263,7 +293,7 @@
             font-weight: bold;
             font-size: 0.8rem;
         }
-        
+
         .insight-confidence {
             background: rgba(0, 255, 0, 0.2);
             color: #00ff00;
@@ -272,7 +302,7 @@
             font-size: 0.8rem;
             font-weight: 600;
         }
-        
+
         .loading {
             display: flex;
             align-items: center;
@@ -280,7 +310,7 @@
             padding: 2rem;
             color: #888;
         }
-        
+
         .error {
             color: #dc3545;
             padding: 1rem;
@@ -289,17 +319,17 @@
             border-radius: 8px;
             margin: 1rem 0;
         }
-        
+
         .full-width {
             grid-column: 1 / -1;
         }
-        
+
         .quick-actions {
             display: flex;
             gap: 1rem;
             margin-top: 1rem;
         }
-        
+
         .btn {
             padding: 0.5rem 1rem;
             border: 1px solid rgba(0, 102, 204, 0.5);
@@ -311,12 +341,12 @@
             font-weight: 500;
             transition: all 0.2s ease;
         }
-        
+
         .btn:hover {
             background: rgba(0, 102, 204, 0.2);
             border-color: #0066CC;
         }
-        
+
         .footer {
             text-align: center;
             padding: 2rem;
@@ -326,6 +356,7 @@
         }
     </style>
 </head>
+
 <body>
     <div class="header">
         <div class="header-content">
@@ -441,22 +472,22 @@
         // Configuration
         const COGNITOD_BASE = '';
         const LLM_BASE = 'http://localhost:8090';
-        
+
         // State
         let eventCount = 0;
         let lastEventTime = Date.now();
         let insightsHistory = []; // Keep track of all insights
         let lastInsightData = null; // Track last fetched data to detect changes
-        
+
         // Service health checks
         async function checkServiceHealth() {
             try {
                 const cognitodResponse = await fetch(`${COGNITOD_BASE}/healthz`);
                 const cognitodHealthy = cognitodResponse.ok;
-                
-                document.getElementById('cognitod-status').className = 
+
+                document.getElementById('cognitod-status').className =
                     `status-dot ${cognitodHealthy ? 'online' : 'offline'}`;
-                
+
                 if (cognitodHealthy) {
                     loadSystemData();
                     loadProcesses();
@@ -466,35 +497,35 @@
                 console.error('Cognitod health check failed:', error);
                 document.getElementById('cognitod-status').className = 'status-dot offline';
             }
-            
+
             try {
                 const llmResponse = await fetch(`${LLM_BASE}/health`);
                 const llmHealthy = llmResponse.ok;
-                
-                document.getElementById('llm-status').className = 
+
+                document.getElementById('llm-status').className =
                     `status-dot ${llmHealthy ? 'online' : 'offline'}`;
             } catch (error) {
                 console.error('LLM health check failed:', error);
                 document.getElementById('llm-status').className = 'status-dot offline';
             }
         }
-        
+
         // Load system overview data
         async function loadSystemData() {
             try {
                 // Get process count from /processes endpoint
                 const processResponse = await fetch(`${COGNITOD_BASE}/processes`);
                 const processes = await processResponse.json();
-                
+
                 // Count unique processes
                 const uniquePids = new Set(processes.map(p => p.pid));
                 document.getElementById('active-processes').textContent = uniquePids.size;
-                
+
                 // Get memory usage and other metrics from /metrics endpoint
                 try {
                     const metricsResponse = await fetch(`${COGNITOD_BASE}/metrics`);
                     const metrics = await metricsResponse.json();
-                    
+
                     // Parse RSS memory (now in KB after bug fix)
                     if (metrics.rss) {
                         const memMB = Math.round(metrics.rss / 1024);
@@ -503,7 +534,7 @@
                     } else {
                         document.getElementById('memory-usage').textContent = 'N/A';
                     }
-                    
+
                     // Update CPU overhead
                     if (metrics.cpu_percent !== undefined) {
                         const cpuPercent = metrics.cpu_percent.toFixed(1);
@@ -517,7 +548,7 @@
                             document.getElementById('cpu-overhead').style.color = '#ff6600';
                         }
                     }
-                    
+
                     // Update events per second from metrics if available
                     if (metrics.events_per_sec !== undefined) {
                         document.getElementById('events-per-sec').textContent = Math.round(metrics.events_per_sec);
@@ -526,12 +557,12 @@
                     console.error('Failed to parse metrics:', error);
                     document.getElementById('memory-usage').textContent = 'N/A';
                 }
-                
+
             } catch (error) {
                 console.error('Failed to load system data:', error);
             }
         }
-        
+
         // Load top processes
         async function loadProcesses() {
             try {
@@ -540,36 +571,42 @@
                 const status = await statusResponse.json();
                 const topRss = status.top_rss || [];
                 const topCpu = status.top_cpu || [];
-                
+
                 console.log('Fetched processes - CPU:', topCpu.length, 'RSS:', topRss.length);
-                
+
                 // Combine CPU and memory into a unified list
                 const metricsMap = new Map();
-                
+
                 // Add memory data
                 for (const proc of topRss) {
                     metricsMap.set(proc.pid, {
                         pid: proc.pid,
                         comm: proc.comm,
                         mem_percent: proc.mem_percent,
-                        cpu_percent: 0
+                        cpu_percent: 0,
+                        k8s: proc.k8s
                     });
                 }
-                
+
                 // Add CPU data (merge if already exists)
                 for (const proc of topCpu) {
                     if (metricsMap.has(proc.pid)) {
                         metricsMap.get(proc.pid).cpu_percent = proc.cpu_percent;
+                        // Prefer existing K8s data, but take new if missing
+                        if (proc.k8s && !metricsMap.get(proc.pid).k8s) {
+                            metricsMap.get(proc.pid).k8s = proc.k8s;
+                        }
                     } else {
                         metricsMap.set(proc.pid, {
                             pid: proc.pid,
                             comm: proc.comm,
                             mem_percent: 0,
-                            cpu_percent: proc.cpu_percent
+                            cpu_percent: proc.cpu_percent,
+                            k8s: proc.k8s
                         });
                     }
                 }
-                
+
                 // Convert to array and sort by combined score (CPU + Memory)
                 const topProcesses = Array.from(metricsMap.values())
                     .sort((a, b) => {
@@ -578,19 +615,19 @@
                         return scoreB - scoreA;
                     })
                     .slice(0, 15);
-                
+
                 console.log('Top processes to display:', topProcesses.length, topProcesses);
-                
-                const processesHtml = topProcesses.length > 0 ? 
+
+                const processesHtml = topProcesses.length > 0 ?
                     topProcesses.map(proc => {
                         const cpuPercent = proc.cpu_percent || 0;
                         const memPercent = proc.mem_percent || 0;
                         const maxValue = Math.max(cpuPercent, memPercent);
-                        
+
                         // Color code by highest value
-                        const valueClass = maxValue > 20 ? 'cpu-high' : 
-                                         maxValue > 5 ? 'cpu-medium' : 'cpu-low';
-                        
+                        const valueClass = maxValue > 20 ? 'cpu-high' :
+                            maxValue > 5 ? 'cpu-medium' : 'cpu-low';
+
                         // Show both metrics
                         const metrics = [];
                         if (cpuPercent > 0) {
@@ -600,14 +637,21 @@
                             metrics.push(`💾 ${memPercent.toFixed(1)}% RAM`);
                         }
                         const metricsText = metrics.length > 0 ? metrics.join(' • ') : 'tracked';
-                        
-                        console.log(`Process ${proc.comm}: CPU=${cpuPercent}, MEM=${memPercent}, metrics=${metricsText}`);
-                        
+
+                        // K8s info
+                        let k8sInfo = '';
+                        if (proc.k8s) {
+                            k8sInfo = `<div class="process-k8s" style="font-size: 0.75rem; color: #888; margin-top: 2px;">
+                                📦 ${proc.k8s.pod_name} <span style="opacity:0.7">(${proc.k8s.namespace})</span>
+                            </div>`;
+                        }
+
                         return `
                             <div class="process-item ${maxValue > 20 ? 'high-cpu' : ''}">
                                 <div class="process-info">
                                     <div class="process-name">${proc.comm || 'unknown'}</div>
                                     <div class="process-pid">PID ${proc.pid}</div>
+                                    ${k8sInfo}
                                 </div>
                                 <div class="process-cpu ${valueClass}" style="font-size: 0.75rem; text-align: right;">
                                     ${metricsText}
@@ -616,37 +660,37 @@
                         `;
                     }).join('') :
                     '<div class="loading">No processes with metrics yet. <br><small style="color: #888;">CPU data requires time-based sampling (warmup in progress)</small></div>';
-                
+
                 console.log('Setting innerHTML, length:', processesHtml.length);
                 document.getElementById('processes-list').innerHTML = processesHtml;
-                
+
             } catch (error) {
                 console.error('Failed to load processes:', error);
-                document.getElementById('processes-list').innerHTML = 
+                document.getElementById('processes-list').innerHTML =
                     '<div class="error">Failed to load processes</div>';
             }
         }
-        
+
         // Load AI insights
         async function loadInsights() {
             try {
                 const response = await fetch(`${COGNITOD_BASE}/insights`);
                 const data = await response.json();
-                
+
                 // Check if data has changed
                 const dataStr = JSON.stringify(data);
                 if (dataStr === lastInsightData) {
                     return; // No new insights
                 }
                 lastInsightData = dataStr;
-                
+
                 // Handle both array format and {risks, summary} format
                 const insights = data.risks || (Array.isArray(data) ? data : []);
                 const summary = data.summary || '';
-                
+
                 // Add timestamp to new insight
                 const timestamp = new Date().toLocaleTimeString();
-                
+
                 // Append to history
                 if (summary || insights.length > 0) {
                     insightsHistory.unshift({
@@ -654,27 +698,27 @@
                         summary,
                         risks: insights
                     });
-                    
+
                     // Keep only last 10 insight batches
                     if (insightsHistory.length > 10) {
                         insightsHistory = insightsHistory.slice(0, 10);
                     }
                 }
-                
+
                 // Update AI Status card
-                const totalInsights = insightsHistory.reduce((sum, h) => 
+                const totalInsights = insightsHistory.reduce((sum, h) =>
                     sum + (h.summary ? 1 : 0) + h.risks.length, 0);
                 document.getElementById('insights-count').textContent = totalInsights || '0';
-                
+
                 // Update last insight time
                 const timeStr = insightsHistory.length > 0 ? timestamp : 'Never';
                 document.getElementById('last-insight-time').textContent = timeStr;
                 document.getElementById('last-insight-time').style.fontSize = insightsHistory.length > 0 ? '1.2rem' : '1rem';
                 document.getElementById('last-insight-time').style.color = insightsHistory.length > 0 ? '#00ff00' : '#888';
-                
+
                 // Render all insights in history
                 let insightsHtml = '';
-                
+
                 for (const batch of insightsHistory) {
                     // Show summary with enhanced structured data
                     if (batch.summary) {
@@ -682,7 +726,7 @@
                         const topCpu = data.top_cpu || [];
                         const topMemory = data.top_memory || [];
                         const alerts = data.alerts || [];
-                        
+
                         insightsHtml += `
                             <div class="insight-item" style="background: linear-gradient(135deg, rgba(59, 130, 246, 0.1), rgba(37, 99, 235, 0.05)); border-left: 4px solid #3b82f6;">
                                 <div class="insight-header">
@@ -775,7 +819,7 @@
                             </div>
                         `;
                     }
-                    
+
                     // Show risks if available
                     if (batch.risks.length > 0) {
                         insightsHtml += batch.risks.map(insight => `
@@ -804,27 +848,27 @@
                         `).join('');
                     }
                 }
-                
+
                 if (insightsHtml) {
                     document.getElementById('insights-panel').innerHTML = insightsHtml;
                 } else {
-                    document.getElementById('insights-panel').innerHTML = 
+                    document.getElementById('insights-panel').innerHTML =
                         '<div class="loading">No insights available yet. AI analysis runs every 30 seconds.</div>';
                 }
-                
+
             } catch (error) {
                 console.error('Failed to load insights:', error);
-                document.getElementById('insights-panel').innerHTML = 
+                document.getElementById('insights-panel').innerHTML =
                     '<div class="error">Failed to load AI insights</div>';
             }
         }
-        
+
         // Connect to events stream
         function connectEventStream() {
             try {
                 const eventSource = new EventSource(`${COGNITOD_BASE}/stream`);
-                
-                eventSource.onmessage = function(event) {
+
+                eventSource.onmessage = function (event) {
                     try {
                         const data = JSON.parse(event.data);
                         handleNewEvent(data);
@@ -832,41 +876,41 @@
                         console.error('Failed to parse event data:', e);
                     }
                 };
-                
-                eventSource.onerror = function(error) {
+
+                eventSource.onerror = function (error) {
                     console.error('EventSource failed:', error);
-                    document.getElementById('events-stream').innerHTML = 
+                    document.getElementById('events-stream').innerHTML =
                         '<div class="error">Event stream disconnected. Retrying in 5 seconds...</div>';
-                    
+
                     setTimeout(() => {
                         eventSource.close();
                         connectEventStream();
                     }, 5000);
                 };
-                
+
             } catch (error) {
                 console.error('Failed to connect to event stream:', error);
-                document.getElementById('events-stream').innerHTML = 
+                document.getElementById('events-stream').innerHTML =
                     '<div class="error">Failed to connect to event stream</div>';
             }
         }
-        
+
         // Handle new events from stream
         function handleNewEvent(event) {
             eventCount++;
             const eventsContainer = document.getElementById('events-stream');
-            
+
             const eventTime = new Date().toLocaleTimeString();
             const eventElement = document.createElement('div');
-            
+
             // Use event_type_name from backend API (e.g., 'exec', 'fork', 'exit')
             let eventLabel = event.event_type_name || 'unknown';
-            
+
             // Determine event type and styling
             let eventIcon = '📝';
             let eventColor = '#0066CC';
-            
-            switch(eventLabel) {
+
+            switch (eventLabel) {
                 case 'fork':
                     eventIcon = '🔄';
                     eventColor = '#ffc107';
@@ -880,10 +924,10 @@
                     eventColor = '#888';
                     break;
             }
-            
+
             // Get user info
             const userName = event.uid === 0 ? 'root' : `uid:${event.uid}`;
-            
+
             // Build metric badges
             const metrics = [];
             if (event.cpu_percent && event.cpu_percent > 0) {
@@ -893,7 +937,7 @@
             if (event.mem_percent && event.mem_percent > 0) {
                 metrics.push(`<span style="background: rgba(59,130,246,0.2); color: #3b82f6; padding: 2px 6px; border-radius: 3px; font-size: 0.75rem;">RAM ${event.mem_percent.toFixed(1)}%</span>`);
             }
-            
+
             eventElement.className = 'event-item';
             eventElement.style.borderLeftColor = eventColor;
             eventElement.innerHTML = `
@@ -909,36 +953,37 @@
                     ${metrics.length > 0 ? '<span style="margin-left: auto;"></span>' + metrics.join(' ') : ''}
                 </div>
             `;
-            
+
             // Add to top of events list
             eventsContainer.insertBefore(eventElement, eventsContainer.firstChild);
-            
+
             // Keep only last 50 events
             const events = eventsContainer.children;
             while (events.length > 50) {
                 eventsContainer.removeChild(events[events.length - 1]);
             }
         }
-        
+
         // Initialize dashboard
         async function initialize() {
             console.log('Initializing Linnix Dashboard...');
-            
+
             // Initial health check
             await checkServiceHealth();
-            
+
             // Connect to event stream
             connectEventStream();
-            
+
             // Set up periodic updates (optimized for performance)
             setInterval(checkServiceHealth, 30000);  // Every 30 seconds
             setInterval(loadSystemData, 15000);      // Every 15 seconds
             setInterval(loadProcesses, 20000);       // Every 20 seconds
             setInterval(loadInsights, 60000);        // Every 60 seconds
         }
-        
+
         // Start when page loads
         window.addEventListener('load', initialize);
     </script>
 </body>
+
 </html>

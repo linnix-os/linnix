@@ -82,6 +82,15 @@ impl IncidentStore {
             CREATE INDEX IF NOT EXISTS idx_timestamp ON incidents(timestamp);
             CREATE INDEX IF NOT EXISTS idx_event_type ON incidents(event_type);
             CREATE INDEX IF NOT EXISTS idx_psi_cpu ON incidents(psi_cpu);
+            CREATE TABLE IF NOT EXISTS feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                insight_id TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                label TEXT NOT NULL,
+                source TEXT NOT NULL,
+                user_id TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_feedback_insight_id ON feedback(insight_id);
             "#,
         )
         .execute(&pool)
@@ -138,6 +147,34 @@ impl IncidentStore {
 
         debug!("Added LLM analysis to incident #{}", id);
         Ok(())
+    }
+
+    /// Insert user feedback for an insight
+    pub async fn insert_feedback(
+        &self,
+        insight_id: &str,
+        label: &str,
+        source: &str,
+        user_id: Option<&str>,
+    ) -> Result<i64, sqlx::Error> {
+        let now = Utc::now().timestamp();
+        let result = sqlx::query(
+            r#"
+            INSERT INTO feedback (insight_id, timestamp, label, source, user_id)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(insight_id)
+        .bind(now)
+        .bind(label)
+        .bind(source)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+
+        let id = result.last_insert_rowid();
+        debug!("Inserted feedback #{} for insight {}", id, insight_id);
+        Ok(id)
     }
 
     /// Get incident by ID
@@ -290,10 +327,16 @@ impl IncidentStore {
         .await?;
         let avg_recovery: Option<f64> = avg_row.get(0);
 
+        let feedback_row = sqlx::query("SELECT COUNT(*) FROM feedback")
+            .fetch_one(&self.pool)
+            .await?;
+        let feedback_count: i64 = feedback_row.get(0);
+
         Ok(IncidentStats {
             total: total as u64,
             circuit_breaker_triggers: circuit_breaker_count as u64,
             avg_recovery_time_ms: avg_recovery.map(|r| r as u64),
+            feedback_entries: feedback_count as u64,
         })
     }
 }
@@ -304,4 +347,5 @@ pub struct IncidentStats {
     pub total: u64,
     pub circuit_breaker_triggers: u64,
     pub avg_recovery_time_ms: Option<u64>,
+    pub feedback_entries: u64,
 }

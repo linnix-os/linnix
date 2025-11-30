@@ -53,6 +53,7 @@ pub struct Metrics {
     pub slack_sent_total: AtomicU64,
     pub slack_failed_total: AtomicU64,
     pub alerts_generated_total: AtomicU64,
+    pub feedback_entries_total: AtomicU64,
 }
 
 #[allow(dead_code)]
@@ -98,6 +99,7 @@ impl Metrics {
             slack_sent_total: AtomicU64::new(0),
             slack_failed_total: AtomicU64::new(0),
             alerts_generated_total: AtomicU64::new(0),
+            feedback_entries_total: AtomicU64::new(0),
         }
     }
 
@@ -411,7 +413,16 @@ impl Metrics {
     pub fn alerts_generated(&self) -> u64 {
         self.alerts_generated_total.load(Ordering::Relaxed)
     }
+
+    pub fn inc_feedback_entry(&self) {
+        self.feedback_entries_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn feedback_entries(&self) -> u64 {
+        self.feedback_entries_total.load(Ordering::Relaxed)
+    }
 }
+
 impl Default for Metrics {
     fn default() -> Self {
         Self::new()

@@ -88,6 +88,7 @@ struct ProcessInfo {
     age_sec: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<String>,
+    k8s: Option<cognitod::k8s::K8sMetadata>,
 }
 
 #[derive(Serialize)]
@@ -137,6 +138,7 @@ struct TopRssEntry {
     pid: u32,
     comm: String,
     mem_percent: f32,
+    k8s: Option<cognitod::k8s::K8sMetadata>,
 }
 
 #[derive(Serialize)]
@@ -144,6 +146,7 @@ struct TopCpuEntry {
     pid: u32,
     comm: String,
     cpu_percent: f32,
+    k8s: Option<cognitod::k8s::K8sMetadata>,
 }
 
 // Alert timeline structures
@@ -229,6 +232,19 @@ struct StatusResponse {
     top_cpu: Vec<TopCpuEntry>,
     probes: StatusProbeState,
     reasoner: ReasonerStatus,
+    incidents_last_1h: Option<usize>,
+    feedback_entries: u64,
+    slack_stats: SlackStats,
+    perf_poll_errors: u64,
+    dropped_events_total: u64,
+}
+
+#[derive(Serialize)]
+struct SlackStats {
+    sent: u64,
+    failed: u64,
+    approved: u64,
+    denied: u64,
 }
 
 #[derive(Serialize)]
@@ -272,24 +288,32 @@ async fn status_handler(State(app_state): State<Arc<AppState>>) -> Json<StatusRe
     }
 
     let reasoner_cfg = &app_state.reasoner;
-    let top_rss = app_state
-        .context
+    let ctx = &app_state.context;
+    let top_rss = ctx
         .top_rss_processes(5)
         .into_iter()
-        .map(|proc| TopRssEntry {
-            pid: proc.pid,
-            comm: proc.comm,
-            mem_percent: proc.mem_percent,
+        .map(|p| TopRssEntry {
+            pid: p.pid,
+            comm: p.comm,
+            mem_percent: p.mem_percent,
+            k8s: app_state
+                .k8s
+                .as_ref()
+                .and_then(|k| k.get_metadata_for_pid(p.pid)),
         })
         .collect();
-    let top_cpu = app_state
-        .context
+
+    let top_cpu = ctx
         .top_cpu_processes(5)
         .into_iter()
-        .map(|proc| TopCpuEntry {
-            pid: proc.pid,
-            comm: proc.comm,
-            cpu_percent: proc.mem_percent, // mem_percent field holds CPU value
+        .map(|p| TopCpuEntry {
+            pid: p.pid,
+            comm: p.comm,
+            cpu_percent: p.mem_percent, // Reusing mem_percent field for CPU in summary struct
+            k8s: app_state
+                .k8s
+                .as_ref()
+                .and_then(|k| k.get_metadata_for_pid(p.pid)),
         })
         .collect();
     let reasoner = ReasonerStatus {
@@ -306,6 +330,20 @@ async fn status_handler(State(app_state): State<Arc<AppState>>) -> Json<StatusRe
         ilm_timeouts: metrics.ilm_timeouts(),
         ilm_insights: metrics.ilm_insights(),
         ilm_schema_errors: metrics.ilm_schema_errors(),
+    };
+
+    let incidents_last_1h = if let Some(store) = &app_state.incident_store {
+        let one_hour_ago = chrono::Utc::now().timestamp() - 3600;
+        store.since(one_hour_ago, None).await.ok().map(|v| v.len())
+    } else {
+        None
+    };
+
+    let slack_stats = SlackStats {
+        sent: metrics.slack_sent(),
+        failed: metrics.slack_failed(),
+        approved: metrics.slack_approved(),
+        denied: metrics.slack_denied(),
     };
 
     let resp = StatusResponse {
@@ -328,6 +366,13 @@ async fn status_handler(State(app_state): State<Arc<AppState>>) -> Json<StatusRe
             btf: app_state.probe_state.btf_available,
         },
         reasoner,
+        incidents_last_1h,
+        feedback_entries: metrics.feedback_entries(),
+        slack_stats,
+        perf_poll_errors: metrics.perf_poll_errors(),
+        dropped_events_total: metrics
+            .dropped_events_total
+            .load(std::sync::atomic::Ordering::Relaxed),
     };
     Json(resp)
 }
@@ -350,6 +395,10 @@ async fn get_context_route(State(app_state): State<Arc<AppState>>) -> Json<Vec<P
             mem_pct: e.mem_percent(),
             age_sec: calculate_age_sec(e.ts_ns),
             state: Some(process_state_str(e.event_type, e.exit_time_ns)),
+            k8s: app_state
+                .k8s
+                .as_ref()
+                .and_then(|k| k.get_metadata_for_pid(e.pid)),
         })
         .collect();
     Json(data)
@@ -408,6 +457,10 @@ async fn get_processes(
             mem_pct: e.mem_percent(),
             age_sec: calculate_age_sec(e.ts_ns),
             state: Some(process_state_str(e.event_type, e.exit_time_ns)),
+            k8s: app_state
+                .k8s
+                .as_ref()
+                .and_then(|k| k.get_metadata_for_pid(e.pid)),
         })
         .collect();
 
@@ -466,6 +519,10 @@ async fn get_process_by_pid(
             mem_pct: e.mem_percent(),
             age_sec: calculate_age_sec(e.ts_ns),
             state: Some(process_state_str(e.event_type, e.exit_time_ns)),
+            k8s: app_state
+                .k8s
+                .as_ref()
+                .and_then(|k| k.get_metadata_for_pid(e.pid)),
         };
         (axum::http::StatusCode::OK, Json(info)).into_response()
     } else {
@@ -499,6 +556,10 @@ async fn get_by_ppid(
             mem_pct: e.mem_percent(),
             age_sec: calculate_age_sec(e.ts_ns),
             state: Some(process_state_str(e.event_type, e.exit_time_ns)),
+            k8s: app_state
+                .k8s
+                .as_ref()
+                .and_then(|k| k.get_metadata_for_pid(e.pid)),
         })
         .collect();
     Json(matches)
@@ -818,6 +879,10 @@ pub async fn stream_processes_live(
                     mem_pct: e.mem_percent(),
                     age_sec: calculate_age_sec(e.ts_ns),
                     state: Some(process_state_str(e.event_type, e.exit_time_ns)),
+                    k8s: app_state
+                        .k8s
+                        .as_ref()
+                        .and_then(|k| k.get_metadata_for_pid(e.pid)),
                 })
                 .collect();
 
@@ -1570,6 +1635,7 @@ pub struct AppState {
     pub auth_token: Option<String>,
     pub enforcement: Option<Arc<crate::enforcement::EnforcementQueue>>,
     pub incident_store: Option<Arc<IncidentStore>>,
+    pub k8s: Option<Arc<cognitod::k8s::K8sContext>>,
 }
 
 pub fn all_routes(app_state: Arc<AppState>) -> Router {
@@ -1595,6 +1661,7 @@ pub fn all_routes(app_state: Arc<AppState>) -> Router {
         .route("/insights/recent", get(get_recent_insights))
         .route("/insights/{id}", get(get_insight_by_id))
         .route("/insights/{id}/feedback", post(submit_feedback))
+        .route("/api/feedback", post(submit_feedback_api))
         .route("/api/slack/interactions", post(handle_slack_interaction))
         .route("/incidents", get(get_incidents))
         .route("/incidents/summary", get(get_incident_summary))
@@ -1664,6 +1731,44 @@ fn dependency_version(target: &str) -> Option<String> {
         return current_version;
     }
     None
+}
+
+// ========================================
+// Feedback API Endpoints
+// ========================================
+
+#[derive(Deserialize)]
+struct FeedbackRequest {
+    insight_id: String,
+    label: String,  // "useful", "noise", "wrong"
+    source: String, // "cli", "slack", "web"
+    user_id: Option<String>,
+}
+
+async fn submit_feedback_api(
+    State(app): State<Arc<AppState>>,
+    Json(req): Json<FeedbackRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = app.incident_store.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Incident store not available".to_string(),
+        )
+    })?;
+
+    store
+        .insert_feedback(
+            &req.insight_id,
+            &req.label,
+            &req.source,
+            req.user_id.as_deref(),
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    app.metrics.inc_feedback_entry();
+
+    Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
 // ========================================

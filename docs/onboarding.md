@@ -57,6 +57,15 @@ Linnix runs silently in the background. It will only alert you when:
 *   A process threatens system stability (e.g., fork bomb, OOM risk).
 *   A "Grey Failure" pattern is detected (e.g., slow memory leak).
 
+## Pilot Success Criteria
+
+We define a successful pilot by the following outcomes:
+
+1.  **Deployment**: Linnix is deployed to at least one Kubernetes cluster or 5+ VMs.
+2.  **Health**: `linnix doctor` reports all green checks.
+3.  **Value**: At least one "useful" insight or circuit breaker action is recorded.
+4.  **Feedback**: The team provides feedback on at least 3 insights (via Slack or CLI).
+
 ## Data Flow & Privacy
 
 **What leaves the node by default**: Nothing. All analysis is local.
@@ -65,7 +74,7 @@ Linnix runs silently in the background. It will only alert you when:
 
 **How redaction works**: Set `privacy.redact_sensitive_data = true` in `/etc/linnix/config.yaml` and pod/namespace names will be SHA-256 hashed (8-char truncated). Hashes are deterministic for easy correlation.
 
-**Where data is stored**: Incident history lives in SQLite at `/var/lib/linnix/incidents.db`. Feedback is logged to `/var/log/linnix/insights_feedback.json`.
+**Where data is stored**: Incident history lives in SQLite at `/var/lib/linnix/incidents.db`. Feedback is stored in the `feedback` table within the same database.
 
 See [SECURITY.md](../SECURITY.md) and [docs/architecture.md](architecture.md) for full details.
 

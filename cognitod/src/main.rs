@@ -1132,6 +1132,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         auth_token: auth_token.clone(),
         enforcement: enforcement_queue.clone(),
         incident_store: incident_store.clone(),
+        k8s: k8s_context.clone(),
     });
 
     let api = all_routes(app_state.clone());
