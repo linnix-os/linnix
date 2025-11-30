@@ -50,6 +50,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
+            type=sha
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push
@@ -60,7 +61,7 @@ jobs:
           # TODO: ARM64 support blocked by bpf-linker LLVM issues in QEMU
           # See: https://github.com/aya-rs/bpf-linker/issues
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -102,6 +103,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
+            type=sha
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push
@@ -110,7 +112,7 @@ jobs:
           context: ./docker/llama-cpp
           file: ./docker/llama-cpp/Dockerfile
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
