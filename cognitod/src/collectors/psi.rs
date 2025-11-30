@@ -39,14 +39,15 @@ pub fn parse_psi_file(content: &str) -> Result<PsiSnapshot> {
         }
 
         for part in &parts[1..] {
-            if let Some((key, value)) = part.split_once('=')
-                && key == "total"
-                && let Ok(v) = value.parse::<u64>()
-            {
-                if prefix == "some" {
-                    some_total = v;
-                } else {
-                    full_total = v;
+            if let Some((key, value)) = part.split_once('=') {
+                if key == "total" {
+                    if let Ok(v) = value.parse::<u64>() {
+                        if prefix == "some" {
+                            some_total = v;
+                        } else {
+                            full_total = v;
+                        }
+                    }
                 }
             }
         }
@@ -63,7 +64,7 @@ fn find_psi_files(base_path: &Path) -> Vec<PathBuf> {
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| {
-            e.path().file_name().is_some_and(|n| n == "cpu.pressure")
+            e.path().file_name().map_or(false, |n| n == "cpu.pressure")
                 && e.path().to_string_lossy().contains("kubepods")
         })
         .map(|e| e.path().to_path_buf())
@@ -114,7 +115,10 @@ impl PsiMonitor {
                     let key = format!("{}/{}", meta.namespace, meta.pod_name);
 
                     // Get or create history for this pod
-                    let hist = self.history.entry(key.clone()).or_default();
+                    let hist = self
+                        .history
+                        .entry(key.clone())
+                        .or_insert_with(VecDeque::new);
 
                     // Calculate delta if we have previous snapshot
                     if let Some(prev) = hist.back() {
