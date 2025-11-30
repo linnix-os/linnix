@@ -2215,6 +2215,7 @@ mod tests {
             alert_history: Arc::new(AlertHistory::new(16)),
             auth_token: None,
             incident_store: None,
+            k8s: None,
         });
         let Json(resp) = super::status_handler(State(app_state)).await;
         let val = serde_json::to_value(resp).unwrap();
@@ -2262,6 +2263,7 @@ mod tests {
             alert_history: Arc::new(AlertHistory::new(16)),
             auth_token: None,
             incident_store: None,
+            k8s: None,
         });
 
         let Json(resp) = super::metrics_handler(State(app_state)).await;
@@ -2292,6 +2294,7 @@ mod tests {
             alert_history: Arc::new(AlertHistory::new(16)),
             auth_token: None,
             incident_store: None,
+            k8s: None,
         });
         let router = super::all_routes(Arc::clone(&app_state));
         let response = router
@@ -2325,6 +2328,7 @@ mod tests {
             alert_history: Arc::new(AlertHistory::new(16)),
             auth_token: None,
             incident_store: None,
+            k8s: None,
         });
         let router = super::all_routes(Arc::clone(&app_state));
         let response = router
@@ -2372,6 +2376,7 @@ mod tests {
             alert_history: Arc::new(AlertHistory::new(16)),
             auth_token: None,
             incident_store: None,
+            k8s: None,
         });
         let router = super::all_routes(app_state);
         let response = router
@@ -2404,6 +2409,7 @@ mod tests {
             alert_history: Arc::new(AlertHistory::new(16)),
             incident_store: None,
             auth_token: Some("secret123".to_string()),
+            k8s: None,
         });
         let router = super::all_routes(app_state);
         let response = router
@@ -2436,6 +2442,7 @@ mod tests {
             alert_history: Arc::new(AlertHistory::new(16)),
             incident_store: None,
             auth_token: Some("secret123".to_string()),
+            k8s: None,
         });
         let router = super::all_routes(app_state);
         let response = router
@@ -2469,6 +2476,7 @@ mod tests {
             alert_history: Arc::new(AlertHistory::new(16)),
             incident_store: None,
             auth_token: Some("secret123".to_string()),
+            k8s: None,
         });
         let router = super::all_routes(app_state);
         let response = router
@@ -2502,6 +2510,7 @@ mod tests {
             alert_history: Arc::new(AlertHistory::new(16)),
             incident_store: None,
             auth_token: Some("secret123".to_string()),
+            k8s: None,
         });
         let router = super::all_routes(app_state);
         let response = router
