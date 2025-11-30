@@ -215,14 +215,16 @@ impl K8sContext {
                 };
 
                 if id.len() == 64 {
-                    let map = self.container_map.read().unwrap();
-                    if let Some(meta) = map.get(id) {
-                        return Some(meta.clone());
-                    }
+                    return self.get_metadata(id);
                 }
             }
         }
         None
+    }
+
+    pub fn get_metadata(&self, container_id: &str) -> Option<K8sMetadata> {
+        let map = self.container_map.read().unwrap();
+        map.get(container_id).cloned()
     }
 }
 

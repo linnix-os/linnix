@@ -774,6 +774,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             ctx.node_name
         );
         ctx.clone().start_watcher();
+
+        // Start PSI monitor
+        let psi_monitor = cognitod::collectors::psi::PsiMonitor::new(ctx.clone());
+        tokio::spawn(async move {
+            psi_monitor.run().await;
+        });
     } else {
         info!("[cognitod] K8s context not available (missing env/tokens)");
     }

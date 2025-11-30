@@ -836,6 +836,7 @@ dependencies = [
  "tower",
  "tracing",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]
