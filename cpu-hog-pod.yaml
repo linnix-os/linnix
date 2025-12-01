@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cpu-hog
+  labels:
+    app: cpu-hog
+spec:
+  containers:
+  - name: stress
+    image: polinux/stress
+    command: ["stress"]
+    args: ["--cpu", "4", "--timeout", "300s"]
+    resources:
+      limits:
+        cpu: "1000m"
+      requests:
+        cpu: "1000m"

@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: stress-test
+  labels:
+    app: stress-test
+spec:
+  containers:
+  - name: stress
+    image: polinux/stress
+    command: ["stress"]
+    args: ["--cpu", "2", "--timeout", "120s"]
+    resources:
+      limits:
+        cpu: "500m"
+      requests:
+        cpu: "500m"
