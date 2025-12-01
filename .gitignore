@@ -93,6 +93,8 @@ docs/*
 # BUT keep public images
 !docs/images/
 docs/images/README.md
+# Allow wiki for GitHub Pages
+!docs/wiki/
 # Allow selected public docs
 !docs/COMPARISON.md
 !docs/HOW_IT_WORKS.md

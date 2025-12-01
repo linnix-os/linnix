@@ -1,0 +1,11 @@
+title: Linnix Documentation
+description: eBPF-powered Linux observability with AI-assisted incident triage
+theme: jekyll-theme-cayman
+baseurl: "/linnix"
+url: "https://linnix-os.github.io"
+
+markdown: GFM
+highlighter: rouge
+
+exclude:
+  - _Sidebar.md
