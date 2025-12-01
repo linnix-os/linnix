@@ -201,6 +201,7 @@ impl IncidentStore {
     }
 
     /// Insert stall attribution event
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_stall_attribution(
         &self,
         victim_pod: &str,
