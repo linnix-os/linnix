@@ -493,11 +493,17 @@ curl http://localhost:3000/api/healthz
 # Check running processes
 linnix-cli processes
 
-# View system metrics
-linnix-cli metrics
+# View system stats
+linnix-cli --stats
 
 # Stream live events
-linnix-cli stream
+linnix-cli
+
+# Stream alerts only
+linnix-cli --alerts
+
+# Check system health
+linnix-cli doctor
 ```
 
 ---
