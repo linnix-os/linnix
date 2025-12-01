@@ -101,14 +101,9 @@ Create `./configs/linnix.toml` (auto-created by quickstart.sh):
 [runtime]
 offline = false  # Disable external webhooks (Slack, PagerDuty)
 
-[probes]
-enable_page_faults = false  # High overhead - disable for production
-
 [reasoner]
 enabled = true
 endpoint = "http://llama-server:8090/v1/chat/completions"
-model = "linnix-3b-distilled"
-window_seconds = 30
 ```
 
 Changes take effect after restart:
@@ -187,9 +182,8 @@ curl -X POST http://localhost:8090/v1/chat/completions \
 **Symptom**: cognitod uses >10% CPU
 
 **Possible causes**:
-1. **Page fault tracing enabled** - Disable in config: `enable_page_faults = false`
-2. **High event rate** - Normal for busy systems (1000s of events/sec)
-3. **Model inference** - llama-server is CPU-intensive during analysis
+1. **High event rate** - Normal for busy systems (1000s of events/sec)
+2. **Model inference** - llama-server is CPU-intensive during analysis
 
 **Verify overhead**:
 ```bash

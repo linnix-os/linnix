@@ -12,7 +12,7 @@ Linnix uses a split licensing model to balance open collaboration with sustainab
 | Component | License | Why? |
 | :--- | :--- | :--- |
 | **Agent (`cognitod`)** | **AGPL-3.0** | This is the "brain" of Linnix. If you modify it to sell a service, you must share your changes. |
-| **eBPF Collector** | **Apache 2.0** | (In Progress) The low-level kernel probes. We want this to be a standard that anyone can use and improve. |
+| **eBPF Collector** | **GPL-2.0 OR MIT** | The low-level kernel probes. Dual-licensed for flexibility (eBPF programs must be GPL-compatible for kernel loading). |
 | **Dashboard / CLI** | **AGPL-3.0** | User interfaces. |
 
 ## Q: Can I use Linnix at my company?

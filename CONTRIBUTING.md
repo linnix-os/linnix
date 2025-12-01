@@ -22,10 +22,7 @@ cargo build --workspace
 cargo xtask build-ebpf
 
 # Run unit + integration tests
-cargo test --workspace
-
-# (Optional) run CLI tests
-pushd linnix-cli && cargo test && popd
+cargo nextest run --workspace
 ```
 
 Recommended toolchain versions:
@@ -58,7 +55,6 @@ To skip hooks temporarily: `git commit --no-verify`
 3. **Format + lint**:
    - `cargo fmt --all`
    - `cargo clippy --all-targets -- -D warnings`
-   - `cargo xtask fmt-ebpf` (if you touched eBPF code)
 4. **Run tests** that cover your surface area (daemon, CLI, docs lint if applicable).
 5. **Open a Pull Request** with:
    - Description of change

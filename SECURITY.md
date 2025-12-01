@@ -33,7 +33,7 @@ Linnix uses Rust for memory safety. However, `unsafe` blocks are necessary for i
 ### Data Egress
 *   **Default**: No data leaves the node. All analysis is local.
 *   **Slack**: If configured, alerts are sent to your Slack webhook.
-*   **Redaction**: You can enable `privacy.redact_sensitive_data = true` in `config.yaml` to hash Pod names and Namespaces in alerts.
+*   **Redaction**: You can enable `privacy.redact_sensitive_data = true` in `linnix.toml` to hash Pod names and Namespaces in alerts.
 
 ## Reporting Vulnerabilities
 
