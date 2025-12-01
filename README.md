@@ -40,10 +40,11 @@ Deploy Linnix as a DaemonSet to monitor your cluster.
 kubectl apply -f k8s/
 ```
 
-**View the Triage Dashboard:**
+**Access the API:**
 ```bash
-kubectl port-forward svc/linnix-dashboard 3000:3000
-# Open http://localhost:3000
+kubectl port-forward daemonset/linnix-agent 3000:3000
+# API available at http://localhost:3000
+# Stream events: curl http://localhost:3000/stream
 ```
 
 ## Quickstart (Docker)
@@ -80,7 +81,7 @@ Linnix is designed for production safety.
 
 *   **Monitor-First**: Enforcement capabilities are opt-in and require explicit configuration.
 *   **Low Overhead**: Uses eBPF perf buffers, not `/proc` polling.
-*   **Privilege Isolation**: Requires only `CAP_BPF` and `CAP_PERFMON`, not full root.
+*   **Privilege Isolation**: Can run with `CAP_BPF` and `CAP_PERFMON` on bare metal. Kubernetes DaemonSet currently uses privileged mode for simplicity.
 
 See [SAFETY.md](SAFETY.md) for our detailed safety model.
 
@@ -89,6 +90,6 @@ See [SAFETY.md](SAFETY.md) for our detailed safety model.
 ## License
 
 *   **Agent (`cognitod`)**: AGPL-3.0
-*   **eBPF Collector**: Apache 2.0 (Coming soon)
+*   **eBPF Collector**: GPL-2.0 or MIT (eBPF programs must be GPL-compatible for kernel loading)
 
 See [LICENSE_FAQ.md](LICENSE_FAQ.md) for details.
