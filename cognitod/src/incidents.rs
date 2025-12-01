@@ -91,6 +91,19 @@ impl IncidentStore {
                 user_id TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_feedback_insight_id ON feedback(insight_id);
+            CREATE TABLE IF NOT EXISTS stall_attributions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                victim_pod TEXT NOT NULL,
+                victim_namespace TEXT NOT NULL,
+                offender_pod TEXT NOT NULL,
+                offender_namespace TEXT NOT NULL,
+                stall_us INTEGER NOT NULL,
+                blame_score REAL NOT NULL,
+                timestamp INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_victim_time ON stall_attributions(victim_pod, victim_namespace, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_offender_time ON stall_attributions(offender_pod, offender_namespace, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_timestamp_attr ON stall_attributions(timestamp);
             "#,
         )
         .execute(&pool)
@@ -174,6 +187,43 @@ impl IncidentStore {
 
         let id = result.last_insert_rowid();
         debug!("Inserted feedback #{} for insight {}", id, insight_id);
+        Ok(id)
+    }
+
+    /// Insert stall attribution event
+    pub async fn insert_stall_attribution(
+        &self,
+        victim_pod: &str,
+        victim_namespace: &str,
+        offender_pod: &str,
+        offender_namespace: &str,
+        stall_us: u64,
+        blame_score: f64,
+        timestamp: u64,
+    ) -> Result<i64, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO stall_attributions (
+                victim_pod, victim_namespace, offender_pod, offender_namespace,
+                stall_us, blame_score, timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(victim_pod)
+        .bind(victim_namespace)
+        .bind(offender_pod)
+        .bind(offender_namespace)
+        .bind(stall_us as i64)
+        .bind(blame_score)
+        .bind(timestamp as i64)
+        .execute(&self.pool)
+        .await?;
+
+        let id = result.last_insert_rowid();
+        debug!(
+            "Inserted stall attribution #{}: {}/{} blamed {}/{}",
+            id, victim_namespace, victim_pod, offender_namespace, offender_pod
+        );
         Ok(id)
     }
 
