@@ -4,7 +4,7 @@ use httpmock::prelude::*;
 #[tokio::test]
 async fn doctor_command_checks_health() {
     let server = MockServer::start_async().await;
-    
+
     // Mock healthz endpoint
     let _health = server
         .mock_async(|when, then| {
@@ -14,7 +14,7 @@ async fn doctor_command_checks_health() {
                 .body(r#"{"status":"ok","version":"0.1.0"}"#);
         })
         .await;
-    
+
     // Mock status endpoint with full expected structure
     let _status = server
         .mock_async(|when, then| {
@@ -57,6 +57,6 @@ async fn doctor_command_handles_unreachable_server() {
     Command::new(assert_cmd::cargo::cargo_bin!("linnix-cli"))
         .args(["--url", "http://127.0.0.1:59999", "doctor"])
         .assert()
-        .success()  // Doctor returns Ok even on connection failure
+        .success() // Doctor returns Ok even on connection failure
         .stdout(predicates::str::contains("FAIL"));
 }

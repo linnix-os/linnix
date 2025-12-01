@@ -4,7 +4,7 @@ use httpmock::prelude::*;
 #[tokio::test]
 async fn stream_receives_events() {
     let server = MockServer::start_async().await;
-    
+
     // Mock stream endpoint with SSE events
     let body = r#"data: {"event_type":"Exec","pid":1234,"ppid":1,"comm":"test","ts":1234567890}
 
@@ -29,7 +29,7 @@ async fn stream_receives_events() {
 #[tokio::test]
 async fn stream_handles_heartbeats() {
     let server = MockServer::start_async().await;
-    
+
     // Mock stream endpoint with heartbeat followed by event
     let body = ": heartbeat\n\ndata: {\"event_type\":\"Exec\",\"pid\":1234,\"ppid\":1,\"comm\":\"test\",\"ts\":1234567890}\n\n";
     let _m = server

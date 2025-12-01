@@ -9,9 +9,7 @@ async fn processes_command_lists_processes() {
             when.method(GET).path("/processes");
             then.status(200)
                 .header("content-type", "application/json")
-                .body(
-                    r#"[{"pid":1234,"comm":"test_proc","ppid":1,"cpu_pct":5.0,"rss_mb":100}]"#,
-                );
+                .body(r#"[{"pid":1234,"comm":"test_proc","ppid":1,"cpu_pct":5.0,"rss_mb":100}]"#);
         })
         .await;
 
