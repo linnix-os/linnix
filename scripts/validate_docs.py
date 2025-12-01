@@ -318,23 +318,28 @@ class DocValidator:
         return probes
     
     def validate_ebpf_probes(self):
-        """Validate that documented probes match code."""
+        """Validate that mandatory eBPF probes exist in code."""
         print("\n[4/5] Validating eBPF Probes...")
         
-        collector_doc = self.root / "docs/collector.md"
-        if not collector_doc.exists():
-            self.add_result("ebpf", False, "Collector documentation not found")
+        # Validate probes exist in eBPF code directly (docs/collector.md is not tracked)
+        ebpf_file = self.root / "linnix-ai-ebpf/linnix-ai-ebpf-ebpf/src/program.rs"
+        if not ebpf_file.exists():
+            self.add_result("ebpf", False, "eBPF program source not found")
             return
         
-        doc_content = collector_doc.read_text()
+        content = ebpf_file.read_text()
         
-        # Check mandatory probes are documented
-        mandatory = ['sched_process_exec', 'sched_process_fork', 'sched_process_exit']
-        for probe in mandatory:
-            if probe in doc_content:
-                self.add_result("ebpf", True, f"Mandatory probe documented: {probe}")
+        # Check mandatory probes exist in code
+        mandatory = [
+            ('sched_process_exec', 'tracepoint'),
+            ('sched_process_fork', 'tracepoint'),
+            ('sched_process_exit', 'tracepoint'),
+        ]
+        for probe, probe_type in mandatory:
+            if probe in content:
+                self.add_result("ebpf", True, f"Mandatory probe in code: {probe}")
             else:
-                self.add_result("ebpf", False, f"Mandatory probe not documented: {probe}")
+                self.add_result("ebpf", False, f"Mandatory probe missing: {probe}")
     
     # =========================================================================
     # Environment Variable Validation
