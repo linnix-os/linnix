@@ -57,8 +57,8 @@ Linnix combines eBPF probes, BTF-powered compatibility helpers, and an AI reason
 |------|-----------|---------------|
 | 1 | Kernel | `uname -r` ≥ 5.8 recommended, `ls /sys/kernel/btf/vmlinux` to confirm BTF |
 | 2 | eBPF assets | `cargo xtask build-ebpf` (development) or use shipped object files |
-| 3 | Daemon | `sudo systemctl status cognitod` or `./setup-llm.sh` |
-| 4 | LLM endpoint | `curl http://localhost:8090/health` |
+| 3 | Daemon | `sudo systemctl status cognitod` or `./quickstart.sh` |
+| 4 | LLM endpoint | `curl http://localhost:8090/v1/models` |
 | 5 | Insights | `curl -N http://localhost:3000/stream` and `curl http://localhost:3000/insights | jq` |
 
 Once the loop is running, Linnix continuously turns kernel-space events into contextual human guidance without leaving your infrastructure.
