@@ -40,6 +40,17 @@ pub struct StallEvent {
     pub concurrent_consumers: Vec<CpuConsumer>,
 }
 
+#[derive(Debug, Clone)]
+pub struct BlameAttribution {
+    pub victim_pod: String,
+    pub victim_namespace: String,
+    pub offender_pod: String,
+    pub offender_namespace: String,
+    pub blame_score: f64,
+    pub stall_us: u64,
+    pub timestamp: u64,
+}
+
 pub fn parse_psi_file(content: &str) -> Result<PsiSnapshot> {
     let mut some_total = 0u64;
     let mut full_total = 0u64;
@@ -177,14 +188,17 @@ impl PsiMonitor {
                                 consumers.len()
                             );
 
-                            // Log top 3 consumers
-                            for (i, consumer) in consumers.iter().take(3).enumerate() {
-                                debug!(
-                                    "[psi]   consumer {}: {}/{} cpu={}%",
+                            // Calculate blame attributions
+                            let attributions = self.calculate_blame_attributions(&stall_event);
+
+                            // Log top 3 attributions
+                            for (i, attr) in attributions.iter().take(3).enumerate() {
+                                info!(
+                                    "[psi]   blame {}: {}/{} score={:.3} cpu_share",
                                     i + 1,
-                                    consumer.namespace,
-                                    consumer.pod,
-                                    consumer.cpu_percent
+                                    attr.offender_namespace,
+                                    attr.offender_pod,
+                                    attr.blame_score
                                 );
                             }
                         }
@@ -220,6 +234,43 @@ impl PsiMonitor {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         consumers
+    }
+
+    fn calculate_blame_attributions(&self, event: &StallEvent) -> Vec<BlameAttribution> {
+        let total_cpu: f32 = event
+            .concurrent_consumers
+            .iter()
+            .map(|c| c.cpu_percent)
+            .sum();
+
+        if total_cpu == 0.0 {
+            return Vec::new();
+        }
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        event
+            .concurrent_consumers
+            .iter()
+            .map(|consumer| {
+                // Blame score: normalized CPU share weighted by stall magnitude
+                let cpu_share = (consumer.cpu_percent / total_cpu) as f64;
+                let blame_score = cpu_share * (event.stall_delta_us as f64 / 1_000_000.0); // normalize to seconds
+
+                BlameAttribution {
+                    victim_pod: event.victim_pod.clone(),
+                    victim_namespace: event.victim_namespace.clone(),
+                    offender_pod: consumer.pod.clone(),
+                    offender_namespace: consumer.namespace.clone(),
+                    blame_score,
+                    stall_us: event.stall_delta_us,
+                    timestamp,
+                }
+            })
+            .collect()
     }
 }
 
