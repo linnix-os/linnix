@@ -776,7 +776,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         ctx.clone().start_watcher();
 
         // Start PSI monitor
-        let psi_monitor = cognitod::collectors::psi::PsiMonitor::new(ctx.clone(), context.clone());
+        let psi_monitor = cognitod::collectors::psi::PsiMonitor::new(
+            ctx.clone(),
+            context.clone(),
+            incident_store.clone(),
+        );
         tokio::spawn(async move {
             psi_monitor.run().await;
         });

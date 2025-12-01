@@ -1226,6 +1226,42 @@ async fn get_action_by_id(
 }
 
 #[derive(Deserialize)]
+struct AttributionQuery {
+    pod: String,
+    namespace: String,
+    #[serde(default = "default_window")]
+    window: i64, // minutes
+}
+
+fn default_window() -> i64 {
+    5
+}
+
+async fn get_attributions(
+    State(app_state): State<Arc<AppState>>,
+    Query(query): Query<AttributionQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    match &app_state.incident_store {
+        Some(store) => {
+            let attributions = store
+                .query_attributions(&query.pod, &query.namespace, query.window * 60)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+            Ok(Json(serde_json::json!({
+                "victim": {
+                    "pod": query.pod,
+                    "namespace": query.namespace
+                },
+                "window_minutes": query.window,
+                "attributions": attributions
+            })))
+        }
+        None => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+#[derive(Deserialize)]
 struct ApprovalRequest {
     approver: String,
 }
@@ -1609,6 +1645,7 @@ pub fn all_routes(app_state: Arc<AppState>) -> Router {
         .route("/incidents/summary", get(get_incident_summary))
         .route("/incidents/stats", get(get_incident_stats))
         .route("/incidents/{id}", get(get_incident_by_id))
+        .route("/attribution", get(get_attributions))
         .route("/metrics", get(metrics_handler))
         .route("/status", get(status_handler))
         .route("/healthz", get(healthz))

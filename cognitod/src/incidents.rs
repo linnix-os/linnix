@@ -44,6 +44,16 @@ pub struct Incident {
     pub psi_after: Option<f32>,
 }
 
+/// Represents a stall attribution event
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StallAttribution {
+    pub offender_pod: String,
+    pub offender_namespace: String,
+    pub stall_us: u64,
+    pub blame_score: f64,
+    pub timestamp: u64,
+}
+
 /// Incident storage backed by SQLite
 pub struct IncidentStore {
     pool: SqlitePool,
@@ -225,6 +235,45 @@ impl IncidentStore {
             id, victim_namespace, victim_pod, offender_namespace, offender_pod
         );
         Ok(id)
+    }
+
+    /// Query stall attributions for a victim pod within a time window
+    pub async fn query_attributions(
+        &self,
+        victim_pod: &str,
+        victim_namespace: &str,
+        window_seconds: i64,
+    ) -> Result<Vec<StallAttribution>, sqlx::Error> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let start_time = now - window_seconds;
+
+        let rows = sqlx::query(
+            r#"
+            SELECT offender_pod, offender_namespace, stall_us, blame_score, timestamp
+            FROM stall_attributions
+            WHERE victim_pod = ? AND victim_namespace = ? AND timestamp >= ?
+            ORDER BY blame_score DESC
+            "#,
+        )
+        .bind(victim_pod)
+        .bind(victim_namespace)
+        .bind(start_time)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| StallAttribution {
+                offender_pod: r.get(0),
+                offender_namespace: r.get(1),
+                stall_us: r.get::<i64, _>(2) as u64,
+                blame_score: r.get(3),
+                timestamp: r.get::<i64, _>(4) as u64,
+            })
+            .collect())
     }
 
     /// Get incident by ID

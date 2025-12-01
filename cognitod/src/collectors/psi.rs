@@ -116,14 +116,20 @@ const STALL_THRESHOLD_US: u64 = 100_000; // 100ms threshold for significant stal
 pub struct PsiMonitor {
     k8s_ctx: Arc<K8sContext>,
     context: Arc<ContextStore>,
+    incident_store: Option<Arc<crate::incidents::IncidentStore>>,
     history: HashMap<String, VecDeque<PsiSnapshot>>,
 }
 
 impl PsiMonitor {
-    pub fn new(k8s_ctx: Arc<K8sContext>, context: Arc<ContextStore>) -> Self {
+    pub fn new(
+        k8s_ctx: Arc<K8sContext>,
+        context: Arc<ContextStore>,
+        incident_store: Option<Arc<crate::incidents::IncidentStore>>,
+    ) -> Self {
         Self {
             k8s_ctx,
             context,
+            incident_store,
             history: HashMap::new(),
         }
     }
@@ -200,6 +206,26 @@ impl PsiMonitor {
                                     attr.offender_pod,
                                     attr.blame_score
                                 );
+                            }
+
+                            // Persist to database if available
+                            if let Some(ref store) = self.incident_store {
+                                for attr in &attributions {
+                                    if let Err(e) = store
+                                        .insert_stall_attribution(
+                                            &attr.victim_pod,
+                                            &attr.victim_namespace,
+                                            &attr.offender_pod,
+                                            &attr.offender_namespace,
+                                            attr.stall_us,
+                                            attr.blame_score,
+                                            attr.timestamp,
+                                        )
+                                        .await
+                                    {
+                                        debug!("[psi] Failed to persist attribution: {}", e);
+                                    }
+                                }
                             }
                         }
                     }
