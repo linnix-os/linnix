@@ -41,3 +41,7 @@ enabled = true
 #     "mailto://user:pass@smtp.gmail.com"
 # ]
 # min_severity = "medium"  # Options: info, low, medium, high (default: info)
+
+[psi]
+# Duration in seconds of sustained pressure required to trigger attribution
+sustained_pressure_seconds = 15

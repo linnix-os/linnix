@@ -52,6 +52,10 @@ pub struct StallAttribution {
     pub stall_us: u64,
     pub blame_score: f64,
     pub timestamp: u64,
+    // Detailed metrics
+    pub cpu_share: f64,
+    pub fork_count: u64,
+    pub short_job_count: u64,
 }
 
 /// Incident storage backed by SQLite
@@ -109,7 +113,10 @@ impl IncidentStore {
                 offender_namespace TEXT NOT NULL,
                 stall_us INTEGER NOT NULL,
                 blame_score REAL NOT NULL,
-                timestamp INTEGER NOT NULL
+                timestamp INTEGER NOT NULL,
+                cpu_share REAL DEFAULT 0.0,
+                fork_count INTEGER DEFAULT 0,
+                short_job_count INTEGER DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_victim_time ON stall_attributions(victim_pod, victim_namespace, timestamp);
             CREATE INDEX IF NOT EXISTS idx_offender_time ON stall_attributions(offender_pod, offender_namespace, timestamp);
@@ -118,6 +125,21 @@ impl IncidentStore {
         )
         .execute(&pool)
         .await?;
+
+        // Manual migration for existing databases
+        // We ignore errors because the columns might already exist
+        let _ = sqlx::query("ALTER TABLE stall_attributions ADD COLUMN cpu_share REAL DEFAULT 0.0")
+            .execute(&pool)
+            .await;
+        let _ =
+            sqlx::query("ALTER TABLE stall_attributions ADD COLUMN fork_count INTEGER DEFAULT 0")
+                .execute(&pool)
+                .await;
+        let _ = sqlx::query(
+            "ALTER TABLE stall_attributions ADD COLUMN short_job_count INTEGER DEFAULT 0",
+        )
+        .execute(&pool)
+        .await;
 
         info!(
             "Incident store initialized at {}",
@@ -211,13 +233,17 @@ impl IncidentStore {
         stall_us: u64,
         blame_score: f64,
         timestamp: u64,
+        cpu_share: f64,
+        fork_count: u64,
+        short_job_count: u64,
     ) -> Result<i64, sqlx::Error> {
         let result = sqlx::query(
             r#"
             INSERT INTO stall_attributions (
                 victim_pod, victim_namespace, offender_pod, offender_namespace,
-                stall_us, blame_score, timestamp
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                stall_us, blame_score, timestamp,
+                cpu_share, fork_count, short_job_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(victim_pod)
@@ -227,13 +253,16 @@ impl IncidentStore {
         .bind(stall_us as i64)
         .bind(blame_score)
         .bind(timestamp as i64)
+        .bind(cpu_share)
+        .bind(fork_count as i64)
+        .bind(short_job_count as i64)
         .execute(&self.pool)
         .await?;
 
         let id = result.last_insert_rowid();
         debug!(
-            "Inserted stall attribution #{}: {}/{} blamed {}/{}",
-            id, victim_namespace, victim_pod, offender_namespace, offender_pod
+            "Inserted stall attribution #{}: {}/{} blamed {}/{} (score={:.2})",
+            id, victim_namespace, victim_pod, offender_namespace, offender_pod, blame_score
         );
         Ok(id)
     }
@@ -253,7 +282,8 @@ impl IncidentStore {
 
         let rows = sqlx::query(
             r#"
-            SELECT offender_pod, offender_namespace, stall_us, blame_score, timestamp
+            SELECT offender_pod, offender_namespace, stall_us, blame_score, timestamp,
+                   cpu_share, fork_count, short_job_count
             FROM stall_attributions
             WHERE victim_pod = ? AND victim_namespace = ? AND timestamp >= ?
             ORDER BY blame_score DESC
@@ -273,6 +303,9 @@ impl IncidentStore {
                 stall_us: r.get::<i64, _>(2) as u64,
                 blame_score: r.get(3),
                 timestamp: r.get::<i64, _>(4) as u64,
+                cpu_share: r.get(5),
+                fork_count: r.get::<i64, _>(6) as u64,
+                short_job_count: r.get::<i64, _>(7) as u64,
             })
             .collect())
     }

@@ -81,6 +81,8 @@ pub struct Config {
     pub noise_budget: NoiseBudgetConfig,
     #[serde(default)]
     pub privacy: PrivacyConfig,
+    #[serde(default)]
+    pub psi: PsiConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -310,6 +312,25 @@ impl OfflineGuard {
             true
         }
     }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct PsiConfig {
+    /// Duration in seconds of sustained pressure required to trigger attribution
+    #[serde(default = "default_psi_sustained_pressure_seconds")]
+    pub sustained_pressure_seconds: u64,
+}
+
+impl Default for PsiConfig {
+    fn default() -> Self {
+        Self {
+            sustained_pressure_seconds: default_psi_sustained_pressure_seconds(),
+        }
+    }
+}
+
+fn default_psi_sustained_pressure_seconds() -> u64 {
+    15
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
