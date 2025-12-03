@@ -780,6 +780,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             ctx.clone(),
             context.clone(),
             incident_store.clone(),
+            config.psi.sustained_pressure_seconds,
         );
         tokio::spawn(async move {
             psi_monitor.run().await;

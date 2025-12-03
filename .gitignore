@@ -108,3 +108,6 @@ kubectl
 
 verification.yaml
 run-cognitod-k8s.sh
+scripts/full_test_suite.sh
+scripts/generate_wiki.sh
+scripts/validate_api_docs.sh

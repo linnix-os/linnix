@@ -371,6 +371,52 @@ impl ContextStore {
         }
         entries
     }
+
+    /// Get pod activity stats within a time window
+    pub fn get_pod_activity_window(
+        &self,
+        window: Duration,
+        k8s_ctx: &crate::k8s::K8sContext,
+    ) -> (HashMap<String, u64>, HashMap<String, u64>) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let cutoff = now.saturating_sub(window.as_nanos() as u64);
+
+        let mut fork_counts: HashMap<String, u64> = HashMap::new();
+        let mut short_job_counts: HashMap<String, u64> = HashMap::new();
+
+        let queue = self.inner.lock().unwrap();
+
+        // Scan history for relevant events
+        for (ts, event) in queue.iter() {
+            if *ts < cutoff {
+                continue;
+            }
+
+            if let Some(meta) = k8s_ctx.get_metadata_for_pid(event.pid) {
+                let key = format!("{}/{}", meta.namespace, meta.pod_name);
+
+                // Count forks
+                if event.event_type == 1 {
+                    *fork_counts.entry(key.clone()).or_default() += 1;
+                }
+
+                // Count short jobs (exit event with lifetime < 1s)
+                if event.event_type == 2 {
+                    if let Some(exit_time) = event.exit_time() {
+                        let lifetime_ns = exit_time.saturating_sub(event.ts_ns);
+                        if lifetime_ns < 1_000_000_000 {
+                            *short_job_counts.entry(key).or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        (fork_counts, short_job_counts)
+    }
 }
 
 #[cfg(test)]
