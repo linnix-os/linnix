@@ -28,10 +28,10 @@ pub use linnix_ai_ebpf_common::ProcessEventExt as ProcessEvent;
 use linnix_ai_ebpf_common::TelemetryConfig;
 
 mod api;
-mod bpf_config;
 mod runtime;
 // mod routes; // Deleted (dead code cleanup)
 
+use cognitod::bpf_config;
 use cognitod::config;
 use cognitod::context;
 use cognitod::enforcement;

@@ -29,6 +29,8 @@ pub fn derive_telemetry_config() -> Result<TelemetryConfigResult> {
 
     let (real_parent_bits, _) = member_offset(task_struct, "real_parent")?;
     let (tgid_bits, _) = member_offset(task_struct, "tgid")?;
+    let (pid_bits, _) = member_offset(task_struct, "pid")?;
+    let (comm_bits, _) = member_offset(task_struct, "comm")?;
     let (se_bits, se_type) = member_offset(task_struct, "se")?;
 
     let signal_candidate = rss_layout_for_field(&btf, task_struct, "signal")?;
@@ -84,6 +86,8 @@ pub fn derive_telemetry_config() -> Result<TelemetryConfigResult> {
     let mut telemetry = TelemetryConfig::zeroed();
     telemetry.task_real_parent_offset = to_bytes(real_parent_bits)?;
     telemetry.task_tgid_offset = to_bytes(tgid_bits)?;
+    telemetry.task_pid_offset = to_bytes(pid_bits)?;
+    telemetry.task_comm_offset = to_bytes(comm_bits)?;
     telemetry.task_se_offset = to_bytes(se_bits)?;
     telemetry.se_sum_exec_runtime_offset = to_bytes(sum_exec_bits)?;
     telemetry.rss_count_offset = selected_layout.count_offset;

@@ -46,6 +46,17 @@ tracing = "0.1"
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
 sha2 = "0.10.9"
 walkdir = "2.5.0"
+memmap2 = "0.9"
+nix = { version = "0.29", features = ["time"] }
+ctrlc = "3.4"
+
+[[bin]]
+name = "cognitod"
+path = "src/main.rs"
+
+[[bin]]
+name = "sequencer-test"
+path = "src/bin/sequencer_test.rs"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }
