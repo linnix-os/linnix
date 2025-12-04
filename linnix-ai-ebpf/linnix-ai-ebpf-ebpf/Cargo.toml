@@ -6,6 +6,8 @@ license = "Apache-2.0"
 
 [features]
 default = []
+# Enable fault injection for reaper testing (simulates producer crashes)
+fault-injection = []
 
 [dependencies]
 aya-ebpf = { git = "https://github.com/aya-rs/aya", package = "aya-ebpf", rev = "fe8e1c48b0f8e14634d55b6abd2207584110546d", default-features = false }

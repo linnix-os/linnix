@@ -2,6 +2,7 @@
 // Both local stable and Docker stable support it without feature flags
 
 pub mod alerts;
+pub mod bpf_config;
 pub mod collectors;
 pub mod config;
 pub mod context;
@@ -12,6 +13,7 @@ pub mod insights;
 pub mod k8s;
 pub mod metrics;
 pub mod notifications;
+pub mod runtime;
 pub mod schema;
 pub mod types;
 pub mod ui;
