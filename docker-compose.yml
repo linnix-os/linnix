@@ -70,7 +70,7 @@ services:
 
   # LLM Server - Linnix 3B distilled model
   llama-server:
-    image: ${LLAMA_IMAGE:-ghcr.io/ggerganov/llama.cpp:server}
+    image: ${LLAMA_IMAGE:-ghcr.io/ggml-org/llama.cpp:server}
     container_name: linnix-llm
     volumes:
       - ./models:/models:ro

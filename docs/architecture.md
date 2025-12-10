@@ -11,11 +11,11 @@ graph TD
         P -->|Metrics| M[eBPF Maps]
     end
 
-    subgraph User Space [Linnix Agent (Cognitod)]
+    subgraph User Space ["Linnix Agent (Cognitod)"]
         RB -->|Read| I[Ingestor]
         I -->|Process| A[Analyzer]
         A -->|Store| DB[(SQLite Incidents)]
-        A -->|Analyze| LLM[Local LLM (3B)]
+        A -->|Analyze| LLM["Local LLM (3B)"]
         LLM -->|Insight| A
         A -->|Alert| N[Notifier]
     end
