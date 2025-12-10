@@ -524,7 +524,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    let context = Arc::new(context::ContextStore::new(Duration::from_secs(300), 1000));
+    let k8s_context = cognitod::k8s::K8sContext::new();
+    if let Some(ctx) = &k8s_context {
+        info!(
+            "[cognitod] K8s context initialized (node: {})",
+            ctx.node_name
+        );
+        ctx.clone().start_watcher();
+    } else {
+        info!("[cognitod] K8s context not available (missing env/tokens)");
+    }
+
+    let context = Arc::new(context::ContextStore::new(
+        Duration::from_secs(300),
+        1000,
+        k8s_context.clone(),
+    ));
     let insight_store = {
         let path = config.logging.insights_file.trim();
         let path = if path.is_empty() {
@@ -767,15 +782,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // KB Index removed (YAGNI cleanup)
 
-    let k8s_context = cognitod::k8s::K8sContext::new();
+    // Start PSI monitor (after incident store is ready)
     if let Some(ctx) = &k8s_context {
-        info!(
-            "[cognitod] K8s context initialized (node: {})",
-            ctx.node_name
-        );
-        ctx.clone().start_watcher();
-
-        // Start PSI monitor
         let psi_monitor = cognitod::collectors::psi::PsiMonitor::new(
             ctx.clone(),
             context.clone(),
@@ -785,8 +793,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tokio::spawn(async move {
             psi_monitor.run().await;
         });
-    } else {
-        info!("[cognitod] K8s context not available (missing env/tokens)");
     }
 
     // Initialize Slack Notifier

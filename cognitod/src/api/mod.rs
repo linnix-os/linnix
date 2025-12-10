@@ -533,7 +533,7 @@ async fn get_graph(
     let mut nodes = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
-    if let Some(proc) = live.get(&pid) {
+    if let Some((proc, _)) = live.get(&pid) {
         // Add self
         nodes.push(GraphNode {
             pid: proc.pid,
@@ -554,7 +554,7 @@ async fn get_graph(
         let mut current_pid = proc.ppid;
         let mut parent_found = false;
         while current_pid != 0 && current_pid != pid && !seen.contains(&current_pid) {
-            if let Some(parent) = live.get(&current_pid) {
+            if let Some((parent, _)) = live.get(&current_pid) {
                 nodes.push(GraphNode {
                     pid: parent.pid,
                     ppid: parent.ppid,
@@ -590,7 +590,7 @@ async fn get_graph(
         }
 
         // Add siblings
-        for sibling in live.values() {
+        for (sibling, _) in live.values() {
             if sibling.ppid == proc.ppid && sibling.pid != pid && !seen.contains(&sibling.pid) {
                 nodes.push(GraphNode {
                     pid: sibling.pid,
@@ -611,12 +611,15 @@ async fn get_graph(
         // Add descendants
         fn collect_descendants(
             pid: u32,
-            live: &std::collections::HashMap<u32, ProcessEvent>,
+            live: &std::collections::HashMap<
+                u32,
+                (ProcessEvent, Option<Arc<cognitod::k8s::K8sMetadata>>),
+            >,
             seen: &mut std::collections::HashSet<u32>,
             nodes: &mut Vec<GraphNode>,
             level: isize,
         ) {
-            for proc in live.values() {
+            for (proc, _) in live.values() {
                 if proc.ppid == pid && seen.insert(proc.pid) {
                     nodes.push(GraphNode {
                         pid: proc.pid,
@@ -639,7 +642,7 @@ async fn get_graph(
         (StatusCode::OK, Json(GraphResponse { root: pid, nodes })).into_response()
     } else {
         // If not found as PID, but is a PPID, show virtual root and descendants
-        let has_children = live.values().any(|proc| proc.ppid == pid);
+        let has_children = live.values().any(|(proc, _)| proc.ppid == pid);
         if has_children {
             nodes.push(GraphNode {
                 pid,
@@ -655,12 +658,15 @@ async fn get_graph(
 
             fn collect_descendants(
                 pid: u32,
-                live: &std::collections::HashMap<u32, ProcessEvent>,
+                live: &std::collections::HashMap<
+                    u32,
+                    (ProcessEvent, Option<Arc<cognitod::k8s::K8sMetadata>>),
+                >,
                 seen: &mut std::collections::HashSet<u32>,
                 nodes: &mut Vec<GraphNode>,
                 level: isize,
             ) {
-                for proc in live.values() {
+                for (proc, _) in live.values() {
                     if proc.ppid == pid && seen.insert(proc.pid) {
                         nodes.push(GraphNode {
                             pid: proc.pid,

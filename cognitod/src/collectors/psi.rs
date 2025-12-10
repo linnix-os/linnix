@@ -200,11 +200,9 @@ impl PsiMonitor {
 
                                 // Collect metrics
                                 let consumers = self.get_concurrent_cpu_consumers();
-                                let (fork_counts, short_job_counts) =
-                                    self.context.get_pod_activity_window(
-                                        self.sustained_pressure_duration,
-                                        &self.k8s_ctx,
-                                    );
+                                let (fork_counts, short_job_counts) = self
+                                    .context
+                                    .get_pod_activity_window(self.sustained_pressure_duration);
 
                                 let stall_event = StallEvent {
                                     victim_pod: meta.pod_name.clone(),
@@ -289,14 +287,14 @@ impl PsiMonitor {
         let live = self.context.get_live_map();
         let mut consumers: Vec<CpuConsumer> = Vec::new();
 
-        for proc in live.values() {
+        for (proc, meta_opt) in live.values() {
             if let Some(cpu_pct) = proc.cpu_percent()
                 && cpu_pct > 0.0
-                && let Some(k8s_meta) = self.k8s_ctx.get_metadata_for_pid(proc.pid)
+                && let Some(k8s_meta) = meta_opt
             {
                 consumers.push(CpuConsumer {
-                    pod: k8s_meta.pod_name,
-                    namespace: k8s_meta.namespace,
+                    pod: k8s_meta.pod_name.clone(),
+                    namespace: k8s_meta.namespace.clone(),
                     cpu_percent: cpu_pct,
                 });
             }
@@ -441,9 +439,14 @@ mod tests {
             std::env::set_var("K8S_TOKEN", "dummy");
         }
 
+        let k8s_ctx = K8sContext::new().expect("Failed to create K8sContext");
         let monitor = PsiMonitor::new(
-            K8sContext::new().expect("Failed to create K8sContext"),
-            Arc::new(ContextStore::new(Duration::from_secs(60), 1000)),
+            k8s_ctx.clone(),
+            Arc::new(ContextStore::new(
+                Duration::from_secs(60),
+                1000,
+                Some(k8s_ctx),
+            )),
             None,
             15,
         );
