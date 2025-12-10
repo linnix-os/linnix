@@ -488,18 +488,18 @@ mod tests {
 
     #[test]
     fn sequenced_slot_layout() {
-        // Slot must be exactly 256 bytes for cache efficiency
+        // Slot must be exactly 128 bytes (2 cache lines)
         assert_eq!(
             size_of::<SequencedSlot>(),
-            256,
-            "SequencedSlot must be exactly 256 bytes"
+            128,
+            "SequencedSlot must be exactly 128 bytes"
         );
 
-        // Must be aligned to 64 bytes (cache line)
+        // Must be aligned to 128 bytes (as declared with #[repr(C, align(128))])
         assert_eq!(
             std::mem::align_of::<SequencedSlot>(),
-            64,
-            "SequencedSlot must be 64-byte aligned"
+            128,
+            "SequencedSlot must be 128-byte aligned"
         );
 
         // Ring size must be a power of 2

@@ -541,8 +541,9 @@ mod tests {
     fn test_sequenced_slot_alignment() {
         use std::mem::{align_of, size_of};
 
-        assert_eq!(size_of::<SequencedSlot>(), 256);
-        assert_eq!(align_of::<SequencedSlot>(), 64);
+        // SequencedSlot is 128 bytes with 128-byte alignment (2 cache lines)
+        assert_eq!(size_of::<SequencedSlot>(), 128);
+        assert_eq!(align_of::<SequencedSlot>(), 128);
     }
 
     #[test]
