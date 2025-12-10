@@ -18,11 +18,15 @@ use sysinfo::{
     System,   // system handle
 };
 
+pub type ProcessEntry = (ProcessEvent, Option<Arc<K8sMetadata>>);
+
+pub type ProcessHistoryEntry = (u64, ProcessEvent, Option<Arc<K8sMetadata>>);
+
 pub struct ContextStore {
     // Store timestamp, event, and optional cached metadata
-    inner: Mutex<VecDeque<(u64, ProcessEvent, Option<Arc<K8sMetadata>>)>>,
+    inner: Mutex<VecDeque<ProcessHistoryEntry>>,
     // Store live process state and cached metadata
-    live: Mutex<HashMap<u32, (ProcessEvent, Option<Arc<K8sMetadata>>)>>,
+    live: Mutex<HashMap<u32, ProcessEntry>>,
     max_age: Duration,
     max_len: usize,
     broadcaster: broadcast::Sender<ProcessEvent>,
@@ -69,9 +73,7 @@ impl ContextStore {
         }
     }
 
-    pub fn get_live_map(
-        &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<u32, (ProcessEvent, Option<Arc<K8sMetadata>>)>> {
+    pub fn get_live_map(&self) -> std::sync::MutexGuard<'_, HashMap<u32, ProcessEntry>> {
         self.live.lock().unwrap()
     }
 
@@ -128,12 +130,12 @@ impl ContextStore {
         }
 
         // If we still don't have metadata (e.g. late discovery), try one last check for non-exit
-        if metadata.is_none() && event.event_type != 2 {
-            if let Some(ctx) = &self.k8s_ctx {
-                if let Some(meta) = ctx.get_metadata_for_pid(event.pid) {
-                    metadata = Some(Arc::new(meta));
-                }
-            }
+        if metadata.is_none()
+            && event.event_type != 2
+            && let Some(ctx) = &self.k8s_ctx
+            && let Some(meta) = ctx.get_metadata_for_pid(event.pid)
+        {
+            metadata = Some(Arc::new(meta));
         }
 
         {
@@ -193,11 +195,7 @@ impl ContextStore {
             .collect()
     }
 
-    fn prune_locked(
-        queue: &mut VecDeque<(u64, ProcessEvent, Option<Arc<K8sMetadata>>)>,
-        max_age: Duration,
-        max_len: usize,
-    ) {
+    fn prune_locked(queue: &mut VecDeque<ProcessHistoryEntry>, max_age: Duration, max_len: usize) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -472,12 +470,13 @@ impl ContextStore {
                 }
 
                 // Count short jobs (exit event with lifetime < 1s)
-                if event.event_type == 2 {
-                    if let Some(exit_time) = event.exit_time() {
-                        let lifetime_ns = exit_time.saturating_sub(event.ts_ns);
-                        if lifetime_ns < 1_000_000_000 {
-                            *short_job_counts.entry(key).or_default() += 1;
-                        }
+                // Count short jobs (exit event with lifetime < 1s)
+                if event.event_type == 2
+                    && let Some(exit_time) = event.exit_time()
+                {
+                    let lifetime_ns = exit_time.saturating_sub(event.ts_ns);
+                    if lifetime_ns < 1_000_000_000 {
+                        *short_job_counts.entry(key).or_default() += 1;
                     }
                 }
             }

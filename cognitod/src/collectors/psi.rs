@@ -328,12 +328,12 @@ impl PsiMonitor {
             let key = format!("{}/{}", c.namespace, c.pod);
             offenders.insert(key, (c.namespace.clone(), c.pod.clone()));
         }
-        for (key, _) in &event.fork_counts {
+        for key in event.fork_counts.keys() {
             if let Some((ns, pod)) = key.split_once('/') {
                 offenders.insert(key.clone(), (ns.to_string(), pod.to_string()));
             }
         }
-        for (key, _) in &event.short_job_counts {
+        for key in event.short_job_counts.keys() {
             if let Some((ns, pod)) = key.split_once('/') {
                 offenders.insert(key.clone(), (ns.to_string(), pod.to_string()));
             }

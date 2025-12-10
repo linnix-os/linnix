@@ -2116,7 +2116,7 @@ mod tests {
     #[tokio::test]
     async fn heartbeats_emit_every_10s() {
         tokio::time::pause();
-        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10));
+        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10, None));
         let _metrics = Arc::new(Metrics::new());
         let rx = ctx.broadcaster().subscribe();
 
@@ -2139,7 +2139,7 @@ mod tests {
 
     #[tokio::test]
     async fn drops_are_counted() {
-        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 100));
+        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 100, None));
         let metrics = Arc::new(Metrics::new());
         let rx = ctx.broadcaster().subscribe();
         let metrics_clone = metrics.clone();
@@ -2184,7 +2184,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_keys_present() {
-        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10));
+        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10, None));
         let metrics = Arc::new(Metrics::new());
         let app_state = Arc::new(AppState {
             context: Arc::clone(&ctx),
@@ -2227,7 +2227,7 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_includes_probe_state() {
-        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10));
+        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10, None));
         let metrics = Arc::new(Metrics::new());
         metrics.set_rss_probe_mode(RssProbeMode::CoreMm.metric_value());
         metrics.set_kernel_btf_available(true);
@@ -2263,7 +2263,7 @@ mod tests {
 
     #[tokio::test]
     async fn prometheus_endpoint_respects_flag() {
-        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10));
+        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10, None));
         let metrics = Arc::new(Metrics::new());
         let app_state = Arc::new(AppState {
             context: Arc::clone(&ctx),
@@ -2296,7 +2296,7 @@ mod tests {
 
     #[tokio::test]
     async fn prometheus_endpoint_returns_metrics_when_enabled() {
-        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10));
+        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10, None));
         let metrics = Arc::new(Metrics::new());
         metrics.events_total.fetch_add(42, Ordering::Relaxed);
         let app_state = Arc::new(AppState {
@@ -2345,7 +2345,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_no_auth_allows_requests() {
-        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10));
+        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10, None));
         let metrics = Arc::new(Metrics::new());
         let app_state = Arc::new(AppState {
             context: Arc::clone(&ctx),
@@ -2378,7 +2378,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_required_when_token_set() {
-        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10));
+        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10, None));
         let metrics = Arc::new(Metrics::new());
         let app_state = Arc::new(AppState {
             context: Arc::clone(&ctx),
@@ -2411,7 +2411,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_with_valid_bearer_token() {
-        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10));
+        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10, None));
         let metrics = Arc::new(Metrics::new());
         let app_state = Arc::new(AppState {
             context: Arc::clone(&ctx),
@@ -2445,7 +2445,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_with_invalid_token() {
-        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10));
+        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10, None));
         let metrics = Arc::new(Metrics::new());
         let app_state = Arc::new(AppState {
             context: Arc::clone(&ctx),
@@ -2479,7 +2479,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_with_malformed_header() {
-        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10));
+        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10, None));
         let metrics = Arc::new(Metrics::new());
         let app_state = Arc::new(AppState {
             context: Arc::clone(&ctx),
