@@ -12,9 +12,7 @@ use aya::programs::{BtfTracePoint, TracePoint};
 use aya::{Btf, EbpfLoader, Pod};
 use clap::Parser;
 use log::{error, info, warn};
-use std::os::fd::{AsFd, AsRawFd};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::os::fd::AsFd;
 use std::time::{Duration, Instant};
 
 use cognitod::bpf_config::derive_telemetry_config;
@@ -234,7 +232,7 @@ fn main() -> Result<()> {
     let start = Instant::now();
     let deadline = start + Duration::from_secs(args.duration);
     let mut consumer = consumer;
-    let mut total_events: u64 = 0;
+    let mut _total_events: u64 = 0;
     let mut poll_cycles: u64 = 0;
     let mut max_batch: usize = 0;
     let mut empty_polls: u64 = 0;
@@ -249,7 +247,7 @@ fn main() -> Result<()> {
             std::thread::sleep(Duration::from_micros(100));
         } else {
             let batch_size = events.len();
-            total_events += batch_size as u64;
+            _total_events += batch_size as u64;
             if batch_size > max_batch {
                 max_batch = batch_size;
             }

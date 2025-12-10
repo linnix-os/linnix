@@ -30,8 +30,9 @@
 //! - **Read-Only Consumer**: We never write EMPTY flags back to the ring buffer,
 //!   avoiding cache ping-pong with kernel producers.
 
+#![allow(dead_code)] // Suppress unused warnings for WIP sequencer
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::os::fd::{BorrowedFd, RawFd};
 
 use linnix_ai_ebpf_common::{
     ProcessEvent, REAPER_TIMEOUT_NS, SEQUENCER_RING_MASK, SEQUENCER_RING_SIZE, SequencedSlot,
@@ -108,18 +109,18 @@ impl OrderingValidator {
     /// Check that the given ticket maintains strict ordering.
     /// Returns true if ordering is correct, false if violated.
     pub fn check(&mut self, ticket: u64) -> bool {
-        if let Some(last) = self.last_ticket {
-            if ticket != last + 1 {
-                error!(
-                    "ORDERING VIOLATION: Expected ticket {}, got {}. Gap of {} events.",
-                    last + 1,
-                    ticket,
-                    ticket.saturating_sub(last + 1)
-                );
-                self.violations += 1;
-                self.last_ticket = Some(ticket);
-                return false;
-            }
+        if let Some(last) = self.last_ticket
+            && ticket != last + 1
+        {
+            error!(
+                "ORDERING VIOLATION: Expected ticket {}, got {}. Gap of {} events.",
+                last + 1,
+                ticket,
+                ticket.saturating_sub(last + 1)
+            );
+            self.violations += 1;
+            self.last_ticket = Some(ticket);
+            return false;
         }
         self.last_ticket = Some(ticket);
         true

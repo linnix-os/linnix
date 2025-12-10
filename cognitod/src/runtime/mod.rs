@@ -1,3 +1,4 @@
+#![allow(unused_imports)]
 pub mod lineage;
 pub mod probes;
 pub mod sequencer;
