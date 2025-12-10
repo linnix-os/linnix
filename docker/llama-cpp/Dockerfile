@@ -1,7 +1,7 @@
 # Dockerfile for llama.cpp server with Linnix 3B model
-# Uses official pre-built ghcr.io/ggerganov/llama.cpp image for fast setup
+# Uses official pre-built ghcr.io/ggml-org/llama.cpp image for fast setup
 
-FROM ghcr.io/ggerganov/llama.cpp:server as llama-base
+FROM ghcr.io/ggml-org/llama.cpp:server AS llama-base
 
 # Runtime stage - lightweight image with llama-server
 FROM debian:bookworm-slim
