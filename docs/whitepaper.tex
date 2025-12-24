@@ -1,0 +1,236 @@
+\documentclass[11pt,a4paper]{article}
+
+% Packages
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage[margin=1in]{geometry}
+
+% Code listing style
+\lstdefinestyle{rust}{
+    language=C,
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue},
+    commentstyle=\color{gray},
+    stringstyle=\color{red},
+    numbers=none,
+    breaklines=true,
+    frame=single,
+    backgroundcolor=\color{gray!10}
+}
+
+\title{The Cost of Causality: High-Frequency, Causal Observability with eBPF Sequencers}
+
+\author{
+    Linnix Project\\
+    \texttt{https://github.com/linnix-os/linnix}
+}
+
+\date{December 2025}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Production observability faces a fundamental tradeoff: standard eBPF primitives force a choice between throughput and ordering. \texttt{BPF\_PERF\_EVENT\_ARRAY} delivers high throughput through per-CPU buffers but sacrifices global event ordering---making it impossible to diagnose race conditions and process lifecycle bugs. \texttt{BPF\_RINGBUF} provides ordering through a shared ring but collapses under spinlock contention at high core counts.
+
+This paper introduces \textbf{Linnix-Sequencer}, a wait-free eBPF primitive that achieves strict global ordering at line rate. Based on the LMAX Disruptor pattern, our approach replaces kernel spinlocks with an atomic serialization point: a cache-line-aligned ticket counter that moves contention from software (OS scheduler) to hardware (CPU mesh interconnect). Combined with BTF-powered raw tracepoints and zero-copy mmap, the sequencer \textbf{captures 100\% of kernel events} while standard perf buffers drop up to 77\% at high core counts---maintaining \textbf{zero ordering violations} across 8 to 192 cores on AMD EPYC systems.
+\end{abstract}
+
+\section{Introduction: The Observability Uncertainty Principle}
+
+Modern distributed systems require precise event ordering to debug race conditions, reconstruct attack timelines, and ensure correctness. Yet the very act of observing high-frequency kernel events introduces a fundamental tradeoff---what we call the \textbf{Observability Uncertainty Principle}:
+
+\begin{quote}
+\textit{High-throughput event capture destroys the ordering required to diagnose the bugs it detects.}
+\end{quote}
+
+\subsection{The Problem}
+
+Consider a common production scenario: a process forks, the child executes, and an exit event occurs. A security or debugging tool must capture these events in the exact order they occurred. Any misordering could lead to false positives, missed attacks, or debugging failures.
+
+Standard Linux eBPF primitives force a choice:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Primitive} & \textbf{Throughput} & \textbf{Global Ordering} & \textbf{Wait-Free} & \textbf{Scalability} \\
+\midrule
+BPF\_PERF\_EVENT\_ARRAY & High & No (per-CPU) & Yes & Linear \\
+BPF\_RINGBUF & Medium & Yes & No (spinlock) & Collapses at 64+ cores \\
+\textbf{Linnix-Sequencer} & \textbf{High} & \textbf{Yes} & \textbf{Yes} & \textbf{Linear} \\
+\bottomrule
+\end{tabular}
+\caption{Comparison of eBPF event delivery primitives}
+\end{table}
+
+\subsection{Our Contribution}
+
+We present the first wait-free, strictly-ordered eBPF primitive that doesn't sacrifice throughput. Our key insight: \textbf{move contention from software (kernel spinlocks) to hardware (atomic CPU operations)}.
+
+\section{Background: Why Standard Primitives Fail}
+
+\subsection{BPF\_PERF\_EVENT\_ARRAY: High Throughput, No Ordering}
+
+The perf event array provides one ring buffer per CPU. Each CPU writes events to its own buffer, eliminating cross-core synchronization.
+
+\textbf{Problem}: Userspace receives N independent streams. Merging by timestamp is unreliable---clock skew between cores, NMI delays, and scheduler jitter introduce reordering.
+
+\subsection{BPF\_RINGBUF: Ordering via Spinlock}
+
+The ring buffer uses a kernel spinlock to serialize writes from all CPUs to a single buffer.
+
+\textbf{Problem}: At high core counts (64+), spinlock contention becomes catastrophic. CPUs spend more time waiting for the lock than processing events.
+
+\section{Design: LMAX Disruptor in Kernel Space}
+
+The Linnix-Sequencer is built on three pillars:
+
+\subsection{The Atomic Ticket Counter}
+
+Instead of a spinlock, we use an atomic ticket counter placed in a dedicated cache line:
+
+\begin{lstlisting}[style=rust]
+#[repr(C, align(64))]  // Cache-line aligned
+struct GlobalSequencer {
+    value: u64,         // Ticket counter
+    _padding: [u8; 56], // Fill to 64 bytes
+}
+\end{lstlisting}
+
+Each producer atomically increments this counter to claim a unique sequence number. Hardware atomic operations complete in $\sim$20-50 cycles; spinlock contention can cost thousands of cycles plus context switches.
+
+\subsection{The Zero-Copy Ring Buffer}
+
+Events are written directly to an mmap-backed BPF array:
+\begin{itemize}
+    \item 128MB ring with 1 million 128-byte slots
+    \item BPF\_F\_MMAPABLE flag enables direct userspace access
+    \item No syscalls on the hot path---consumer reads directly from RAM
+\end{itemize}
+
+\subsection{The Consumer Protocol}
+
+The consumer advances through slots using sequence number validation. Events are processed in exact sequence order, regardless of which CPU produced them.
+
+\section{Implementation Details}
+
+\subsection{BTF-Powered Raw Tracepoints}
+
+Standard tracepoints incur overhead from kernel argument marshaling. BTF raw tracepoints provide direct struct access. Offsets are discovered at runtime via \texttt{/sys/kernel/btf/vmlinux}, enabling portable binaries.
+
+\subsection{Huge Page Optimization}
+
+A 128MB ring spans 32,768 pages at 4KB. Each TLB miss costs $\sim$100ns. We advise the kernel to use 2MB huge pages via \texttt{MADV\_HUGEPAGE}, reducing TLB entries from 32K to $\sim$64.
+
+\subsection{Cache-Line Alignment}
+
+Each slot spans exactly two cache lines (128 bytes), ensuring producer writes don't cause false sharing on consumer reads.
+
+\section{Evaluation}
+
+\subsection{Test Environment}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{ll}
+\toprule
+\textbf{Property} & \textbf{Value} \\
+\midrule
+Hardware & AWS c6a.48xlarge (192 vCPUs) \\
+CPU & AMD EPYC 7R13 (Milan) \\
+Kernel & Linux 6.8.0-1044-aws \\
+Workload & stress-ng --fork N --fork-ops 50000 \\
+Core Counts & 8, 32, 64, 128, 192 \\
+\bottomrule
+\end{tabular}
+\caption{Test environment configuration}
+\end{table}
+
+\subsection{Throughput Results}
+
+We ran both modes against an identical fixed workload (50,000 fork operations = $\sim$100K kernel events) across increasing core counts.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{ccccc}
+\toprule
+\textbf{Cores} & \textbf{Perf Buffer} & \textbf{Sequencer} & \textbf{Capture Rate} & \textbf{Violations} \\
+\midrule
+8 & 90,191 & 100,150 & 90\% & 0 \\
+32 & 59,650 & 100,269 & 60\% & 0 \\
+64 & 38,312 & 100,103 & 38\% & 0 \\
+128 & 26,862 & 100,231 & 27\% & 0 \\
+192 & 23,327 & 100,232 & \textbf{23\%} & \textbf{0} \\
+\bottomrule
+\end{tabular}
+\caption{Event capture comparison: Perf Buffer vs Sequencer}
+\end{table}
+
+\textbf{Key findings}:
+\begin{enumerate}
+    \item Perf buffer capture degrades from 90\% at 8 cores to 23\% at 192 cores
+    \item Sequencer captures 100\% at all core counts with no degradation
+    \item Zero ordering violations across all tests
+    \item 4.3x capture gap at 192 cores
+\end{enumerate}
+
+\section{Related Work}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Tool} & \textbf{Buffer Type} & \textbf{Ordering} & \textbf{Wait-Free} & \textbf{Scales 100+ Cores} \\
+\midrule
+Falco & Ringbuf* & Global & No & No \\
+Tetragon & Ringbuf* & Global & No & No \\
+Tracee & Ringbuf* & Global & No & No \\
+BCC/bpftrace & Perf/Ringbuf & Varies & Yes & No \\
+\textbf{Linnix-Sequencer} & \textbf{Custom} & \textbf{Global} & \textbf{Yes} & \textbf{Yes} \\
+\bottomrule
+\end{tabular}
+\caption{Comparison with existing eBPF observability tools. *Modern tools prefer \texttt{BPF\_RINGBUF} on Linux 5.8+, falling back to perf buffers on older kernels.}
+\end{table}
+
+The key difference: \texttt{BPF\_RINGBUF} provides global ordering but uses a kernel spinlock that causes contention at high core counts. The Linnix-Sequencer replaces the spinlock with an atomic ticket counter, achieving the same ordering guarantees without lock contention.
+
+\section{Conclusion}
+
+The Linnix-Sequencer demonstrates that wait-free observability with strict global ordering is possible. By applying the LMAX Disruptor pattern to kernel space---replacing spinlocks with atomic ticket counters---we achieve:
+
+\begin{itemize}
+    \item \textbf{100\% event capture} at all core counts (vs 23-90\% for perf buffers)
+    \item \textbf{Zero ordering violations} across all tests from 8 to 192 cores
+    \item \textbf{No degradation at scale}: Sequencer maintains full capture while perf buffer drops from 90\% to 23\%
+\end{itemize}
+
+\subsection{Future Work}
+
+\begin{itemize}
+    \item NUMA-aware allocation to reduce cross-socket traffic
+    \item Batch ticket reservation to amortize atomic overhead
+    \item Hardware timestamp integration using CPU TSC
+\end{itemize}
+
+\section*{References}
+
+\begin{enumerate}
+    \item LMAX Disruptor: High Performance Alternative to Bounded Queues. Trisha Gee and Martin Thompson, 2011.
+    \item BPF and XDP Reference Guide. Linux Kernel Documentation.
+    \item BTF Type Format. \url{https://www.kernel.org/doc/html/latest/bpf/btf.html}
+    \item Falco: Cloud-Native Runtime Security. \url{https://falco.org/}
+    \item Tetragon: eBPF-based Security Observability. \url{https://github.com/cilium/tetragon}
+\end{enumerate}
+
+\vspace{1cm}
+\noindent\textit{Linnix is open source software available at \url{https://github.com/linnix-os/linnix}}
+
+\end{document}
