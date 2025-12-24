@@ -1,0 +1,5 @@
+
+{"cores": 4, "mode": "perf", "iteration": 1, "events_per_sec": 7041, "dropped": 0, "ordering_violations": "n/a"}
+{"cores": 4, "mode": "sequencer", "iteration": 1, "events_per_sec": 11449, "dropped": 0, "ordering_violations": 0}
+{"cores": 8, "mode": "perf", "iteration": 1, "events_per_sec": 9889, "dropped": 0, "ordering_violations": "n/a"}
+{"cores": 8, "mode": "sequencer", "iteration": 1, "events_per_sec": 12115, "dropped": 0, "ordering_violations": 0}

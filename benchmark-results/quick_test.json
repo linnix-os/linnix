@@ -1,0 +1,33 @@
+{
+  "metadata": {
+    "timestamp": "2025-12-13T16:15:31-05:00",
+    "system": {
+      "hostname": "lab",
+      "kernel": "6.8.0-87-generic",
+      "total_cores": 16,
+      "cpu_model": "AMD Ryzen 7 5700U with Radeon Graphics"
+    },
+    "config": {
+      "core_counts_tested": "4",
+      "duration_per_test": 20,
+      "warmup_duration": 3,
+      "iterations": 1,
+      "benchmark_mode": "perf"
+    }
+  },
+  "results": [
+    {
+      "cores": 4,
+      "mode": "perf",
+      "events_per_sec_mean": 0,
+      "events_per_sec_min": 0,
+      "events_per_sec_max": 0,
+      "events_per_sec_all": [
+        0
+      ],
+      "dropped_total": 0,
+      "ordering_violations_total": 0,
+      "iterations": 1
+    }
+  ]
+}
