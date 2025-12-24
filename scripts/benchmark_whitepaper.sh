@@ -547,6 +547,7 @@ EOF
     # Aggregate results by cores and mode
     local aggregated
     aggregated=$(cat "$raw_file" | jq -s '
+        sort_by([.cores, .mode]) |
         group_by([.cores, .mode]) | 
         map({
             cores: .[0].cores,
