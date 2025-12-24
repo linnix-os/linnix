@@ -4,6 +4,7 @@
 
 [![CI](https://github.com/linnix-os/linnix/actions/workflows/docker.yml/badge.svg)](https://github.com/linnix-os/linnix/actions/workflows/docker.yml)
 [![License](https://img.shields.io/badge/License-AGPL%203.0-blue.svg)](LICENSE)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18042323.svg)](https://doi.org/10.5281/zenodo.18042323)
 
 ---
 
