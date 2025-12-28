@@ -15,5 +15,5 @@ clap = { version = "4", features = ["derive"] }
 chrono = "0.4"
 futures-util = "0.3"
 eventsource-stream = "0.2"
-sysinfo = "0.32"
+sysinfo = "0.37"
 linnix-ai-ebpf-common = { path = "../linnix-ai-ebpf/linnix-ai-ebpf-common", features = ["user"] }
