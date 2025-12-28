@@ -56,6 +56,8 @@ pub struct StallAttribution {
     pub cpu_share: f64,
     pub fork_count: u64,
     pub short_job_count: u64,
+    /// GPU memory used by offender during stall (MB)
+    pub gpu_memory_mb: u64,
 }
 
 /// Incident storage backed by SQLite
@@ -116,7 +118,8 @@ impl IncidentStore {
                 timestamp INTEGER NOT NULL,
                 cpu_share REAL DEFAULT 0.0,
                 fork_count INTEGER DEFAULT 0,
-                short_job_count INTEGER DEFAULT 0
+                short_job_count INTEGER DEFAULT 0,
+                gpu_memory_mb INTEGER DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_victim_time ON stall_attributions(victim_pod, victim_namespace, timestamp);
             CREATE INDEX IF NOT EXISTS idx_offender_time ON stall_attributions(offender_pod, offender_namespace, timestamp);
@@ -137,6 +140,11 @@ impl IncidentStore {
                 .await;
         let _ = sqlx::query(
             "ALTER TABLE stall_attributions ADD COLUMN short_job_count INTEGER DEFAULT 0",
+        )
+        .execute(&pool)
+        .await;
+        let _ = sqlx::query(
+            "ALTER TABLE stall_attributions ADD COLUMN gpu_memory_mb INTEGER DEFAULT 0",
         )
         .execute(&pool)
         .await;
@@ -236,14 +244,15 @@ impl IncidentStore {
         cpu_share: f64,
         fork_count: u64,
         short_job_count: u64,
+        gpu_memory_mb: u64,
     ) -> Result<i64, sqlx::Error> {
         let result = sqlx::query(
             r#"
             INSERT INTO stall_attributions (
                 victim_pod, victim_namespace, offender_pod, offender_namespace,
                 stall_us, blame_score, timestamp,
-                cpu_share, fork_count, short_job_count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                cpu_share, fork_count, short_job_count, gpu_memory_mb
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(victim_pod)
@@ -256,13 +265,20 @@ impl IncidentStore {
         .bind(cpu_share)
         .bind(fork_count as i64)
         .bind(short_job_count as i64)
+        .bind(gpu_memory_mb as i64)
         .execute(&self.pool)
         .await?;
 
         let id = result.last_insert_rowid();
         debug!(
-            "Inserted stall attribution #{}: {}/{} blamed {}/{} (score={:.2})",
-            id, victim_namespace, victim_pod, offender_namespace, offender_pod, blame_score
+            "Inserted stall attribution #{}: {}/{} blamed {}/{} (score={:.2}, gpu_mb={})",
+            id,
+            victim_namespace,
+            victim_pod,
+            offender_namespace,
+            offender_pod,
+            blame_score,
+            gpu_memory_mb
         );
         Ok(id)
     }
@@ -283,7 +299,7 @@ impl IncidentStore {
         let rows = sqlx::query(
             r#"
             SELECT offender_pod, offender_namespace, stall_us, blame_score, timestamp,
-                   cpu_share, fork_count, short_job_count
+                   cpu_share, fork_count, short_job_count, gpu_memory_mb
             FROM stall_attributions
             WHERE victim_pod = ? AND victim_namespace = ? AND timestamp >= ?
             ORDER BY blame_score DESC
@@ -306,6 +322,7 @@ impl IncidentStore {
                 cpu_share: r.get(5),
                 fork_count: r.get::<i64, _>(6) as u64,
                 short_job_count: r.get::<i64, _>(7) as u64,
+                gpu_memory_mb: r.get::<i64, _>(8) as u64,
             })
             .collect())
     }
