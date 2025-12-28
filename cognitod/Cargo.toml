@@ -50,6 +50,9 @@ memmap2 = "0.9"
 nix = { version = "0.29", features = ["time"] }
 ctrlc = "3.4"
 
+# GPU monitoring (optional)
+nvml-wrapper = { version = "0.10", optional = true }
+
 [[bin]]
 name = "cognitod"
 path = "src/main.rs"
@@ -66,6 +69,8 @@ reqwest-eventsource = "0.4"
 [features]
 default = []
 ilm-test = []
+gpu = ["nvml-wrapper"]
+cuda = []  # CUDA uprobe tracing (requires GPU and cuda feature in eBPF)
 
 # Metadata for cargo-deb and cargo-generate-rpm
 [package.metadata.deb]

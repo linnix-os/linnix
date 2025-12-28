@@ -19,7 +19,7 @@ services:
   # Cognitod - eBPF monitoring daemon
   # Security: root + minimal caps (CAP_BPF + CAP_PERFMON only)
   cognitod:
-    image: ${COGNITOD_IMAGE:-linnix-cognitod}
+    image: ${COGNITOD_IMAGE:-ghcr.io/linnix-os/cognitod:latest}
     container_name: linnix-cognitod
 
     network_mode: host

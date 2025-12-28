@@ -31,6 +31,15 @@ pub struct CpuConsumer {
     pub cpu_percent: f32,
 }
 
+/// GPU process contributing to resource pressure
+#[derive(Debug, Clone)]
+pub struct GpuConsumer {
+    pub pod: String,
+    pub namespace: String,
+    pub gpu_memory_mb: u64,
+    pub gpu_index: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct StallEvent {
     pub victim_pod: String,
@@ -40,6 +49,8 @@ pub struct StallEvent {
     pub concurrent_consumers: Vec<CpuConsumer>,
     pub fork_counts: HashMap<String, u64>,
     pub short_job_counts: HashMap<String, u64>,
+    /// GPU processes active during the stall
+    pub gpu_consumers: Vec<GpuConsumer>,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +65,8 @@ pub struct BlameAttribution {
     pub cpu_share: f64,
     pub fork_count: u64,
     pub short_job_count: u64,
+    /// GPU memory used by offender during stall (MB)
+    pub gpu_memory_mb: u64,
 }
 
 pub fn parse_psi_file(content: &str) -> Result<PsiSnapshot> {
@@ -212,6 +225,7 @@ impl PsiMonitor {
                                     concurrent_consumers: consumers.clone(),
                                     fork_counts,
                                     short_job_counts,
+                                    gpu_consumers: Vec::new(), // Phase 2: will be populated when GPU data available
                                 };
 
                                 info!(
@@ -254,6 +268,7 @@ impl PsiMonitor {
                                                 attr.cpu_share,
                                                 attr.fork_count,
                                                 attr.short_job_count,
+                                                attr.gpu_memory_mb,
                                             )
                                             .await
                                         {
@@ -380,6 +395,14 @@ impl PsiMonitor {
             let blame_score = raw_score * (event.stall_delta_us as f64 / 1_000_000.0);
 
             if blame_score > 0.0 {
+                // Lookup GPU memory for this offender
+                let gpu_memory_mb = event
+                    .gpu_consumers
+                    .iter()
+                    .filter(|g| g.pod == pod && g.namespace == ns)
+                    .map(|g| g.gpu_memory_mb)
+                    .sum();
+
                 attributions.push(BlameAttribution {
                     victim_pod: event.victim_pod.clone(),
                     victim_namespace: event.victim_namespace.clone(),
@@ -391,6 +414,7 @@ impl PsiMonitor {
                     cpu_share,
                     fork_count,
                     short_job_count,
+                    gpu_memory_mb,
                 });
             }
         }
@@ -476,6 +500,7 @@ mod tests {
             ],
             fork_counts,
             short_job_counts,
+            gpu_consumers: Vec::new(),
         };
 
         let attributions = monitor.calculate_blame_attributions(&event);
