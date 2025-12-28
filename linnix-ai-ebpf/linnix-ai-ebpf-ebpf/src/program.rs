@@ -4,15 +4,16 @@ use aya_ebpf::{
     helpers::{
         bpf_get_current_task_btf, bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read,
     },
-    macros::{btf_tracepoint, kprobe, map, tracepoint},
+    macros::{btf_tracepoint, kprobe, map, tracepoint, uprobe},
     maps::{perf::PerfEventArray, Array, HashMap, PerCpuArray},
     programs::{BtfTracePointContext, ProbeContext, TracePointContext},
     EbpfContext,
 };
 use aya_log_ebpf::info;
 use linnix_ai_ebpf_common::{
-    rss_source, slot_flags, BlockOp, EventType, PageFaultOrigin, ProcessEvent, SequencedSlot,
-    TelemetryConfig, PERCENT_MILLI_UNKNOWN, SEQUENCER_RING_MASK, SEQUENCER_RING_SIZE,
+    rss_source, slot_flags, BlockOp, CudaOp, EventType, PageFaultOrigin, ProcessEvent,
+    SequencedSlot, TelemetryConfig, PERCENT_MILLI_UNKNOWN, SEQUENCER_RING_MASK,
+    SEQUENCER_RING_SIZE,
 };
 
 #[map(name = "EVENTS")]
@@ -1257,6 +1258,147 @@ pub fn trace_sys_enter(ctx: TracePointContext) -> u32 {
 
 fn try_trace_sys_enter(ctx: TracePointContext) -> u32 {
     let _ = ctx;
+    0
+}
+
+// =============================================================================
+// CUDA UPROBE HANDLERS - GPU API Call Tracing
+// =============================================================================
+//
+// These uprobes attach to libcuda.so functions to trace GPU API calls.
+// They provide sub-millisecond visibility into CUDA operations.
+//
+// Note: These probes are attached dynamically at runtime when libcuda.so
+// is found. They gracefully do nothing if CUDA is not installed.
+
+/// Trace cudaMalloc calls
+/// Signature: cudaError_t cudaMalloc(void** devPtr, size_t size)
+/// We capture the allocation size (arg1)
+#[uprobe]
+pub fn handle_cuda_malloc(ctx: ProbeContext) -> u32 {
+    try_handle_cuda_malloc(&ctx)
+}
+
+#[inline(always)]
+fn try_handle_cuda_malloc(ctx: &ProbeContext) -> u32 {
+    let now = unsafe { bpf_ktime_get_ns() };
+    let pid = ctx.pid();
+    if pid == 0 {
+        return 0;
+    }
+
+    // arg1: size_t size (allocation size in bytes)
+    let size: usize = match unsafe { ctx.arg(1) } {
+        Some(s) => s,
+        None => return 0,
+    };
+
+    emit_cuda_event(ctx, CudaOp::Malloc, now, size as u64, 0)
+}
+
+/// Trace cudaFree calls
+/// Signature: cudaError_t cudaFree(void* devPtr)
+#[uprobe]
+pub fn handle_cuda_free(ctx: ProbeContext) -> u32 {
+    try_handle_cuda_free(&ctx)
+}
+
+#[inline(always)]
+fn try_handle_cuda_free(ctx: &ProbeContext) -> u32 {
+    let now = unsafe { bpf_ktime_get_ns() };
+    let pid = ctx.pid();
+    if pid == 0 {
+        return 0;
+    }
+
+    // arg0: void* devPtr (we don't capture the actual pointer for security)
+    emit_cuda_event(ctx, CudaOp::Free, now, 0, 0)
+}
+
+/// Trace cudaLaunchKernel calls
+/// This is the core GPU kernel launch function
+#[uprobe]
+pub fn handle_cuda_launch_kernel(ctx: ProbeContext) -> u32 {
+    try_handle_cuda_launch_kernel(&ctx)
+}
+
+#[inline(always)]
+fn try_handle_cuda_launch_kernel(ctx: &ProbeContext) -> u32 {
+    let now = unsafe { bpf_ktime_get_ns() };
+    let pid = ctx.pid();
+    if pid == 0 {
+        return 0;
+    }
+
+    // cudaLaunchKernel has complex args, we just record the event
+    emit_cuda_event(ctx, CudaOp::LaunchKernel, now, 0, 0)
+}
+
+/// Trace cudaMemcpy calls
+/// Signature: cudaError_t cudaMemcpy(void* dst, const void* src, size_t count, cudaMemcpyKind kind)
+/// We capture count (arg2) and kind (arg3)
+#[uprobe]
+pub fn handle_cuda_memcpy(ctx: ProbeContext) -> u32 {
+    try_handle_cuda_memcpy(&ctx)
+}
+
+#[inline(always)]
+fn try_handle_cuda_memcpy(ctx: &ProbeContext) -> u32 {
+    let now = unsafe { bpf_ktime_get_ns() };
+    let pid = ctx.pid();
+    if pid == 0 {
+        return 0;
+    }
+
+    // arg2: size_t count (bytes to copy)
+    let count: usize = match unsafe { ctx.arg(2) } {
+        Some(c) => c,
+        None => return 0,
+    };
+
+    // arg3: cudaMemcpyKind (direction: HtoD=1, DtoH=2, DtoD=3)
+    let kind: u32 = match unsafe { ctx.arg(3) } {
+        Some(k) => k,
+        None => 1, // default to HtoD
+    };
+
+    let op = match kind {
+        1 => CudaOp::MemcpyHtoD,
+        2 => CudaOp::MemcpyDtoH,
+        3 => CudaOp::MemcpyDtoD,
+        _ => CudaOp::MemcpyHtoD,
+    };
+
+    emit_cuda_event(ctx, op, now, count as u64, 0)
+}
+
+/// Emit a CUDA event using the standard event infrastructure
+/// Uses ProcessEvent.data for bytes, ProcessEvent.aux for CudaOp
+#[inline(always)]
+fn emit_cuda_event(ctx: &ProbeContext, op: CudaOp, now: u64, bytes: u64, data2: u64) -> u32 {
+    let pid = ctx.pid();
+    let ids = bpf_get_current_uid_gid();
+    let uid = ids as u32;
+    let gid = (ids >> 32) as u32;
+    let comm = get_comm();
+
+    // Use existing event infrastructure
+    submit_event_direct(
+        ctx,
+        pid,
+        0, // ppid not relevant for CUDA events
+        uid,
+        gid,
+        EventType::Cuda as u32,
+        now,
+        &comm,
+        PERCENT_MILLI_UNKNOWN,
+        PERCENT_MILLI_UNKNOWN,
+        bytes,     // data: bytes allocated/copied
+        data2,     // data2: unused
+        op as u32, // aux: CudaOp enum
+        0,         // aux2: unused
+    );
     0
 }
 
