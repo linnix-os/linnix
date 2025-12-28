@@ -61,7 +61,7 @@ jobs:
           # TODO: ARM64 support blocked by bpf-linker LLVM issues in QEMU
           # See: https://github.com/aya-rs/bpf-linker/issues
           platforms: linux/amd64
-          push: true
+          push: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork != true }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -112,7 +112,7 @@ jobs:
           context: ./docker/llama-cpp
           file: ./docker/llama-cpp/Dockerfile
           platforms: linux/amd64,linux/arm64
-          push: true
+          push: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork != true }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
