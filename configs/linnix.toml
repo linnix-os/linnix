@@ -45,3 +45,8 @@ enabled = true
 [psi]
 # Duration in seconds of sustained pressure required to trigger attribution
 sustained_pressure_seconds = 15
+
+[gpu]
+# GPU monitoring configuration (requires NVIDIA GPU with NVML)
+enabled = true
+poll_interval_ms = 100

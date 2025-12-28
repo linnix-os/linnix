@@ -795,6 +795,34 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
     }
 
+    // Start GPU monitor (optional, requires NVIDIA GPU)
+    #[cfg(feature = "gpu")]
+    let gpu_data: Option<cognitod::collectors::gpu::GpuData> = if config.gpu.enabled {
+        match cognitod::collectors::gpu::GpuMonitor::new(
+            k8s_context.clone(),
+            config.gpu.poll_interval_ms,
+        ) {
+            Ok(monitor) => {
+                let data = monitor.data();
+                tokio::spawn(async move {
+                    monitor.run().await;
+                });
+                info!(
+                    "[cognitod] GPU monitor started (poll interval: {}ms)",
+                    config.gpu.poll_interval_ms
+                );
+                Some(data)
+            }
+            Err(e) => {
+                info!("[cognitod] GPU monitoring unavailable: {}", e);
+                None
+            }
+        }
+    } else {
+        info!("[cognitod] GPU monitoring disabled by config");
+        None
+    };
+
     // Initialize Slack Notifier
     let _slack_notifier = if let Some(ref notif_cfg) = config.notifications {
         if let Some(ref slack_cfg) = notif_cfg.slack {
@@ -1150,6 +1178,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         enforcement: enforcement_queue.clone(),
         incident_store: incident_store.clone(),
         k8s: k8s_context.clone(),
+        #[cfg(feature = "gpu")]
+        gpu_data,
     });
 
     let api = all_routes(app_state.clone());
