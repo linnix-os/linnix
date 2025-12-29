@@ -61,7 +61,7 @@ jobs:
           # TODO: ARM64 support blocked by bpf-linker LLVM issues in QEMU
           # See: https://github.com/aya-rs/bpf-linker/issues
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork != true }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -112,7 +112,7 @@ jobs:
           context: ./docker/llama-cpp
           file: ./docker/llama-cpp/Dockerfile
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork != true }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -121,12 +121,33 @@ jobs:
   test-docker-compose:
     name: Test Docker Compose Setup
     runs-on: ubuntu-latest
-    needs: [build-cognitod, build-llama-cpp]
+    # Build images locally instead of pulling from registry to avoid manifest delays
     if: github.event_name == 'pull_request' || github.event_name == 'push'
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build cognitod image locally
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          tags: linnix-cognitod:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build llama-cpp image locally
+        uses: docker/build-push-action@v5
+        with:
+          context: ./docker/llama-cpp
+          file: ./docker/llama-cpp/Dockerfile
+          load: true
+          tags: linnix-llama:test
 
       - name: Create test config
         run: |
@@ -137,8 +158,8 @@ jobs:
       - name: Start services
         run: |
           # Use locally built images for testing
-          export COGNITOD_IMAGE=ghcr.io/${{ env.COGNITOD_IMAGE_NAME }}:${{ github.sha }}
-          export LLAMA_IMAGE=ghcr.io/${{ env.LLAMA_IMAGE_NAME }}:${{ github.sha }}
+          export COGNITOD_IMAGE=linnix-cognitod:test
+          export LLAMA_IMAGE=linnix-llama:test
           docker compose up -d
 
       - name: Wait for services
