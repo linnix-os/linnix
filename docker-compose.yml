@@ -43,6 +43,7 @@ services:
     tmpfs:
       - /tmp
       - /var/run
+      - /run  # Required for Tokio signal handler
 
     volumes:
       - /sys/kernel/btf:/sys/kernel/btf:ro
