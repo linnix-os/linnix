@@ -200,10 +200,10 @@ impl ContextStore {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
-        while queue.front().is_some_and(|(_, e, _)| {
-            e.event_type == 2
-                && e.exit_time()
-                    .is_some_and(|et| now - et > max_age.as_nanos() as u64)
+        while queue.front().is_some_and(|(ts, e, _)| {
+            // Use the queue timestamp to avoid mixing time bases (wall clock vs kernel monotonic).
+            // Exit events carry kernel monotonic times; pruning should be based on wall-clock age.
+            e.event_type == 2 && now.saturating_sub(*ts) > max_age.as_nanos() as u64
         }) {
             queue.pop_front();
         }
@@ -592,5 +592,22 @@ mod tests {
         // Duration should be 1.5s
         let duration = exit_event.exit_time_ns - exit_event.ts_ns;
         assert_eq!(duration, 1_500_000_000);
+    }
+
+    #[test]
+    fn exit_survives_prune_after_exec_evicted() {
+        // max_len=1 forces the exec to be evicted when exit is added
+        let store = ContextStore::new(Duration::from_secs(10), 1, None);
+        let mut exec = sample_event(7, 1, EventType::Exec);
+        exec.ts_ns = 1_000_000_000;
+        store.add(exec);
+
+        let mut exit = sample_event(7, 1, EventType::Exit);
+        exit.ts_ns = 2_000_000_000;
+        store.add(exit);
+
+        let recent = store.get_recent();
+        assert_eq!(recent.len(), 1, "exit event should remain after exec eviction");
+        assert_eq!(recent[0].event_type, EventType::Exit as u32);
     }
 }
