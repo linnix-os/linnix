@@ -71,15 +71,15 @@ jobs:
           toolchain: nightly-2024-12-10
           components: rust-src, llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
-      - name: Install LLVM 19
+      - name: Install LLVM 20
         run: |
           wget https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
-          sudo ./llvm.sh 19
-          sudo apt-get install -y llvm-19-dev libpolly-19-dev
-          echo "LLVM_SYS_191_PREFIX=/usr/lib/llvm-19" >> $GITHUB_ENV
+          sudo ./llvm.sh 20
+          sudo apt-get install -y llvm-20-dev libpolly-20-dev
+          echo "LLVM_SYS_200_PREFIX=/usr/lib/llvm-20" >> $GITHUB_ENV
       - name: Install bpf-linker
-        run: cargo install bpf-linker --no-default-features --features llvm-19
+        run: cargo install bpf-linker --no-default-features --features llvm-20
       - name: Build eBPF artifacts
         run: cargo xtask build-ebpf
 

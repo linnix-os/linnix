@@ -123,7 +123,7 @@ jobs:
   test-docker-compose:
     name: Test Docker Compose Setup
     runs-on: ubuntu-latest
-    # Build images locally instead of pulling from registry to avoid manifest delays
+    needs: [build-cognitod, build-llama-cpp]
     if: github.event_name == 'pull_request' || github.event_name == 'push'
 
     steps:
