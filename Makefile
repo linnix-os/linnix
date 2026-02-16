@@ -1,4 +1,4 @@
-.PHONY: test release
+.PHONY: test
 
 test:
 	RUSTFLAGS="-D warnings" cargo nextest run --workspace --profile default
@@ -6,6 +6,3 @@ test:
 	cargo fmt --all -- --check
 	cargo clippy --all-targets --all-features -- -D warnings
 	cargo deny check
-
-release:
-	./scripts/release.sh
