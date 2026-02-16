@@ -32,6 +32,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Container Registry
+        if: github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -61,7 +62,7 @@ jobs:
           # TODO: ARM64 support blocked by bpf-linker LLVM issues in QEMU
           # See: https://github.com/aya-rs/bpf-linker/issues
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork != true }}
+          push: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -85,6 +86,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Container Registry
+        if: github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -112,7 +114,7 @@ jobs:
           context: ./docker/llama-cpp
           file: ./docker/llama-cpp/Dockerfile
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork != true }}
+          push: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -121,7 +123,7 @@ jobs:
   test-docker-compose:
     name: Test Docker Compose Setup
     runs-on: ubuntu-latest
-    # Build images locally instead of pulling from registry to avoid manifest delays
+    needs: [build-cognitod, build-llama-cpp]
     if: github.event_name == 'pull_request' || github.event_name == 'push'
 
     steps:
@@ -129,9 +131,20 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork
         uses: docker/setup-buildx-action@v3
 
+      - name: Determine image source
+        id: image_source
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" && "${{ github.event.pull_request.head.repo.fork }}" == "true" ]]; then
+            echo "use_local_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "use_local_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build cognitod image locally
+        if: steps.image_source.outputs.use_local_build == 'true'
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -142,6 +155,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Build llama-cpp image locally
+        if: steps.image_source.outputs.use_local_build == 'true'
         uses: docker/build-push-action@v5
         with:
           context: ./docker/llama-cpp
@@ -157,9 +171,17 @@ jobs:
 
       - name: Start services
         run: |
-          # Use locally built images for testing
-          export COGNITOD_IMAGE=linnix-cognitod:test
-          export LLAMA_IMAGE=linnix-llama:test
+          if [[ "${{ steps.image_source.outputs.use_local_build }}" == "true" ]]; then
+            echo "Using locally built test images for fork PR"
+            export COGNITOD_IMAGE=linnix-cognitod:test
+            export LLAMA_IMAGE=linnix-llama:test
+          else
+            echo "Using published SHA images from registry"
+            export COGNITOD_IMAGE=ghcr.io/${{ env.COGNITOD_IMAGE_NAME }}:${{ github.sha }}
+            export LLAMA_IMAGE=ghcr.io/${{ env.LLAMA_IMAGE_NAME }}:${{ github.sha }}
+            docker pull "$COGNITOD_IMAGE"
+            docker pull "$LLAMA_IMAGE"
+          fi
           docker compose up -d
 
       - name: Wait for services
