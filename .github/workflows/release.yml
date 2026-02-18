@@ -11,7 +11,7 @@ permissions:
 jobs:
   build-packages:
     name: Build Packages
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
         include:
@@ -19,11 +19,12 @@ jobs:
             rust_target: x86_64-unknown-linux-gnu
             deb_arch: amd64
             rpm_arch: x86_64
-          # ARM64 support coming in v0.2.0 (requires QEMU/cross setup)
-          # - arch: aarch64
-          #   rust_target: aarch64-unknown-linux-gnu
-          #   deb_arch: arm64
-          #   rpm_arch: aarch64
+            runner: ubuntu-latest
+          - arch: aarch64
+            rust_target: aarch64-unknown-linux-gnu
+            deb_arch: arm64
+            rpm_arch: aarch64
+            runner: ubuntu-22.04-arm
     
     steps:
       - name: Checkout code
@@ -43,19 +44,19 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ matrix.runner }}-${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache cargo index
         uses: actions/cache@v4
         with:
           path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ matrix.runner }}-${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache target directory
         uses: actions/cache@v4
         with:
           path: target
-          key: ${{ runner.os }}-target-${{ matrix.rust_target }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ matrix.runner }}-${{ runner.os }}-target-${{ matrix.rust_target }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build cognitod
         run: |
@@ -163,6 +164,8 @@ jobs:
           # Create 'latest' symlinks for x86_64 only (ARM64 coming in v0.2.0)
           ln -s cognitod_${VERSION}_amd64.deb cognitod_amd64.deb
           ln -s cognitod-${VERSION}.x86_64.rpm cognitod.x86_64.rpm
+          ln -s cognitod_${VERSION}_arm64.deb cognitod_arm64.deb
+          ln -s cognitod-${VERSION}.aarch64.rpm cognitod.aarch64.rpm
 
       - name: Generate release notes
         id: release_notes
@@ -202,7 +205,19 @@ jobs:
           
           ### ARM64 Support
           
-          ARM64 packages coming in v0.2.0 (Q1 2026).
+          \`\`\`bash
+          wget https://github.com/linnix-os/linnix/releases/latest/download/cognitod_arm64.deb
+          sudo dpkg -i cognitod_arm64.deb
+          sudo systemctl start cognitod
+          \`\`\`
+          
+          ### RHEL/CentOS/Fedora
+          
+          \`\`\`bash
+          wget https://github.com/linnix-os/linnix/releases/latest/download/cognitod.aarch64.rpm
+          sudo rpm -i cognitod.aarch64.rpm
+          sudo systemctl start cognitod
+          \`\`\`
           
           ## 🤖 AI Model
           

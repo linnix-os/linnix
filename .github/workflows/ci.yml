@@ -6,7 +6,12 @@ on:
 
 jobs:
   test-unit:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+          - runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
     env:
       RUSTFLAGS: -D warnings
     steps:
@@ -24,7 +29,12 @@ jobs:
         run: cargo nextest run --workspace --profile default
 
   test-e2e:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+          - runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
     env:
       RUSTFLAGS: -D warnings
     steps:
@@ -62,7 +72,12 @@ jobs:
         run: cargo deny check
 
   test-ebpf:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+          - runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - name: Set up Rust (nightly for eBPF)
