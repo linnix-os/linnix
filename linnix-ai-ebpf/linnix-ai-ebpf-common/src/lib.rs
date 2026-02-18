@@ -326,6 +326,38 @@ pub enum EventType {
     Syscall = 5,
     BlockIo = 6,
     PageFault = 7,
+    Cuda = 8, // CUDA API calls via uprobe
+}
+
+/// CUDA operation type for GPU tracing via uprobes
+#[repr(u32)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "user", derive(serde::Serialize, serde::Deserialize))]
+pub enum CudaOp {
+    /// cudaMalloc - GPU memory allocation
+    Malloc = 0,
+    /// cudaFree - GPU memory deallocation
+    Free = 1,
+    /// cudaLaunchKernel - Kernel execution start
+    LaunchKernel = 2,
+    /// cudaMemcpy host-to-device
+    MemcpyHtoD = 3,
+    /// cudaMemcpy device-to-host
+    MemcpyDtoH = 4,
+    /// cudaMemcpy device-to-device  
+    MemcpyDtoD = 5,
+}
+
+impl CudaOp {
+    /// Convert from cudaMemcpyKind enum value
+    pub fn from_memcpy_kind(kind: u32) -> Self {
+        match kind {
+            1 => CudaOp::MemcpyHtoD,
+            2 => CudaOp::MemcpyDtoH,
+            3 => CudaOp::MemcpyDtoD,
+            _ => CudaOp::MemcpyHtoD, // Default to HtoD
+        }
+    }
 }
 
 #[cfg(all(feature = "user", not(target_os = "none")))]

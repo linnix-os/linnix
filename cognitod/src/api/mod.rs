@@ -1605,6 +1605,83 @@ fn probe_mode_label(mode: u8) -> &'static str {
     }
 }
 
+/// GPU metrics endpoint handler
+/// Returns current GPU snapshots for all detected NVIDIA GPUs
+#[cfg(feature = "gpu")]
+async fn get_gpu_metrics(State(app_state): State<Arc<AppState>>) -> impl IntoResponse {
+    use cognitod::collectors::gpu::GpuSnapshot;
+
+    if let Some(ref gpu_data) = app_state.gpu_data {
+        let snapshots = gpu_data.read().await;
+        Json(snapshots.clone())
+    } else {
+        // GPU monitoring not initialized
+        Json(Vec::<GpuSnapshot>::new())
+    }
+}
+
+/// GPU process with enriched CPU/memory data from ContextStore
+#[cfg(feature = "gpu")]
+#[derive(Serialize)]
+struct GpuProcessFull {
+    pid: u32,
+    comm: String,
+    gpu_memory_mb: u64,
+    gpu_index: u32,
+    cpu_percent: Option<f32>,
+    mem_percent: Option<f32>,
+    pod_name: Option<String>,
+    namespace: Option<String>,
+}
+
+/// GPU processes endpoint - joins GPU process data with ContextStore
+/// Returns GPU processes enriched with CPU/memory stats
+#[cfg(feature = "gpu")]
+async fn get_gpu_processes(State(app_state): State<Arc<AppState>>) -> impl IntoResponse {
+    let mut results: Vec<GpuProcessFull> = Vec::new();
+
+    if let Some(ref gpu_data) = app_state.gpu_data {
+        let snapshots = gpu_data.read().await;
+        let ctx = &app_state.context;
+
+        for snapshot in snapshots.iter() {
+            for proc in &snapshot.processes {
+                // Try to get CPU/memory stats from ContextStore
+                let (cpu_pct, mem_pct) = if let Some(event) = ctx.get_process_by_pid(proc.pid) {
+                    (event.cpu_percent(), event.mem_percent())
+                } else {
+                    (None, None)
+                };
+
+                // Try to get process name from ContextStore or /proc
+                let comm = if let Some(event) = ctx.get_process_by_pid(proc.pid) {
+                    String::from_utf8_lossy(&event.comm)
+                        .trim_end_matches('\0')
+                        .to_string()
+                } else {
+                    // Fallback: read from /proc
+                    std::fs::read_to_string(format!("/proc/{}/comm", proc.pid))
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_else(|_| format!("pid-{}", proc.pid))
+                };
+
+                results.push(GpuProcessFull {
+                    pid: proc.pid,
+                    comm,
+                    gpu_memory_mb: proc.used_gpu_memory_mb,
+                    gpu_index: snapshot.device.index,
+                    cpu_percent: cpu_pct,
+                    mem_percent: mem_pct,
+                    pod_name: proc.pod_name.clone(),
+                    namespace: proc.namespace.clone(),
+                });
+            }
+        }
+    }
+
+    Json(results)
+}
+
 pub struct AppState {
     pub context: Arc<ContextStore>,
     pub metrics: Arc<Metrics>,
@@ -1620,6 +1697,9 @@ pub struct AppState {
     pub enforcement: Option<Arc<crate::enforcement::EnforcementQueue>>,
     pub incident_store: Option<Arc<IncidentStore>>,
     pub k8s: Option<Arc<cognitod::k8s::K8sContext>>,
+    /// GPU metrics data (only populated when gpu feature is enabled)
+    #[cfg(feature = "gpu")]
+    pub gpu_data: Option<cognitod::collectors::gpu::GpuData>,
 }
 
 pub fn all_routes(app_state: Arc<AppState>) -> Router {
@@ -1660,6 +1740,14 @@ pub fn all_routes(app_state: Arc<AppState>) -> Router {
         .route("/actions/{id}", get(get_action_by_id))
         .route("/actions/{id}/approve", axum::routing::post(approve_action))
         .route("/actions/{id}/reject", axum::routing::post(reject_action));
+
+    // GPU metrics endpoint (only when gpu feature is enabled)
+    #[cfg(feature = "gpu")]
+    {
+        router = router
+            .route("/gpu", get(get_gpu_metrics))
+            .route("/gpu/processes", get(get_gpu_processes));
+    }
 
     if prometheus_enabled {
         router = router.route("/metrics/prometheus", get(prometheus_metrics));
@@ -2201,6 +2289,8 @@ mod tests {
             auth_token: None,
             incident_store: None,
             k8s: None,
+            #[cfg(feature = "gpu")]
+            gpu_data: None,
         });
         let Json(resp) = super::status_handler(State(app_state)).await;
         let val = serde_json::to_value(resp).unwrap();
@@ -2249,6 +2339,8 @@ mod tests {
             auth_token: None,
             incident_store: None,
             k8s: None,
+            #[cfg(feature = "gpu")]
+            gpu_data: None,
         });
 
         let Json(resp) = super::metrics_handler(State(app_state)).await;
@@ -2280,6 +2372,8 @@ mod tests {
             auth_token: None,
             incident_store: None,
             k8s: None,
+            #[cfg(feature = "gpu")]
+            gpu_data: None,
         });
         let router = super::all_routes(Arc::clone(&app_state));
         let response = router
@@ -2314,6 +2408,8 @@ mod tests {
             auth_token: None,
             incident_store: None,
             k8s: None,
+            #[cfg(feature = "gpu")]
+            gpu_data: None,
         });
         let router = super::all_routes(Arc::clone(&app_state));
         let response = router
@@ -2362,6 +2458,8 @@ mod tests {
             auth_token: None,
             incident_store: None,
             k8s: None,
+            #[cfg(feature = "gpu")]
+            gpu_data: None,
         });
         let router = super::all_routes(app_state);
         let response = router
@@ -2395,6 +2493,8 @@ mod tests {
             incident_store: None,
             auth_token: Some("secret123".to_string()),
             k8s: None,
+            #[cfg(feature = "gpu")]
+            gpu_data: None,
         });
         let router = super::all_routes(app_state);
         let response = router
@@ -2428,6 +2528,8 @@ mod tests {
             incident_store: None,
             auth_token: Some("secret123".to_string()),
             k8s: None,
+            #[cfg(feature = "gpu")]
+            gpu_data: None,
         });
         let router = super::all_routes(app_state);
         let response = router
@@ -2462,6 +2564,8 @@ mod tests {
             incident_store: None,
             auth_token: Some("secret123".to_string()),
             k8s: None,
+            #[cfg(feature = "gpu")]
+            gpu_data: None,
         });
         let router = super::all_routes(app_state);
         let response = router
@@ -2496,6 +2600,8 @@ mod tests {
             incident_store: None,
             auth_token: Some("secret123".to_string()),
             k8s: None,
+            #[cfg(feature = "gpu")]
+            gpu_data: None,
         });
         let router = super::all_routes(app_state);
         let response = router

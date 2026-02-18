@@ -83,6 +83,8 @@ pub struct Config {
     pub privacy: PrivacyConfig,
     #[serde(default)]
     pub psi: PsiConfig,
+    #[serde(default)]
+    pub gpu: GpuConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -331,6 +333,34 @@ impl Default for PsiConfig {
 
 fn default_psi_sustained_pressure_seconds() -> u64 {
     15
+}
+
+/// GPU monitoring configuration
+#[derive(Debug, Deserialize, Clone)]
+pub struct GpuConfig {
+    /// Enable GPU monitoring (requires NVIDIA GPU with NVML)
+    #[serde(default = "default_gpu_enabled")]
+    pub enabled: bool,
+    /// Polling interval in milliseconds
+    #[serde(default = "default_gpu_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+}
+
+impl Default for GpuConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_gpu_enabled(),
+            poll_interval_ms: default_gpu_poll_interval_ms(),
+        }
+    }
+}
+
+fn default_gpu_enabled() -> bool {
+    true
+}
+
+fn default_gpu_poll_interval_ms() -> u64 {
+    100 // 100ms as specified in GPU roadmap
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
