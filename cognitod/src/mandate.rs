@@ -865,8 +865,10 @@ impl MandateManager {
             &batch.mandates
         };
 
-        let total = mandates.len().min(MAX_BATCH_SIZE);
-        let mut results = Vec::with_capacity(total);
+        // Use the constant cap for allocation — `mandates` is already truncated
+        // to MAX_BATCH_SIZE above, so this is the true upper bound.
+        let total = mandates.len();
+        let mut results = Vec::with_capacity(MAX_BATCH_SIZE);
         let mut succeeded = 0usize;
         let mut failed = 0usize;
 
