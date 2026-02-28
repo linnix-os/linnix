@@ -1353,12 +1353,69 @@ async fn create_mandate(
         ));
     }
 
+    // §8.5 Spend-limit check: if the mandate has a spend cap, verify it
+    // doesn't exceed any configured limit (per-mandate, hourly, daily, monthly).
+    if let Some(amount_cents) = req.max_spend_cents {
+        if let Some(ref tracker) = state.spend_tracker {
+            if let Err(violation) = tracker
+                .check_spend(amount_cents, req.counterparty_did.as_deref())
+                .await
+            {
+                state.claw_metrics.inc_rejected();
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({
+                        "error": "spend_limit_exceeded",
+                        "message": violation.to_string()
+                    })),
+                ));
+            }
+        }
+    }
+
+    // §10.3 Compliance screening: if the mandate has commerce fields,
+    // run OFAC/KYT/jurisdiction checks before creating the mandate.
+    if req.is_commerce_request() {
+        if let Some(ref engine) = state.compliance_engine {
+            if let Some(ref did) = req.counterparty_did {
+                let results = engine
+                    .pre_task_screen(
+                        did,
+                        req.wallet_address.as_deref(),
+                        req.jurisdiction.as_deref(),
+                        req.max_spend_cents.unwrap_or(0),
+                    )
+                    .await;
+                if cognitod::compliance::ComplianceEngine::has_hard_block(&results) {
+                    state.claw_metrics.inc_rejected();
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        Json(json!({
+                            "error": "compliance_blocked",
+                            "message": "counterparty failed compliance screening"
+                        })),
+                    ));
+                }
+            }
+        }
+    }
+
     let t0 = std::time::Instant::now();
-    match mgr.create(req).await {
+    match mgr.create(req.clone()).await {
         Ok(resp) => {
             let elapsed_ns = t0.elapsed().as_nanos() as u64;
             state.claw_metrics.observe_mandate_latency_ns(elapsed_ns);
             state.claw_metrics.inc_created();
+
+            // Record spend after successful mandate creation (§8.5).
+            if let Some(amount_cents) = req.max_spend_cents {
+                if let Some(ref tracker) = state.spend_tracker {
+                    tracker
+                        .record_spend(amount_cents, req.counterparty_did.clone())
+                        .await;
+                }
+            }
+
             Ok((StatusCode::CREATED, Json(resp)))
         }
         Err(e) => {
@@ -1415,7 +1472,28 @@ async fn get_mandate_receipt(
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": "receipt not yet available"})),
             ))?;
-            Ok(Json(serde_json::to_value(&receipt).unwrap_or_default()))
+            let mut receipt_json = serde_json::to_value(&receipt).unwrap_or_default();
+
+            // §9 Privacy redaction: redact binary path at read-time to
+            // preserve the unredacted audit trail in memory.
+            if let Some(ref redactor) = state.receipt_redactor {
+                if let Some(exec) = receipt_json.get_mut("execution") {
+                    if let Some(binary) = exec
+                        .get("binary")
+                        .and_then(|b| b.as_str())
+                        .map(String::from)
+                    {
+                        if let Some(obj) = exec.as_object_mut() {
+                            obj.insert(
+                                "binary".to_string(),
+                                serde_json::Value::String(redactor.redact_binary(&binary)),
+                            );
+                        }
+                    }
+                }
+            }
+
+            Ok(Json(receipt_json))
         }
         _ => Err((
             StatusCode::NOT_FOUND,
@@ -1872,6 +1950,12 @@ pub struct AppState {
     pub commerce_policy: Option<cognitod::commerce::CommercePolicy>,
     /// Claw SLO metrics (§10.5).
     pub claw_metrics: Arc<cognitod::claw_metrics::ClawMetrics>,
+    /// Spend-limit tracker (§8.5).
+    pub spend_tracker: Option<Arc<cognitod::spend::SpendTracker>>,
+    /// OFAC/KYT/Travel Rule compliance engine (§10.3).
+    pub compliance_engine: Option<Arc<cognitod::compliance::ComplianceEngine>>,
+    /// Privacy redactor for receipt responses (§9).
+    pub receipt_redactor: Option<cognitod::privacy::ReceiptRedactor>,
 }
 
 pub fn all_routes(app_state: Arc<AppState>) -> Router {
@@ -2524,6 +2608,9 @@ mod tests {
             mandate: None,
             identity: None,
             commerce_policy: None,
+            spend_tracker: None,
+            compliance_engine: None,
+            receipt_redactor: None,
             claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
         let Json(resp) = super::status_handler(State(app_state)).await;
@@ -2576,6 +2663,9 @@ mod tests {
             mandate: None,
             identity: None,
             commerce_policy: None,
+            spend_tracker: None,
+            compliance_engine: None,
+            receipt_redactor: None,
             claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
 
@@ -2611,6 +2701,9 @@ mod tests {
             mandate: None,
             identity: None,
             commerce_policy: None,
+            spend_tracker: None,
+            compliance_engine: None,
+            receipt_redactor: None,
             claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
         let router = super::all_routes(Arc::clone(&app_state));
@@ -2649,6 +2742,9 @@ mod tests {
             mandate: None,
             identity: None,
             commerce_policy: None,
+            spend_tracker: None,
+            compliance_engine: None,
+            receipt_redactor: None,
             claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
         let router = super::all_routes(Arc::clone(&app_state));
@@ -2701,6 +2797,9 @@ mod tests {
             mandate: None,
             identity: None,
             commerce_policy: None,
+            spend_tracker: None,
+            compliance_engine: None,
+            receipt_redactor: None,
             claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
         let router = super::all_routes(app_state);
@@ -2738,6 +2837,9 @@ mod tests {
             mandate: None,
             identity: None,
             commerce_policy: None,
+            spend_tracker: None,
+            compliance_engine: None,
+            receipt_redactor: None,
             claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
         let router = super::all_routes(app_state);
@@ -2775,6 +2877,9 @@ mod tests {
             mandate: None,
             identity: None,
             commerce_policy: None,
+            spend_tracker: None,
+            compliance_engine: None,
+            receipt_redactor: None,
             claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
         let router = super::all_routes(app_state);
@@ -2813,6 +2918,9 @@ mod tests {
             mandate: None,
             identity: None,
             commerce_policy: None,
+            spend_tracker: None,
+            compliance_engine: None,
+            receipt_redactor: None,
             claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
         let router = super::all_routes(app_state);
@@ -2851,6 +2959,9 @@ mod tests {
             mandate: None,
             identity: None,
             commerce_policy: None,
+            spend_tracker: None,
+            compliance_engine: None,
+            receipt_redactor: None,
             claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
         let router = super::all_routes(app_state);
@@ -2895,6 +3006,9 @@ mod tests {
             mandate: Some(Arc::new(mgr)),
             identity: None,
             commerce_policy: None,
+            spend_tracker: None,
+            compliance_engine: None,
+            receipt_redactor: None,
             claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         })
     }
@@ -2940,6 +3054,9 @@ mod tests {
             mandate: None,
             identity: None,
             commerce_policy: None,
+            spend_tracker: None,
+            compliance_engine: None,
+            receipt_redactor: None,
             claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
         let router = super::all_routes(app_state);

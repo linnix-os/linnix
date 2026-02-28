@@ -34,6 +34,9 @@ async fn create_and_retrieve_mandate() {
         monitor_only: false,
         task_id: None,
         max_spend_cents: None,
+        counterparty_did: None,
+        wallet_address: None,
+        jurisdiction: None,
     };
 
     let resp = mgr.create(req).await.expect("create must succeed");
@@ -61,6 +64,9 @@ async fn revoke_mandate() {
         monitor_only: false,
         task_id: None,
         max_spend_cents: None,
+        counterparty_did: None,
+        wallet_address: None,
+        jurisdiction: None,
     };
 
     let resp = mgr.create(req).await.unwrap();
@@ -117,6 +123,9 @@ async fn stats_reflect_creates_and_revokes() {
         monitor_only: false,
         task_id: None,
         max_spend_cents: None,
+        counterparty_did: None,
+        wallet_address: None,
+        jurisdiction: None,
     };
 
     // Create 3 mandates (different args to get distinct keys)
@@ -130,6 +139,9 @@ async fn stats_reflect_creates_and_revokes() {
         monitor_only: false,
         task_id: None,
         max_spend_cents: None,
+        counterparty_did: None,
+        wallet_address: None,
+        jurisdiction: None,
     };
     let _r2 = mgr.create(req2).await.unwrap();
 
@@ -141,6 +153,9 @@ async fn stats_reflect_creates_and_revokes() {
         monitor_only: false,
         task_id: None,
         max_spend_cents: None,
+        counterparty_did: None,
+        wallet_address: None,
+        jurisdiction: None,
     };
     let _r3 = mgr.create(req3).await.unwrap();
 
@@ -184,6 +199,9 @@ async fn list_filters_by_status() {
         monitor_only: false,
         task_id: None,
         max_spend_cents: None,
+        counterparty_did: None,
+        wallet_address: None,
+        jurisdiction: None,
     };
     let resp = mgr.create(req).await.unwrap();
 
@@ -195,6 +213,9 @@ async fn list_filters_by_status() {
         monitor_only: false,
         task_id: None,
         max_spend_cents: None,
+        counterparty_did: None,
+        wallet_address: None,
+        jurisdiction: None,
     };
     let _resp2 = mgr.create(req2).await.unwrap();
 
@@ -230,6 +251,9 @@ async fn reconcile_removes_expired() {
         monitor_only: false,
         task_id: None,
         max_spend_cents: None,
+        counterparty_did: None,
+        wallet_address: None,
+        jurisdiction: None,
     };
     mgr.create(req).await.unwrap();
 
@@ -264,6 +288,9 @@ async fn monitor_only_sets_flag() {
         monitor_only: true,
         task_id: None,
         max_spend_cents: None,
+        counterparty_did: None,
+        wallet_address: None,
+        jurisdiction: None,
     };
     let resp = mgr.create(req).await.unwrap();
     assert_eq!(resp.status, MandateStatus::Active);
@@ -284,6 +311,9 @@ async fn multiple_mandates_same_pid_different_args() {
         monitor_only: false,
         task_id: None,
         max_spend_cents: None,
+        counterparty_did: None,
+        wallet_address: None,
+        jurisdiction: None,
     };
     let req2 = MandateRequest {
         pid,
@@ -293,6 +323,9 @@ async fn multiple_mandates_same_pid_different_args() {
         monitor_only: false,
         task_id: None,
         max_spend_cents: None,
+        counterparty_did: None,
+        wallet_address: None,
+        jurisdiction: None,
     };
 
     let r1 = mgr.create(req1).await.unwrap();

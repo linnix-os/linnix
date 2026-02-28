@@ -211,6 +211,15 @@ pub struct MandateRequest {
     /// Spend cap for this mandate in USD cents (§8.5). Tracked by cognitod.
     #[serde(default)]
     pub max_spend_cents: Option<u64>,
+    /// Counterparty DID for compliance screening (§10.3).
+    #[serde(default)]
+    pub counterparty_did: Option<String>,
+    /// Wallet address for KYT screening (§10.3).
+    #[serde(default)]
+    pub wallet_address: Option<String>,
+    /// Jurisdiction code for sanctions screening (§10.3).
+    #[serde(default)]
+    pub jurisdiction: Option<String>,
 }
 
 impl MandateRequest {
@@ -300,6 +309,8 @@ struct MandateRecord {
     args: Vec<String>,
     status: MandateStatus,
     created_at: Instant,
+    /// Wall-clock expiry time (Unix timestamp ms) for API responses.
+    expires_at_ms: u64,
     /// If the mandate has been written to the BPF map.
     bpf_committed: bool,
     /// Signed execution receipt (populated after mandate execution completes).
@@ -338,6 +349,11 @@ pub struct MandateManager {
     /// Active mandates indexed by their API-level ID.
     mandates: RwLock<HashMap<MandateId, MandateRecord>>,
 
+    /// Reverse index: mandate_seq → mandate_id.
+    /// Populated on create(), cleaned up on reconcile().
+    /// Allows the MandateReceiptHandler to look up mandates from kernel events.
+    seq_to_id: RwLock<HashMap<u64, MandateId>>,
+
     /// SipHash-2-4 key (128-bit: [k0, k1]).
     siphash_key: [u64; 2],
 
@@ -374,6 +390,7 @@ impl MandateManager {
     pub fn new(siphash_key: [u64; 2], bpf_available: bool, mode: MandateMode) -> Self {
         Self {
             mandates: RwLock::new(HashMap::new()),
+            seq_to_id: RwLock::new(HashMap::new()),
             siphash_key,
             bpf_available,
             mode,
@@ -440,6 +457,9 @@ impl MandateManager {
     /// Canonical form (per specs.md §1.1.1):
     ///   arg0 \x00 arg1 \x00 arg2 \x00 ...
     /// UTF-8 encoded, NUL-separated, no trailing NUL.
+    ///
+    /// NOTE: This hashes ALL args. For BPF map keys, use [`hash_filename`]
+    /// which matches the kernel LSM hook's hashing (filename only).
     pub fn hash_args(&self, args: &[String]) -> u64 {
         let mut hasher = SipHasher::new(self.siphash_key[0], self.siphash_key[1]);
         for (i, arg) in args.iter().enumerate() {
@@ -451,11 +471,30 @@ impl MandateManager {
         hasher.finish()
     }
 
+    /// Compute the BPF-map-compatible hash using only the first argument
+    /// (the binary filename / resolved path).
+    ///
+    /// The kernel LSM hook (`bprm_check_security`) hashes only
+    /// `linux_binprm->filename` — the resolved binary path — not the full
+    /// argv.  This method MUST produce the same hash so that mandate
+    /// lookups in the BPF map succeed.
+    pub fn hash_filename(&self, args: &[String]) -> u64 {
+        let mut hasher = SipHasher::new(self.siphash_key[0], self.siphash_key[1]);
+        if let Some(filename) = args.first() {
+            hasher.write(filename.as_bytes());
+        }
+        hasher.finish()
+    }
+
     /// Read the start_time_ns for a process from /proc/<pid>/stat.
     ///
     /// Field 22 is `starttime` in clock ticks since boot.
     /// Converted to nanoseconds via `ticks * (1e9 / CLK_TCK)`.
     fn read_start_time_ns(pid: u32) -> Result<u64> {
+        if pid == 0 {
+            return Err(anyhow!("invalid PID 0"));
+        }
+        // pid is u32 — format! produces only digits, so the path is safe.
         let stat_path = format!("/proc/{}/stat", pid);
         let stat_content = std::fs::read_to_string(&stat_path)
             .with_context(|| format!("failed to read {}", stat_path))?;
@@ -508,6 +547,11 @@ impl MandateManager {
     pub fn resolve_container_pid(container_pid: u32, container_id: &str) -> Result<u32> {
         if container_id.len() < 12 {
             return Err(anyhow!("container_id must be at least 12 hex chars"));
+        }
+        // Validate container_id contains only hex characters to prevent
+        // injection via cgroup path matching.
+        if !container_id.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(anyhow!("container_id must contain only hex characters"));
         }
 
         let prefix = &container_id[..12];
@@ -581,7 +625,30 @@ impl MandateManager {
     /// - The PID doesn't exist
     /// - Backpressure is active (map > 80% full)
     /// - The process start time can't be read
+    /// - The args list is empty or exceeds size limits
     pub async fn create(&self, req: MandateRequest) -> Result<MandateResponse> {
+        // Validate args to prevent unbounded allocation from user input.
+        const MAX_ARGS: usize = 128;
+        const MAX_ARG_BYTES: usize = 4096;
+        if req.args.is_empty() {
+            return Err(anyhow!("args must not be empty"));
+        }
+        if req.args.len() > MAX_ARGS {
+            return Err(anyhow!(
+                "too many args ({}, max {})",
+                req.args.len(),
+                MAX_ARGS
+            ));
+        }
+        let total_bytes: usize = req.args.iter().map(|a| a.len()).sum();
+        if total_bytes > MAX_ARG_BYTES {
+            return Err(anyhow!(
+                "total args size {} bytes exceeds max {} bytes",
+                total_bytes,
+                MAX_ARG_BYTES
+            ));
+        }
+
         // Check backpressure
         if self.is_backpressure_active() {
             return Err(anyhow!(
@@ -608,8 +675,9 @@ impl MandateManager {
         let start_time_ns = Self::read_start_time_ns(effective_pid)
             .with_context(|| format!("PID {} does not exist or is not readable", effective_pid))?;
 
-        // Hash the command args
-        let cmd_hash = self.hash_args(&req.args);
+        // Hash only the filename (first arg) for the BPF map key.
+        // This matches the kernel LSM hook which hashes binprm->filename only.
+        let cmd_hash = self.hash_filename(&req.args);
 
         // Build the key
         let key = MandateKey {
@@ -658,6 +726,7 @@ impl MandateManager {
             args: req.args,
             status: MandateStatus::Active,
             created_at: Instant::now(),
+            expires_at_ms,
             bpf_committed: self.bpf_available, // mark as committed if BPF is available
             receipt: None,
         };
@@ -678,6 +747,12 @@ impl MandateManager {
         {
             let mut mandates = self.mandates.write().await;
             mandates.insert(id.clone(), record);
+        }
+
+        // Populate reverse index for kernel event → mandate ID lookups.
+        {
+            let mut seq_map = self.seq_to_id.write().await;
+            seq_map.insert(seq, id.clone());
         }
 
         // Write to BPF MANDATE_MAP so the LSM hook can enforce this mandate.
@@ -706,11 +781,6 @@ impl MandateManager {
         let mandates = self.mandates.read().await;
         let record = mandates.get(id)?;
 
-        let expires_at_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
         Some(MandateResponse {
             id: record.id.clone(),
             key: MandateKeyInfo {
@@ -718,7 +788,7 @@ impl MandateManager {
                 start_time_ns: record.key.start_time_ns,
                 cmd_hash: record.key.cmd_hash,
             },
-            expires_at_ms,
+            expires_at_ms: record.expires_at_ms,
             status: record.status.clone(),
             enforced: self.bpf_available && self.mode == MandateMode::Enforce,
             enforcement_mode: self.enforcement_mode_str().to_string(),
@@ -874,6 +944,27 @@ impl MandateManager {
         mandates.get(id).map(|r| r.status.clone())
     }
 
+    /// Look up a mandate ID by its kernel sequence number.
+    ///
+    /// Used by MandateReceiptHandler to resolve kernel MandateAllow events
+    /// (which carry mandate_seq) back to the API-level mandate ID.
+    pub async fn find_id_by_seq(&self, seq: u64) -> Option<MandateId> {
+        let seq_map = self.seq_to_id.read().await;
+        seq_map.get(&seq).cloned()
+    }
+
+    /// Get the execution data needed to build a receipt for a mandate.
+    ///
+    /// Returns `(args, mandate_seq)` if the mandate exists and is active.
+    pub async fn get_execution_data(&self, id: &str) -> Option<(Vec<String>, u64)> {
+        let mandates = self.mandates.read().await;
+        let record = mandates.get(id)?;
+        if record.status != MandateStatus::Active {
+            return None;
+        }
+        Some((record.args.clone(), record.value.mandate_seq))
+    }
+
     /// Run the reconciliation loop — scans all mandates and evicts expired ones.
     /// Called every MANDATE_RECONCILE_INTERVAL_SECS by a background task.
     pub async fn reconcile(&self) -> usize {
@@ -883,11 +974,11 @@ impl MandateManager {
             .unwrap_or(0);
 
         let mut mandates = self.mandates.write().await;
-        let mut to_expire: Vec<(MandateId, MandateKey)> = Vec::new();
+        let mut to_expire: Vec<(MandateId, MandateKey, u64)> = Vec::new();
 
         for (id, record) in mandates.iter() {
             if record.status == MandateStatus::Active && now_ns >= record.value.expires_ns {
-                to_expire.push((id.clone(), record.key));
+                to_expire.push((id.clone(), record.key, record.value.mandate_seq));
             }
         }
 
@@ -898,7 +989,7 @@ impl MandateManager {
             {
                 let mut bpf_guard = self.bpf_mandate_map.lock().await;
                 if let Some(ref mut bpf_map) = *bpf_guard {
-                    for (id, key) in &to_expire {
+                    for (id, key, _seq) in &to_expire {
                         if let Err(e) = bpf_map.remove(&BpfMandateKey(*key)) {
                             // Key may already have been evicted by LRU; not an error.
                             debug!("[mandate] BPF map remove on expire (mandate={}): {}", id, e);
@@ -907,7 +998,15 @@ impl MandateManager {
                 }
             }
 
-            for (id, _key) in &to_expire {
+            // Clean up seq_to_id reverse index for expired mandates.
+            {
+                let mut seq_map = self.seq_to_id.write().await;
+                for (_id, _key, seq) in &to_expire {
+                    seq_map.remove(seq);
+                }
+            }
+
+            for (id, _key, _seq) in &to_expire {
                 if let Some(record) = mandates.get_mut(id) {
                     record.status = MandateStatus::Expired;
                 }
@@ -973,10 +1072,6 @@ impl MandateManager {
     /// List all mandates (optionally filtered by status).
     pub async fn list(&self, status_filter: Option<MandateStatus>) -> Vec<MandateResponse> {
         let mandates = self.mandates.read().await;
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
 
         mandates
             .values()
@@ -988,7 +1083,7 @@ impl MandateManager {
                     start_time_ns: r.key.start_time_ns,
                     cmd_hash: r.key.cmd_hash,
                 },
-                expires_at_ms: now_ms,
+                expires_at_ms: r.expires_at_ms,
                 status: r.status.clone(),
                 enforced: self.bpf_available && self.mode == MandateMode::Enforce,
                 enforcement_mode: self.enforcement_mode_str().to_string(),
@@ -1060,6 +1155,101 @@ mod tests {
     }
 
     #[test]
+    fn test_hash_filename_matches_first_arg_only() {
+        let mgr = MandateManager::new([0xdeadbeef, 0xcafebabe], false, MandateMode::Monitor);
+
+        // hash_filename should only use the first arg
+        let args_full = vec![
+            "/usr/bin/curl".to_string(),
+            "https://example.com".to_string(),
+        ];
+        let args_cmd_only = vec!["/usr/bin/curl".to_string()];
+        assert_eq!(
+            mgr.hash_filename(&args_full),
+            mgr.hash_filename(&args_cmd_only),
+            "hash_filename should ignore args beyond the first"
+        );
+
+        // hash_filename should differ from hash_args for multi-arg inputs
+        assert_ne!(
+            mgr.hash_filename(&args_full),
+            mgr.hash_args(&args_full),
+            "hash_filename and hash_args should differ for multi-arg inputs"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_returns_stored_expiry() {
+        let mgr = MandateManager::new([1, 2], false, MandateMode::Monitor);
+        let ttl_ms = 60_000u64;
+
+        let req = MandateRequest {
+            pid: std::process::id(),
+            args: vec!["test".to_string()],
+            ttl_ms,
+            container_id: None,
+            monitor_only: false,
+            task_id: None,
+            max_spend_cents: None,
+            counterparty_did: None,
+            wallet_address: None,
+            jurisdiction: None,
+        };
+
+        let resp = mgr.create(req).await.unwrap();
+        let fetched = mgr.get(&resp.id).await.unwrap();
+
+        // expires_at_ms from get() should match create() response
+        assert_eq!(fetched.expires_at_ms, resp.expires_at_ms);
+        // And should be in the future (not just current time)
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(
+            fetched.expires_at_ms > now_ms,
+            "expires_at_ms should be in the future"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_rejects_empty_args() {
+        let mgr = MandateManager::new([1, 2], false, MandateMode::Monitor);
+        let req = MandateRequest {
+            pid: std::process::id(),
+            args: vec![],
+            ttl_ms: 5000,
+            container_id: None,
+            monitor_only: false,
+            task_id: None,
+            max_spend_cents: None,
+            counterparty_did: None,
+            wallet_address: None,
+            jurisdiction: None,
+        };
+        assert!(mgr.create(req).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_create_rejects_too_many_args() {
+        let mgr = MandateManager::new([1, 2], false, MandateMode::Monitor);
+        let args: Vec<String> = (0..200).map(|i| format!("arg{}", i)).collect();
+        let req = MandateRequest {
+            pid: std::process::id(),
+            args,
+            ttl_ms: 5000,
+            container_id: None,
+            monitor_only: false,
+            task_id: None,
+            max_spend_cents: None,
+            counterparty_did: None,
+            wallet_address: None,
+            jurisdiction: None,
+        };
+        assert!(mgr.create(req).await.is_err());
+    }
+
+    #[test]
     fn test_backpressure() {
         let mgr = MandateManager::new([1, 2], false, MandateMode::Monitor);
         assert!(!mgr.is_backpressure_active());
@@ -1083,6 +1273,9 @@ mod tests {
             monitor_only: false,
             task_id: None,
             max_spend_cents: None,
+            counterparty_did: None,
+            wallet_address: None,
+            jurisdiction: None,
         };
 
         let resp = mgr.create(req).await.expect("create should succeed");
@@ -1106,6 +1299,9 @@ mod tests {
             monitor_only: false,
             task_id: None,
             max_spend_cents: None,
+            counterparty_did: None,
+            wallet_address: None,
+            jurisdiction: None,
         };
 
         let resp = mgr.create(req).await.unwrap();
@@ -1134,6 +1330,9 @@ mod tests {
             monitor_only: false,
             task_id: None,
             max_spend_cents: None,
+            counterparty_did: None,
+            wallet_address: None,
+            jurisdiction: None,
         };
 
         mgr.create(req).await.unwrap();

@@ -896,6 +896,96 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // LocalIlmHandlerRag removed (YAGNI cleanup)
 
+    // ── Linnix-Claw: initialize MandateManager ──────────────────────────
+    // Moved before handler_list finalization so MandateReceiptHandler can be
+    // registered in the handler pipeline.
+    let mandate_manager: Option<Arc<cognitod::mandate::MandateManager>> = {
+        let lsm_available = bpf_config::is_bpf_lsm_available();
+        let allow_without_lsm = config.mandate.allow_commerce_without_lsm;
+        // BPF enforcement is only truly active when capability checks pass
+        // AND the BPF mandate maps were successfully loaded from the eBPF
+        // object.  If eBPF init failed, mandate_bpf_maps is None and we
+        // must not claim enforcement is active.
+        let bpf_maps_connected = mandate_bpf_maps.is_some();
+        let enforcement_available = lsm_available && bpf_maps_connected;
+
+        if enforcement_available || allow_without_lsm {
+            match bpf_config::generate_siphash_key() {
+                Ok(key) => {
+                    let mode = if config.mandate.mode == "enforce" {
+                        linnix_ai_ebpf_common::MandateMode::Enforce
+                    } else {
+                        linnix_ai_ebpf_common::MandateMode::Monitor
+                    };
+                    let mgr =
+                        cognitod::mandate::MandateManager::new(key, enforcement_available, mode);
+                    info!(
+                        "[claw] MandateManager initialized (lsm={}, bpf_maps={}, mode={}, capacity={})",
+                        lsm_available,
+                        bpf_maps_connected,
+                        config.mandate.mode,
+                        config.mandate.map_capacity
+                    );
+                    let mgr = Arc::new(mgr);
+
+                    // Connect BPF maps if available (writes siphash key + mode to kernel).
+                    if let Some(maps) = mandate_bpf_maps.take() {
+                        mgr.connect_bpf_maps(maps).await;
+                    }
+
+                    Some(mgr)
+                }
+                Err(e) => {
+                    warn!("[claw] Failed to generate SipHash key: {e:#}. Mandate system disabled.");
+                    None
+                }
+            }
+        } else {
+            info!(
+                "[claw] BPF LSM not available and allow_commerce_without_lsm=false. Mandate system disabled."
+            );
+            None
+        }
+    };
+
+    // ── Linnix-Claw: initialize AgentIdentity (Phase 1) ─────────────────
+    let agent_identity: Option<Arc<cognitod::identity::AgentIdentity>> = if mandate_manager
+        .is_some()
+    {
+        let identity_path = std::path::Path::new(&config.mandate.identity_path);
+        let hostname = std::fs::read_to_string("/etc/hostname")
+            .map(|h| h.trim().to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+        let default_did = format!("did:linnix:{hostname}");
+        match cognitod::identity::AgentIdentity::load_or_generate(identity_path, &default_did) {
+            Ok(identity) => {
+                info!(
+                    "[claw] Agent identity: DID={}, ETH=0x{}",
+                    identity.did(),
+                    hex::encode(identity.ethereum_address())
+                );
+                Some(Arc::new(identity))
+            }
+            Err(e) => {
+                warn!(
+                    "[claw] Failed to load/generate identity: {e:#}. Receipts will be unavailable."
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // ── Linnix-Claw: register MandateReceiptHandler ─────────────────────
+    if let (Some(mgr), Some(id)) = (&mandate_manager, &agent_identity) {
+        handler_list.register(cognitod::handler::MandateReceiptHandler::new(
+            Arc::clone(mgr),
+            Arc::clone(id),
+        ));
+        info!("[claw] MandateReceiptHandler registered in event pipeline");
+    }
+
     let handlers = Arc::new(handler_list);
     // Pass metrics to your listener
     if !perf_buffers.is_empty() {
@@ -1210,46 +1300,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .ok()
         .or(config.api.auth_token.clone());
 
-    // ── Linnix-Claw: initialize MandateManager ──────────────────────────
-    let mandate_manager: Option<Arc<cognitod::mandate::MandateManager>> = {
-        let lsm_available = bpf_config::is_bpf_lsm_available();
-        let allow_without_lsm = config.mandate.allow_commerce_without_lsm;
-
-        if lsm_available || allow_without_lsm {
-            match bpf_config::generate_siphash_key() {
-                Ok(key) => {
-                    let mode = if config.mandate.mode == "enforce" {
-                        linnix_ai_ebpf_common::MandateMode::Enforce
-                    } else {
-                        linnix_ai_ebpf_common::MandateMode::Monitor
-                    };
-                    let mgr = cognitod::mandate::MandateManager::new(key, lsm_available, mode);
-                    info!(
-                        "[claw] MandateManager initialized (lsm={}, mode={}, capacity={})",
-                        lsm_available, config.mandate.mode, config.mandate.map_capacity
-                    );
-                    let mgr = Arc::new(mgr);
-
-                    // Connect BPF maps if available (writes siphash key + mode to kernel).
-                    if let Some(maps) = mandate_bpf_maps.take() {
-                        mgr.connect_bpf_maps(maps).await;
-                    }
-
-                    Some(mgr)
-                }
-                Err(e) => {
-                    warn!("[claw] Failed to generate SipHash key: {e:#}. Mandate system disabled.");
-                    None
-                }
-            }
-        } else {
-            info!(
-                "[claw] BPF LSM not available and allow_commerce_without_lsm=false. Mandate system disabled."
-            );
-            None
-        }
-    };
-
     // ── Linnix-Claw: commerce policy (§11.1) ───────────────────────────
     let commerce_policy = {
         let lsm_available = bpf_config::is_bpf_lsm_available();
@@ -1267,34 +1317,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Some(policy)
     };
 
-    // ── Linnix-Claw: initialize AgentIdentity (Phase 1) ─────────────────
-    let agent_identity: Option<Arc<cognitod::identity::AgentIdentity>> = if mandate_manager
-        .is_some()
-    {
-        let identity_path = std::path::Path::new(&config.mandate.identity_path);
-        let hostname = std::fs::read_to_string("/etc/hostname")
-            .map(|h| h.trim().to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
-        let default_did = format!("did:linnix:{hostname}");
-        match cognitod::identity::AgentIdentity::load_or_generate(identity_path, &default_did) {
-            Ok(id) => {
-                info!(
-                    "[claw] AgentIdentity loaded (did={}, eth=0x{})",
-                    id.did(),
-                    hex::encode(id.ethereum_address())
-                );
-                Some(Arc::new(id))
-            }
-            Err(e) => {
-                warn!(
-                    "[claw] Failed to load/generate identity: {e:#}. Receipts will be unavailable."
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // ── Linnix-Claw: initialize SpendTracker (§8.5) ─────────────────────
+    let spend_tracker: Option<Arc<cognitod::spend::SpendTracker>> =
+        mandate_manager.as_ref().map(|_| {
+            Arc::new(cognitod::spend::SpendTracker::new(
+                config.spend_limits.clone(),
+            ))
+        });
+
+    // ── Linnix-Claw: initialize ComplianceEngine (§10.3) ────────────────
+    let compliance_engine: Option<Arc<cognitod::compliance::ComplianceEngine>> = mandate_manager
+        .as_ref()
+        .map(|_| Arc::new(cognitod::compliance::ComplianceEngine::permissive()));
+
+    // ── Linnix-Claw: initialize ReceiptRedactor (§10.4) ─────────────────
+    let receipt_redactor: Option<cognitod::privacy::ReceiptRedactor> =
+        mandate_manager.as_ref().map(|_| {
+            let level = config
+                .receipt_privacy
+                .redaction_level
+                .parse::<cognitod::privacy::RedactionLevel>()
+                .unwrap_or_default();
+            info!("[claw] Receipt redaction level: {}", level);
+            cognitod::privacy::ReceiptRedactor::new(level)
+        });
 
     let app_state = Arc::new(AppState {
         context: Arc::clone(&context),
@@ -1314,6 +1360,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         mandate: mandate_manager,
         identity: agent_identity,
         commerce_policy,
+        spend_tracker,
+        compliance_engine,
+        receipt_redactor,
         claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
     });
 
