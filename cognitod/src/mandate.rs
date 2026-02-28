@@ -91,7 +91,7 @@ pub fn build_bpf_mandate_maps(
 
 #[inline]
 fn rotl(x: u64, b: u32) -> u64 {
-    (x << b) | (x >> (64 - b))
+    x.rotate_left(b)
 }
 
 #[inline]
@@ -494,10 +494,12 @@ impl MandateManager {
         if pid == 0 {
             return Err(anyhow!("invalid PID 0"));
         }
-        // pid is u32 — format! produces only digits, so the path is safe.
-        let stat_path = format!("/proc/{}/stat", pid);
+        // Construct path from a u32 — only digits, no path traversal possible.
+        let mut stat_path = std::path::PathBuf::from("/proc");
+        stat_path.push(pid.to_string());
+        stat_path.push("stat");
         let stat_content = std::fs::read_to_string(&stat_path)
-            .with_context(|| format!("failed to read {}", stat_path))?;
+            .with_context(|| format!("failed to read {}", stat_path.display()))?;
 
         // /proc/<pid>/stat format: pid (comm) state ppid ... field22=starttime
         // The comm field can contain spaces and parens, so we find the last ')'
@@ -568,8 +570,10 @@ impl MandateManager {
                 continue;
             };
 
-            // Check cgroup for container ID
-            let cgroup_path = format!("/proc/{}/cgroup", host_pid);
+            // Check cgroup for container ID — host_pid is a parsed u32, safe.
+            let mut cgroup_path = std::path::PathBuf::from("/proc");
+            cgroup_path.push(host_pid.to_string());
+            cgroup_path.push("cgroup");
             let Ok(cgroup_content) = std::fs::read_to_string(&cgroup_path) else {
                 continue;
             };
@@ -580,7 +584,9 @@ impl MandateManager {
 
             // Found a process in this container. Now check NSpid to see if the
             // namespace PID matches the requested container_pid.
-            let status_path = format!("/proc/{}/status", host_pid);
+            let mut status_path = std::path::PathBuf::from("/proc");
+            status_path.push(host_pid.to_string());
+            status_path.push("status");
             let Ok(status_content) = std::fs::read_to_string(&status_path) else {
                 continue;
             };
@@ -859,7 +865,7 @@ impl MandateManager {
             &batch.mandates
         };
 
-        let total = mandates.len();
+        let total = mandates.len().min(MAX_BATCH_SIZE);
         let mut results = Vec::with_capacity(total);
         let mut succeeded = 0usize;
         let mut failed = 0usize;

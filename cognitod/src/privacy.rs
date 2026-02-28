@@ -17,21 +17,16 @@ use std::path::Path;
 // =============================================================================
 
 /// Receipt redaction level (§10.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RedactionLevel {
     /// Full binary path exposed. For internal/dev environments.
     None,
     /// Basename only (e.g., `/usr/bin/curl` → `curl`). Default.
+    #[default]
     External,
     /// Generic category label (e.g., `tool_execution`). Maximum privacy.
     Full,
-}
-
-impl Default for RedactionLevel {
-    fn default() -> Self {
-        Self::External
-    }
 }
 
 impl std::fmt::Display for RedactionLevel {

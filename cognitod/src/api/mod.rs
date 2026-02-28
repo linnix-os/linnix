@@ -1355,48 +1355,45 @@ async fn create_mandate(
 
     // §8.5 Spend-limit check: if the mandate has a spend cap, verify it
     // doesn't exceed any configured limit (per-mandate, hourly, daily, monthly).
-    if let Some(amount_cents) = req.max_spend_cents {
-        if let Some(ref tracker) = state.spend_tracker {
-            if let Err(violation) = tracker
-                .check_spend(amount_cents, req.counterparty_did.as_deref())
-                .await
-            {
-                state.claw_metrics.inc_rejected();
-                return Err((
-                    StatusCode::TOO_MANY_REQUESTS,
-                    Json(json!({
-                        "error": "spend_limit_exceeded",
-                        "message": violation.to_string()
-                    })),
-                ));
-            }
-        }
+    if let Some(amount_cents) = req.max_spend_cents
+        && let Some(ref tracker) = state.spend_tracker
+        && let Err(violation) = tracker
+            .check_spend(amount_cents, req.counterparty_did.as_deref())
+            .await
+    {
+        state.claw_metrics.inc_rejected();
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "error": "spend_limit_exceeded",
+                "message": violation.to_string()
+            })),
+        ));
     }
 
     // §10.3 Compliance screening: if the mandate has commerce fields,
     // run OFAC/KYT/jurisdiction checks before creating the mandate.
-    if req.is_commerce_request() {
-        if let Some(ref engine) = state.compliance_engine {
-            if let Some(ref did) = req.counterparty_did {
-                let results = engine
-                    .pre_task_screen(
-                        did,
-                        req.wallet_address.as_deref(),
-                        req.jurisdiction.as_deref(),
-                        req.max_spend_cents.unwrap_or(0),
-                    )
-                    .await;
-                if cognitod::compliance::ComplianceEngine::has_hard_block(&results) {
-                    state.claw_metrics.inc_rejected();
-                    return Err((
-                        StatusCode::FORBIDDEN,
-                        Json(json!({
-                            "error": "compliance_blocked",
-                            "message": "counterparty failed compliance screening"
-                        })),
-                    ));
-                }
-            }
+    if req.is_commerce_request()
+        && let Some(ref engine) = state.compliance_engine
+        && let Some(ref did) = req.counterparty_did
+    {
+        let results = engine
+            .pre_task_screen(
+                did,
+                req.wallet_address.as_deref(),
+                req.jurisdiction.as_deref(),
+                req.max_spend_cents.unwrap_or(0),
+            )
+            .await;
+        if cognitod::compliance::ComplianceEngine::has_hard_block(&results) {
+            state.claw_metrics.inc_rejected();
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "compliance_blocked",
+                    "message": "counterparty failed compliance screening"
+                })),
+            ));
         }
     }
 
@@ -1408,12 +1405,12 @@ async fn create_mandate(
             state.claw_metrics.inc_created();
 
             // Record spend after successful mandate creation (§8.5).
-            if let Some(amount_cents) = req.max_spend_cents {
-                if let Some(ref tracker) = state.spend_tracker {
-                    tracker
-                        .record_spend(amount_cents, req.counterparty_did.clone())
-                        .await;
-                }
+            if let Some(amount_cents) = req.max_spend_cents
+                && let Some(ref tracker) = state.spend_tracker
+            {
+                tracker
+                    .record_spend(amount_cents, req.counterparty_did.clone())
+                    .await;
             }
 
             Ok((StatusCode::CREATED, Json(resp)))
@@ -1476,21 +1473,18 @@ async fn get_mandate_receipt(
 
             // §9 Privacy redaction: redact binary path at read-time to
             // preserve the unredacted audit trail in memory.
-            if let Some(ref redactor) = state.receipt_redactor {
-                if let Some(exec) = receipt_json.get_mut("execution") {
-                    if let Some(binary) = exec
-                        .get("binary")
-                        .and_then(|b| b.as_str())
-                        .map(String::from)
-                    {
-                        if let Some(obj) = exec.as_object_mut() {
-                            obj.insert(
-                                "binary".to_string(),
-                                serde_json::Value::String(redactor.redact_binary(&binary)),
-                            );
-                        }
-                    }
-                }
+            if let Some(ref redactor) = state.receipt_redactor
+                && let Some(exec) = receipt_json.get_mut("execution")
+                && let Some(binary) = exec
+                    .get("binary")
+                    .and_then(|b| b.as_str())
+                    .map(String::from)
+                && let Some(obj) = exec.as_object_mut()
+            {
+                obj.insert(
+                    "binary".to_string(),
+                    serde_json::Value::String(redactor.redact_binary(&binary)),
+                );
             }
 
             Ok(Json(receipt_json))

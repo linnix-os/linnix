@@ -1302,9 +1302,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // ── Linnix-Claw: commerce policy (§11.1) ───────────────────────────
     let commerce_policy = {
-        let lsm_available = bpf_config::is_bpf_lsm_available();
+        // Use actual enforcement status: LSM available AND BPF maps connected.
+        // is_bpf_lsm_available() alone is insufficient — maps may have failed to load.
+        let enforcement_active = mandate_manager.as_ref().is_some_and(|m| m.bpf_available());
         let policy = cognitod::commerce::CommercePolicy::new(
-            lsm_available,
+            enforcement_active,
             &config.mandate.mode,
             config.mandate.allow_commerce_without_lsm,
         );
