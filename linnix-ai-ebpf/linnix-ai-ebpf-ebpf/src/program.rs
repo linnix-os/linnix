@@ -211,11 +211,11 @@ fn emit_block_event_common(
     )
 }
 
-fn load_config() -> TelemetryConfig {
+pub(crate) fn load_config() -> TelemetryConfig {
     unsafe { core::ptr::read_volatile(&TELEMETRY_CONFIG) }
 }
 
-fn read_field<T: Copy>(base: *const u8, offset: u32) -> Option<T> {
+pub(crate) fn read_field<T: Copy>(base: *const u8, offset: u32) -> Option<T> {
     if base.is_null() {
         return None;
     }
@@ -569,7 +569,7 @@ unsafe fn atomic_fetch_add_u64(ptr: *mut u64, val: u64) -> u64 {
 /// 4. u8 flags to reduce write bandwidth
 /// 5. Direct field writes (event passed by reference, written directly)
 #[inline(always)]
-fn submit_to_sequencer(event: &ProcessEvent) -> Result<(), i64> {
+pub(crate) fn submit_to_sequencer(event: &ProcessEvent) -> Result<(), i64> {
     // 1. ATOMIC RESERVATION (Direct memory access - no map lookup!)
     // --------------------------------------------------------
     // GLOBAL_SEQUENCER is a cache-line-aligned .bss global.

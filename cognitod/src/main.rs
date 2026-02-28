@@ -8,7 +8,7 @@ use aya::maps::{
     MapData,
     perf::{PerfEventArray, PerfEventArrayBuffer},
 };
-use aya::programs::{KProbe, TracePoint};
+use aya::programs::{KProbe, Lsm, TracePoint};
 use aya::util::online_cpus;
 use aya::{Ebpf, EbpfLoader};
 use aya_log::EbpfLogger;
@@ -88,6 +88,26 @@ fn attach_tracepoint_internal(
 fn attach_tracepoint_optional(bpf: &mut Ebpf, program: &str, category: &str, name: &str) {
     if let Err(err) = attach_tracepoint_internal(bpf, program, category, name) {
         warn!("[cognitod] optional tracepoint {category}:{name} ({program}) not attached: {err:?}");
+    }
+}
+
+fn attach_lsm_internal(bpf: &mut Ebpf, program: &str, hook: &str) -> anyhow::Result<()> {
+    let prog: &mut Lsm = bpf
+        .program_mut(program)
+        .ok_or_else(|| anyhow::anyhow!("{program} program not found"))?
+        .try_into()?;
+    let btf = aya::Btf::from_sys_fs()?;
+    prog.load(hook, &btf)?;
+    prog.attach()?;
+    Ok(())
+}
+
+fn attach_lsm_optional(bpf: &mut Ebpf, program: &str, hook: &str) {
+    if let Err(err) = attach_lsm_internal(bpf, program, hook) {
+        warn!(
+            "[cognitod] optional LSM hook {hook} ({program}) not attached: {err:?}. \
+             Requires CONFIG_BPF_LSM=y and lsm=...,bpf boot parameter."
+        );
     }
 }
 
@@ -221,7 +241,11 @@ fn read_rss_trace_bytes() -> anyhow::Result<(Vec<u8>, String)> {
 fn init_ebpf(
     bpf_bytes: &[u8],
     telemetry_cfg: TelemetryConfig,
-) -> anyhow::Result<(BpfRuntimeGuards, Vec<PerfEventArrayBuffer<MapData>>)> {
+) -> anyhow::Result<(
+    BpfRuntimeGuards,
+    Vec<PerfEventArrayBuffer<MapData>>,
+    Option<cognitod::mandate::BpfMandateMaps>,
+)> {
     let telemetry = TelemetryConfigPod(telemetry_cfg);
     let mut loader = EbpfLoader::new();
     loader.set_global("TELEMETRY_CONFIG", &telemetry, true);
@@ -274,6 +298,10 @@ fn init_ebpf(
         "block_rq_complete",
     );
 
+    // Attach LINNIX-CLAW LSM enforcement hooks (optional — need CONFIG_BPF_LSM=y).
+    attach_lsm_optional(&mut bpf, "mandate_execve_check", "bprm_check_security");
+    attach_lsm_optional(&mut bpf, "mandate_socket_connect", "socket_connect");
+
     info!("[cognitod] Program attached. Setting up perf buffers...");
 
     let events_map = bpf
@@ -285,12 +313,45 @@ fn init_ebpf(
         perf_buffers.push(perf_array.open(cpu, None)?);
     }
 
+    // Take LINNIX-CLAW BPF maps for mandate lifecycle management.
+    // These are taken (not borrowed) so they outlive the Ebpf loader and can be
+    // passed to MandateManager.  If any map is absent (older BPF object), we
+    // fall back gracefully to userspace-only tracking.
+    let mandate_maps = (|| -> anyhow::Result<cognitod::mandate::BpfMandateMaps> {
+        let mm_raw = bpf
+            .take_map("MANDATE_MAP")
+            .ok_or_else(|| anyhow::anyhow!("MANDATE_MAP not found"))?;
+        let mode_raw = bpf
+            .take_map("MANDATE_MODE")
+            .ok_or_else(|| anyhow::anyhow!("MANDATE_MODE not found"))?;
+        let siphash_raw = bpf
+            .take_map("SIPHASH_KEY")
+            .ok_or_else(|| anyhow::anyhow!("SIPHASH_KEY not found"))?;
+        cognitod::mandate::build_bpf_mandate_maps(mm_raw, mode_raw, siphash_raw)
+    })();
+
+    let bpf_mandate_maps = match mandate_maps {
+        Ok(maps) => {
+            info!(
+                "[cognitod] LINNIX-CLAW: BPF mandate maps acquired (MANDATE_MAP, MANDATE_MODE, SIPHASH_KEY)"
+            );
+            Some(maps)
+        }
+        Err(e) => {
+            warn!(
+                "[cognitod] LINNIX-CLAW: BPF mandate maps not available ({e}); mandate enforcement will be userspace-only"
+            );
+            None
+        }
+    };
+
     Ok((
         BpfRuntimeGuards {
             _bpf: bpf,
             _logger: logger,
         },
         perf_buffers,
+        bpf_mandate_maps,
     ))
 }
 
@@ -409,6 +470,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut transport: &'static str = "userspace";
     let mut _bpf_runtime: Option<BpfRuntimeGuards> = None;
     let mut probe_state = ProbeState::disabled();
+    let mut mandate_bpf_maps: Option<cognitod::mandate::BpfMandateMaps> = None;
 
     let btf_path = std::env::var("LINNIX_KERNEL_BTF")
         .unwrap_or_else(|_| "/sys/kernel/btf/vmlinux".to_string());
@@ -427,10 +489,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let (bpf_bytes, chosen_path) = read_bpf_bytes()?;
                 println!("[cognitod] Using BPF object: {chosen_path}");
                 match init_ebpf(&bpf_bytes, telemetry_cfg) {
-                    Ok((guards, buffers)) => {
+                    Ok((guards, buffers, maps)) => {
                         transport = "perf";
                         perf_buffers = buffers;
                         _bpf_runtime = Some(guards);
+                        mandate_bpf_maps = maps;
                         probe_state = ProbeState {
                             rss_probe: match result.mode {
                                 CoreRssMode::MmStruct => RssProbeMode::CoreMm,
@@ -833,6 +896,96 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // LocalIlmHandlerRag removed (YAGNI cleanup)
 
+    // ── Linnix-Claw: initialize MandateManager ──────────────────────────
+    // Moved before handler_list finalization so MandateReceiptHandler can be
+    // registered in the handler pipeline.
+    let mandate_manager: Option<Arc<cognitod::mandate::MandateManager>> = {
+        let lsm_available = bpf_config::is_bpf_lsm_available();
+        let allow_without_lsm = config.mandate.allow_commerce_without_lsm;
+        // BPF enforcement is only truly active when capability checks pass
+        // AND the BPF mandate maps were successfully loaded from the eBPF
+        // object.  If eBPF init failed, mandate_bpf_maps is None and we
+        // must not claim enforcement is active.
+        let bpf_maps_connected = mandate_bpf_maps.is_some();
+        let enforcement_available = lsm_available && bpf_maps_connected;
+
+        if enforcement_available || allow_without_lsm {
+            match bpf_config::generate_siphash_key() {
+                Ok(key) => {
+                    let mode = if config.mandate.mode == "enforce" {
+                        linnix_ai_ebpf_common::MandateMode::Enforce
+                    } else {
+                        linnix_ai_ebpf_common::MandateMode::Monitor
+                    };
+                    let mgr =
+                        cognitod::mandate::MandateManager::new(key, enforcement_available, mode);
+                    info!(
+                        "[claw] MandateManager initialized (lsm={}, bpf_maps={}, mode={}, capacity={})",
+                        lsm_available,
+                        bpf_maps_connected,
+                        config.mandate.mode,
+                        config.mandate.map_capacity
+                    );
+                    let mgr = Arc::new(mgr);
+
+                    // Connect BPF maps if available (writes siphash key + mode to kernel).
+                    if let Some(maps) = mandate_bpf_maps.take() {
+                        mgr.connect_bpf_maps(maps).await;
+                    }
+
+                    Some(mgr)
+                }
+                Err(e) => {
+                    warn!("[claw] Failed to generate SipHash key: {e:#}. Mandate system disabled.");
+                    None
+                }
+            }
+        } else {
+            info!(
+                "[claw] BPF LSM not available and allow_commerce_without_lsm=false. Mandate system disabled."
+            );
+            None
+        }
+    };
+
+    // ── Linnix-Claw: initialize AgentIdentity (Phase 1) ─────────────────
+    let agent_identity: Option<Arc<cognitod::identity::AgentIdentity>> = if mandate_manager
+        .is_some()
+    {
+        let identity_path = std::path::Path::new(&config.mandate.identity_path);
+        let hostname = std::fs::read_to_string("/etc/hostname")
+            .map(|h| h.trim().to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+        let default_did = format!("did:linnix:{hostname}");
+        match cognitod::identity::AgentIdentity::load_or_generate(identity_path, &default_did) {
+            Ok(identity) => {
+                info!(
+                    "[claw] Agent identity: DID={}, ETH=0x{}",
+                    identity.did(),
+                    hex::encode(identity.ethereum_address())
+                );
+                Some(Arc::new(identity))
+            }
+            Err(e) => {
+                warn!(
+                    "[claw] Failed to load/generate identity: {e:#}. Receipts will be unavailable."
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // ── Linnix-Claw: register MandateReceiptHandler ─────────────────────
+    if let (Some(mgr), Some(id)) = (&mandate_manager, &agent_identity) {
+        handler_list.register(cognitod::handler::MandateReceiptHandler::new(
+            Arc::clone(mgr),
+            Arc::clone(id),
+        ));
+        info!("[claw] MandateReceiptHandler registered in event pipeline");
+    }
+
     let handlers = Arc::new(handler_list);
     // Pass metrics to your listener
     if !perf_buffers.is_empty() {
@@ -1105,6 +1258,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 }
                                 let _ = queue_clone.complete(&action.id).await;
                             }
+                            cognitod::enforcement::ActionType::AuthorizeExec {
+                                pid,
+                                cmd_hash,
+                                expires_at,
+                            } => {
+                                info!(
+                                    "[enforcement] AUTHORIZE EXEC pid={} cmd_hash={:#x} expires_at={}",
+                                    pid, cmd_hash, expires_at
+                                );
+                                // Phase 0: mandate authorization handled via MandateManager API
+                                let _ = queue_clone.complete(&action.id).await;
+                            }
                         }
                     }
                 }
@@ -1135,6 +1300,50 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .ok()
         .or(config.api.auth_token.clone());
 
+    // ── Linnix-Claw: commerce policy (§11.1) ───────────────────────────
+    let commerce_policy = {
+        // Use actual enforcement status: LSM available AND BPF maps connected.
+        // is_bpf_lsm_available() alone is insufficient — maps may have failed to load.
+        let enforcement_active = mandate_manager.as_ref().is_some_and(|m| m.bpf_available());
+        let policy = cognitod::commerce::CommercePolicy::new(
+            enforcement_active,
+            &config.mandate.mode,
+            config.mandate.allow_commerce_without_lsm,
+        );
+        info!(
+            "[claw] Commerce policy: mode={}, enforced={}, allow_without_lsm={}",
+            policy.mode.enforcement_mode_str(),
+            policy.is_enforced(),
+            policy.allow_commerce_without_lsm,
+        );
+        Some(policy)
+    };
+
+    // ── Linnix-Claw: initialize SpendTracker (§8.5) ─────────────────────
+    let spend_tracker: Option<Arc<cognitod::spend::SpendTracker>> =
+        mandate_manager.as_ref().map(|_| {
+            Arc::new(cognitod::spend::SpendTracker::new(
+                config.spend_limits.clone(),
+            ))
+        });
+
+    // ── Linnix-Claw: initialize ComplianceEngine (§10.3) ────────────────
+    let compliance_engine: Option<Arc<cognitod::compliance::ComplianceEngine>> = mandate_manager
+        .as_ref()
+        .map(|_| Arc::new(cognitod::compliance::ComplianceEngine::permissive()));
+
+    // ── Linnix-Claw: initialize ReceiptRedactor (§10.4) ─────────────────
+    let receipt_redactor: Option<cognitod::privacy::ReceiptRedactor> =
+        mandate_manager.as_ref().map(|_| {
+            let level = config
+                .receipt_privacy
+                .redaction_level
+                .parse::<cognitod::privacy::RedactionLevel>()
+                .unwrap_or_default();
+            info!("[claw] Receipt redaction level: {}", level);
+            cognitod::privacy::ReceiptRedactor::new(level)
+        });
+
     let app_state = Arc::new(AppState {
         context: Arc::clone(&context),
         metrics: Arc::clone(&metrics),
@@ -1150,6 +1359,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         enforcement: enforcement_queue.clone(),
         incident_store: incident_store.clone(),
         k8s: k8s_context.clone(),
+        mandate: mandate_manager,
+        identity: agent_identity,
+        commerce_policy,
+        spend_tracker,
+        compliance_engine,
+        receipt_redactor,
+        claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
     });
 
     let api = all_routes(app_state.clone());
@@ -1170,6 +1386,52 @@ async fn main() -> Result<(), Box<dyn Error>> {
             eprintln!("server error: {e}");
         }
     });
+
+    // ── Unix domain socket listener (bypasses token auth) ──
+    let uds_path = std::env::var("LINNIX_UDS_PATH")
+        .ok()
+        .or_else(|| config.api.unix_socket.clone());
+
+    if let Some(ref socket_path) = uds_path {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::net::UnixListener;
+
+        // Remove stale socket file if it exists
+        let _ = std::fs::remove_file(socket_path);
+
+        // Ensure parent directory exists
+        if let Some(parent) = std::path::Path::new(socket_path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        match UnixListener::bind(socket_path) {
+            Ok(uds_listener) => {
+                // Set socket permissions: owner + group read/write (0o660)
+                if let Err(e) =
+                    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o660))
+                {
+                    warn!("Failed to set UDS permissions: {}", e);
+                }
+
+                let uds_api = api::uds_routes(app_state.clone());
+                info!(
+                    "[cognitod] UDS server on {} (no auth — local connections only)",
+                    socket_path
+                );
+                tokio::spawn(async move {
+                    if let Err(e) = axum::serve(uds_listener, uds_api).await {
+                        eprintln!("UDS server error: {e}");
+                    }
+                });
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to bind UDS at {}: {}. UDS disabled.",
+                    socket_path, e
+                );
+            }
+        }
+    }
 
     tokio::spawn(async {
         let mut sigterm = signal(SignalKind::terminate()).unwrap();

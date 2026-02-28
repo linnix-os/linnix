@@ -7,7 +7,16 @@
 mod program;
 
 #[cfg(target_arch = "bpf")]
+mod siphash;
+
+#[cfg(target_arch = "bpf")]
+mod lsm;
+
+#[cfg(target_arch = "bpf")]
 pub use program::*;
+
+#[cfg(target_arch = "bpf")]
+pub use lsm::*;
 
 #[cfg(not(target_arch = "bpf"))]
 fn main() {}

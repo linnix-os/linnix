@@ -12,7 +12,7 @@ reqwest = { version = "0.12.15", features = ["json"] }
 axum = {version = "0.8.3", features =["macros"]}
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
-tokio = { version = "1.47.0", features = ["rt-multi-thread", "macros", "time", "signal", "sync", "fs", "process"] }
+tokio = { version = "1.47.0", features = ["rt-multi-thread", "macros", "time", "signal", "sync", "fs", "process", "net"] }
 # async handlers and config
 async-trait = "0.1"
 toml = "0.8"
@@ -50,6 +50,15 @@ memmap2 = "0.9"
 nix = { version = "0.29", features = ["time"] }
 ctrlc = "3.4"
 
+# Linnix-Claw Phase 1: Receipt & Identity
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
+hkdf = "0.12"
+hmac = "0.12"
+base64 = "0.22"
+hex = "0.4"
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+
 [[bin]]
 name = "cognitod"
 path = "src/main.rs"
@@ -62,10 +71,17 @@ path = "src/bin/sequencer_test.rs"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }
 tempfile = "3"
 reqwest-eventsource = "0.4"
+cucumber = "0.21"
+futures = "0.3"
+
+[[test]]
+name = "bdd_spend"
+harness = false   # cucumber provides its own main()
 
 [features]
 default = []
 ilm-test = []
+compliance = []   # Enable OFAC/KYT/Travel Rule compliance controls (§10.3)
 
 # Metadata for cargo-deb and cargo-generate-rpm
 [package.metadata.deb]

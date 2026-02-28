@@ -12,6 +12,11 @@ pub struct ApiConfig {
     pub listen_addr: String,
     #[serde(default)]
     pub auth_token: Option<String>,
+    /// Optional Unix domain socket path for local-only connections.
+    /// UDS connections bypass token auth (local identity verified by socket credentials).
+    /// Default: None (UDS disabled). Set to e.g. "/var/run/linnix/cognitod.sock" to enable.
+    #[serde(default)]
+    pub unix_socket: Option<String>,
 }
 
 impl Default for ApiConfig {
@@ -19,6 +24,7 @@ impl Default for ApiConfig {
         Self {
             listen_addr: default_listen_addr(),
             auth_token: None,
+            unix_socket: None,
         }
     }
 }
@@ -83,6 +89,14 @@ pub struct Config {
     pub privacy: PrivacyConfig,
     #[serde(default)]
     pub psi: PsiConfig,
+    #[serde(default)]
+    pub mandate: MandateConfig,
+    #[serde(default)]
+    pub spend_limits: SpendLimitsConfig,
+    #[serde(default)]
+    pub compliance: ComplianceConfig,
+    #[serde(default)]
+    pub receipt_privacy: ReceiptPrivacyConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -333,6 +347,68 @@ fn default_psi_sustained_pressure_seconds() -> u64 {
     15
 }
 
+// =============================================================================
+// LINNIX-CLAW: MANDATE CONFIGURATION
+// =============================================================================
+
+/// Configuration for the Linnix-Claw mandate enforcement subsystem.
+///
+/// Added via `[mandate]` section in linnix.toml.
+///
+/// Example:
+/// ```toml
+/// [mandate]
+/// mode = "monitor"          # "monitor" or "enforce"
+/// map_capacity = 65536      # max entries in BPF LRU map
+/// allow_commerce_without_lsm = false
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct MandateConfig {
+    /// Enforcement mode: "monitor" (log only) or "enforce" (block unauthorized).
+    /// Default: "monitor" — safe default that doesn't break existing workflows.
+    #[serde(default = "default_mandate_mode")]
+    pub mode: String,
+
+    /// Maximum entries in the MANDATE_MAP BPF LRU hash.
+    /// Must match the compiled eBPF program's map definition.
+    #[serde(default = "default_mandate_map_capacity")]
+    pub map_capacity: u32,
+
+    /// If true, mandate API is available even without BPF LSM support.
+    /// Mandates are tracked but not kernel-enforced.
+    /// Default: false — commerce features require kernel enforcement.
+    #[serde(default)]
+    pub allow_commerce_without_lsm: bool,
+
+    /// Path to the agent identity key file (Ed25519 + secp256k1 seed).
+    /// Default: /var/lib/linnix/identity.key
+    #[serde(default = "default_identity_path")]
+    pub identity_path: String,
+}
+
+impl Default for MandateConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_mandate_mode(),
+            map_capacity: default_mandate_map_capacity(),
+            allow_commerce_without_lsm: false,
+            identity_path: default_identity_path(),
+        }
+    }
+}
+
+fn default_mandate_mode() -> String {
+    "monitor".to_string()
+}
+
+fn default_mandate_map_capacity() -> u32 {
+    65_536
+}
+
+fn default_identity_path() -> String {
+    "/var/lib/linnix/identity.key".to_string()
+}
+
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct ProbesConfig {
     // Configuration for probe settings (reserved for future use)
@@ -437,6 +513,209 @@ fn default_circuit_breaker_mode() -> String {
     "monitor".to_string() // Default to safe mode
 }
 
+// =============================================================================
+// LINNIX-CLAW PHASE 4: SPEND LIMITS (§9.1)
+// =============================================================================
+
+/// Per-agent spending limit override.
+///
+/// Example TOML:
+/// ```toml
+/// [mandate.spend_limits.per_agent."did:web:untrusted-agent.io"]
+/// daily_cents = 1000
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerAgentLimit {
+    pub daily_cents: u64,
+}
+
+/// Spend control limits applied by cognitod's `SpendTracker`.
+///
+/// All amounts in USD cents (§8.5).
+///
+/// Example TOML:
+/// ```toml
+/// [spend_limits]
+/// per_mandate_cents = 5000
+/// daily_cents = 50000
+/// monthly_cents = 500000
+///
+/// [spend_limits.per_agent."did:web:untrusted.io"]
+/// daily_cents = 1000
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpendLimitsConfig {
+    /// Max USD cents per individual mandate. Default: $50.
+    #[serde(default = "default_per_mandate_cents")]
+    pub per_mandate_cents: u64,
+
+    /// Max aggregate USD cents per hour (rolling). Optional — None = no hourly limit.
+    #[serde(default)]
+    pub hourly_cents: Option<u64>,
+
+    /// Max aggregate USD cents per day (rolling 24h). Default: $500.
+    #[serde(default = "default_daily_cents")]
+    pub daily_cents: u64,
+
+    /// Max aggregate USD cents per month (rolling 30d). Default: $5,000.
+    #[serde(default = "default_monthly_cents")]
+    pub monthly_cents: u64,
+
+    /// Per-agent daily limit overrides. Key is agent DID.
+    #[serde(default)]
+    pub per_agent: std::collections::HashMap<String, PerAgentLimit>,
+}
+
+impl Default for SpendLimitsConfig {
+    fn default() -> Self {
+        Self {
+            per_mandate_cents: default_per_mandate_cents(),
+            hourly_cents: None,
+            daily_cents: default_daily_cents(),
+            monthly_cents: default_monthly_cents(),
+            per_agent: std::collections::HashMap::new(),
+        }
+    }
+}
+
+fn default_per_mandate_cents() -> u64 {
+    5000 // $50
+}
+fn default_daily_cents() -> u64 {
+    50_000 // $500
+}
+fn default_monthly_cents() -> u64 {
+    500_000 // $5,000
+}
+
+// =============================================================================
+// LINNIX-CLAW PHASE 4: COMPLIANCE CONTROLS (§10.3)
+// =============================================================================
+
+/// Compliance configuration for sanctions screening, KYT, and jurisdiction blocks.
+///
+/// Feature-gated: compile with `--features compliance` to enable runtime checks.
+/// Without the feature, the `ComplianceEngine` operates in permissive mode.
+///
+/// Example TOML:
+/// ```toml
+/// [compliance]
+/// enabled = true
+/// screening_provider = "ofac_sdn"
+/// kyt_threshold_cents = 300000
+/// blocked_jurisdictions = ["KP", "IR", "CU", "SY"]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComplianceConfig {
+    /// Master switch. Default: false (opt-in).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Screening provider: "ofac_sdn", "chainalysis", "elliptic", or "none".
+    #[serde(default = "default_screening_provider")]
+    pub screening_provider: String,
+
+    /// Env var name holding the screening API key.
+    #[serde(default)]
+    pub screening_api_key_env: String,
+
+    /// Cache TTL for screening results, in hours. Default: 24.
+    #[serde(default = "default_screening_cache_ttl")]
+    pub screening_cache_ttl_hours: u64,
+
+    /// KYT threshold in USD cents. Default: $3,000 (FATF Travel Rule).
+    #[serde(default = "default_kyt_threshold")]
+    pub kyt_threshold_cents: u64,
+
+    /// Blocked jurisdictions (ISO 3166 alpha-2).
+    #[serde(default = "default_blocked_jurisdictions")]
+    pub blocked_jurisdictions: Vec<String>,
+}
+
+impl Default for ComplianceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            screening_provider: default_screening_provider(),
+            screening_api_key_env: String::new(),
+            screening_cache_ttl_hours: default_screening_cache_ttl(),
+            kyt_threshold_cents: default_kyt_threshold(),
+            blocked_jurisdictions: default_blocked_jurisdictions(),
+        }
+    }
+}
+
+fn default_screening_provider() -> String {
+    "none".to_string()
+}
+fn default_screening_cache_ttl() -> u64 {
+    24
+}
+fn default_kyt_threshold() -> u64 {
+    300_000 // $3,000
+}
+fn default_blocked_jurisdictions() -> Vec<String> {
+    vec![
+        "KP".to_string(),
+        "IR".to_string(),
+        "CU".to_string(),
+        "SY".to_string(),
+    ]
+}
+
+// =============================================================================
+// LINNIX-CLAW PHASE 4: RECEIPT PRIVACY (§10.4)
+// =============================================================================
+
+/// Receipt privacy and redaction configuration.
+///
+/// Example TOML:
+/// ```toml
+/// [receipt_privacy]
+/// redaction_level = "external"
+/// retention_days = 90
+/// encrypt_db = false
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReceiptPrivacyConfig {
+    /// Redaction level: "none", "external" (default), or "full".
+    #[serde(default = "default_redaction_level")]
+    pub redaction_level: String,
+
+    /// Days to retain receipts in local SQLite. Default: 90.
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u64,
+
+    /// Enable SQLCipher encryption for receipt DB.
+    #[serde(default)]
+    pub encrypt_db: bool,
+
+    /// Path to the database encryption key.
+    #[serde(default = "default_db_key_path")]
+    pub db_key_path: String,
+}
+
+impl Default for ReceiptPrivacyConfig {
+    fn default() -> Self {
+        Self {
+            redaction_level: default_redaction_level(),
+            retention_days: default_retention_days(),
+            encrypt_db: false,
+            db_key_path: default_db_key_path(),
+        }
+    }
+}
+
+fn default_redaction_level() -> String {
+    "external".to_string()
+}
+fn default_retention_days() -> u64 {
+    90
+}
+fn default_db_key_path() -> String {
+    "/var/lib/linnix/receipt_db.key".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,5 +756,89 @@ auth_token = "secret123"
         unsafe {
             std::env::remove_var(ENV_CONFIG_PATH);
         }
+    }
+
+    #[test]
+    fn parse_spend_limits() {
+        let toml = r#"
+[spend_limits]
+per_mandate_cents = 10000
+hourly_cents = 25000
+daily_cents = 100000
+monthly_cents = 1000000
+
+[spend_limits.per_agent."did:web:untrusted.io"]
+daily_cents = 500
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.spend_limits.per_mandate_cents, 10000);
+        assert_eq!(cfg.spend_limits.hourly_cents, Some(25000));
+        assert_eq!(cfg.spend_limits.daily_cents, 100000);
+        assert_eq!(cfg.spend_limits.monthly_cents, 1000000);
+        assert_eq!(
+            cfg.spend_limits
+                .per_agent
+                .get("did:web:untrusted.io")
+                .unwrap()
+                .daily_cents,
+            500
+        );
+    }
+
+    #[test]
+    fn parse_compliance_config() {
+        let toml = r#"
+[compliance]
+enabled = true
+screening_provider = "ofac_sdn"
+kyt_threshold_cents = 500000
+blocked_jurisdictions = ["KP", "IR"]
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.compliance.enabled);
+        assert_eq!(cfg.compliance.screening_provider, "ofac_sdn");
+        assert_eq!(cfg.compliance.kyt_threshold_cents, 500000);
+        assert_eq!(cfg.compliance.blocked_jurisdictions, vec!["KP", "IR"]);
+    }
+
+    #[test]
+    fn parse_receipt_privacy_config() {
+        let toml = r#"
+[receipt_privacy]
+redaction_level = "full"
+retention_days = 30
+encrypt_db = true
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.receipt_privacy.redaction_level, "full");
+        assert_eq!(cfg.receipt_privacy.retention_days, 30);
+        assert!(cfg.receipt_privacy.encrypt_db);
+    }
+
+    #[test]
+    fn spend_limits_defaults() {
+        let cfg = SpendLimitsConfig::default();
+        assert_eq!(cfg.per_mandate_cents, 5000);
+        assert_eq!(cfg.hourly_cents, None);
+        assert_eq!(cfg.daily_cents, 50000);
+        assert_eq!(cfg.monthly_cents, 500000);
+        assert!(cfg.per_agent.is_empty());
+    }
+
+    #[test]
+    fn compliance_defaults() {
+        let cfg = ComplianceConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.screening_provider, "none");
+        assert_eq!(cfg.kyt_threshold_cents, 300000);
+        assert_eq!(cfg.blocked_jurisdictions.len(), 4);
+    }
+
+    #[test]
+    fn receipt_privacy_defaults() {
+        let cfg = ReceiptPrivacyConfig::default();
+        assert_eq!(cfg.redaction_level, "external");
+        assert_eq!(cfg.retention_days, 90);
+        assert!(!cfg.encrypt_db);
     }
 }
