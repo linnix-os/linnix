@@ -1304,6 +1304,248 @@ async fn reject_action(
     }
 }
 
+// =============================================================================
+// MANDATE API HANDLERS
+// =============================================================================
+
+#[derive(Deserialize)]
+struct ListMandatesQuery {
+    #[serde(default)]
+    status: Option<cognitod::mandate::MandateStatus>,
+}
+
+async fn create_mandate(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<cognitod::mandate::MandateRequest>,
+) -> Result<
+    (StatusCode, Json<cognitod::mandate::MandateResponse>),
+    (StatusCode, Json<serde_json::Value>),
+> {
+    // §11.1 Commerce policy gate: if the request has settlement fields
+    // (task_id or max_spend_cents) and BPF LSM is not available, reject
+    // unless the operator has opted in to degraded commerce.
+    if req.is_commerce_request()
+        && let Some(ref policy) = state.commerce_policy
+        && let Err(rejection) = policy.check_commerce(true)
+    {
+        state.claw_metrics.inc_commerce_rejection();
+        state.claw_metrics.inc_rejected();
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "kernel_enforcement_unavailable",
+                "message": rejection.message,
+                "enforcement_mode": rejection.enforcement_mode
+            })),
+        ));
+    }
+
+    let mgr = state.mandate.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": "mandate system not enabled"})),
+    ))?;
+
+    if mgr.is_backpressure_active() {
+        state.claw_metrics.inc_rejected();
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error": "mandate map backpressure active, retry later"})),
+        ));
+    }
+
+    let t0 = std::time::Instant::now();
+    match mgr.create(req).await {
+        Ok(resp) => {
+            let elapsed_ns = t0.elapsed().as_nanos() as u64;
+            state.claw_metrics.observe_mandate_latency_ns(elapsed_ns);
+            state.claw_metrics.inc_created();
+            Ok((StatusCode::CREATED, Json(resp)))
+        }
+        Err(e) => {
+            state.claw_metrics.inc_rejected();
+            Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            ))
+        }
+    }
+}
+
+async fn get_mandate_by_id(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<cognitod::mandate::MandateResponse>, StatusCode> {
+    let mgr = state
+        .mandate
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    mgr.get(&id).await.map(Json).ok_or(StatusCode::NOT_FOUND)
+}
+
+/// GET /mandates/{id}/receipt
+///
+/// Returns the dual-signed execution receipt for a completed mandate.
+/// - 200: Receipt found and returned
+/// - 202: Mandate exists and is active but not yet executed
+/// - 404: Mandate not found or revoked/expired without receipt
+/// - 503: Mandate system not enabled
+async fn get_mandate_receipt(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let mgr = state.mandate.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": "mandate system not enabled"})),
+    ))?;
+
+    // Check if mandate exists and get its status
+    let status = mgr.get_status(&id).await.ok_or((
+        StatusCode::NOT_FOUND,
+        Json(json!({"error": format!("mandate {} not found", id)})),
+    ))?;
+
+    match status {
+        cognitod::mandate::MandateStatus::Active => Err((
+            StatusCode::ACCEPTED,
+            Json(json!({"status": "pending", "message": "mandate is active but not yet executed"})),
+        )),
+        cognitod::mandate::MandateStatus::Executed => {
+            let receipt = mgr.get_receipt(&id).await.ok_or((
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "receipt not yet available"})),
+            ))?;
+            Ok(Json(serde_json::to_value(&receipt).unwrap_or_default()))
+        }
+        _ => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("mandate {} is {:?}, no receipt available", id, status)})),
+        )),
+    }
+}
+
+async fn revoke_mandate(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let mgr = state.mandate.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": "mandate system not enabled"})),
+    ))?;
+
+    mgr.revoke(&id)
+        .await
+        .map(|_| {
+            state.claw_metrics.inc_revoked();
+            StatusCode::NO_CONTENT
+        })
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))))
+}
+
+async fn list_mandates(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListMandatesQuery>,
+) -> Result<Json<Vec<cognitod::mandate::MandateResponse>>, StatusCode> {
+    let mgr = state
+        .mandate
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    Ok(Json(mgr.list(query.status).await))
+}
+
+async fn get_mandate_stats(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<cognitod::mandate::MandateStats>, StatusCode> {
+    let mgr = state
+        .mandate
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    Ok(Json(mgr.stats().await))
+}
+
+async fn get_mandate_health(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<cognitod::mandate::MandateHealth>, StatusCode> {
+    let mgr = state
+        .mandate
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    Ok(Json(mgr.health()))
+}
+
+/// POST /mandates/batch — Create multiple mandates in a single request.
+///
+/// Up to 64 mandates per batch. Each is created independently — individual
+/// failures do not prevent other mandates from being created.
+/// Returns 429 if backpressure is active.
+async fn create_mandate_batch(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<cognitod::mandate::BatchMandateRequest>,
+) -> Result<Json<cognitod::mandate::BatchMandateResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let mgr = state.mandate.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": "mandate system not enabled"})),
+    ))?;
+
+    if mgr.is_backpressure_active() {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error": "mandate map backpressure active, retry later"})),
+        ));
+    }
+
+    if req.mandates.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "batch must contain at least one mandate"})),
+        ));
+    }
+
+    if req.mandates.len() > 64 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "batch size exceeds maximum of 64"})),
+        ));
+    }
+
+    Ok(Json(mgr.create_batch(req).await))
+}
+
+/// GET /.well-known/agent-card.json — A2A Agent Card (§4)
+///
+/// Returns the A2A-compliant agent card with `x-linnix-claw` extension
+/// advertising kernel attestation, settlement preferences, and skills.
+async fn get_agent_card(
+    State(state): State<Arc<AppState>>,
+) -> Json<cognitod::agent_card::AgentCard> {
+    let bpf_available = state
+        .mandate
+        .as_ref()
+        .map(|m| m.health().bpf_lsm_loaded)
+        .unwrap_or(false);
+
+    let enforcement_mode = state
+        .mandate
+        .as_ref()
+        .map(|m| m.health().enforcement_mode.clone())
+        .unwrap_or_else(|| "disabled".to_string());
+
+    let listen_addr =
+        std::env::var("LINNIX_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
+
+    let identity = state.identity.as_deref();
+
+    Json(cognitod::agent_card::build_agent_card(
+        identity,
+        bpf_available,
+        &enforcement_mode,
+        &listen_addr,
+    ))
+}
+
 #[derive(Serialize)]
 struct DropBreakdown {
     event_type: u32,
@@ -1540,6 +1782,9 @@ pub async fn prometheus_metrics(State(app_state): State<Arc<AppState>>) -> Respo
         );
     }
 
+    // Claw SLO metrics (§10.5)
+    body.push_str(&app_state.claw_metrics.render_prometheus());
+
     Response::builder()
         .status(StatusCode::OK)
         .header(
@@ -1620,6 +1865,13 @@ pub struct AppState {
     pub enforcement: Option<Arc<crate::enforcement::EnforcementQueue>>,
     pub incident_store: Option<Arc<IncidentStore>>,
     pub k8s: Option<Arc<cognitod::k8s::K8sContext>>,
+    pub mandate: Option<Arc<cognitod::mandate::MandateManager>>,
+    /// Agent identity for receipt signing and agent card.
+    pub identity: Option<Arc<cognitod::identity::AgentIdentity>>,
+    /// Commerce policy for §11.1 deployment-mode gating.
+    pub commerce_policy: Option<cognitod::commerce::CommercePolicy>,
+    /// Claw SLO metrics (§10.5).
+    pub claw_metrics: Arc<cognitod::claw_metrics::ClawMetrics>,
 }
 
 pub fn all_routes(app_state: Arc<AppState>) -> Router {
@@ -1659,7 +1911,16 @@ pub fn all_routes(app_state: Arc<AppState>) -> Router {
         .route("/actions", get(get_actions))
         .route("/actions/{id}", get(get_action_by_id))
         .route("/actions/{id}/approve", axum::routing::post(approve_action))
-        .route("/actions/{id}/reject", axum::routing::post(reject_action));
+        .route("/actions/{id}/reject", axum::routing::post(reject_action))
+        .route("/mandates", post(create_mandate))
+        .route("/mandates", get(list_mandates))
+        .route("/mandates/batch", post(create_mandate_batch))
+        .route("/mandates/stats", get(get_mandate_stats))
+        .route("/mandates/{id}", get(get_mandate_by_id))
+        .route("/mandates/{id}", axum::routing::delete(revoke_mandate))
+        .route("/mandates/{id}/receipt", get(get_mandate_receipt))
+        .route("/health/mandate", get(get_mandate_health))
+        .route("/.well-known/agent-card.json", get(get_agent_card));
 
     if prometheus_enabled {
         router = router.route("/metrics/prometheus", get(prometheus_metrics));
@@ -1672,6 +1933,65 @@ pub fn all_routes(app_state: Arc<AppState>) -> Router {
         ));
     }
 
+    router.with_state(app_state)
+}
+
+/// Build routes for the Unix domain socket listener.
+///
+/// UDS connections bypass token auth — local process identity is verified
+/// by socket credentials (`SO_PEERCRED`). The routes are identical to `all_routes`
+/// but never apply the auth middleware layer.
+pub fn uds_routes(app_state: Arc<AppState>) -> Router {
+    let prometheus_enabled = app_state.prometheus_enabled;
+
+    let mut router = Router::new()
+        .route("/", get(crate::ui::dashboard_handler))
+        .route("/dashboard", get(crate::ui::dashboard_handler))
+        .route("/context", get(get_context_route))
+        .route("/processes", get(get_processes))
+        .route("/processes/live", get(stream_processes_live))
+        .route("/processes/{pid}", get(get_process_by_pid))
+        .route("/ppid/{ppid}", get(get_by_ppid))
+        .route("/graph/{pid}", get(get_graph))
+        .route("/events", get(stream_events))
+        .route("/stream", get(stream_events))
+        .route("/system", get(system_snapshot))
+        .route("/timeline", get(get_timeline))
+        .route("/metrics/system", get(get_system_metrics))
+        .route("/alerts", get(stream_alerts))
+        .route("/insights", get(get_insights))
+        .route("/insights/recent", get(get_recent_insights))
+        .route("/insights/{id}", get(get_insight_by_id))
+        .route("/insights/{id}/feedback", post(submit_feedback))
+        .route("/api/feedback", post(submit_feedback_api))
+        .route("/api/slack/interactions", post(handle_slack_interaction))
+        .route("/incidents", get(get_incidents))
+        .route("/incidents/summary", get(get_incident_summary))
+        .route("/incidents/stats", get(get_incident_stats))
+        .route("/incidents/{id}", get(get_incident_by_id))
+        .route("/attribution", get(get_attributions))
+        .route("/metrics", get(metrics_handler))
+        .route("/status", get(status_handler))
+        .route("/healthz", get(healthz))
+        .route("/actions", get(get_actions))
+        .route("/actions/{id}", get(get_action_by_id))
+        .route("/actions/{id}/approve", axum::routing::post(approve_action))
+        .route("/actions/{id}/reject", axum::routing::post(reject_action))
+        .route("/mandates", post(create_mandate))
+        .route("/mandates", get(list_mandates))
+        .route("/mandates/batch", post(create_mandate_batch))
+        .route("/mandates/stats", get(get_mandate_stats))
+        .route("/mandates/{id}", get(get_mandate_by_id))
+        .route("/mandates/{id}", axum::routing::delete(revoke_mandate))
+        .route("/mandates/{id}/receipt", get(get_mandate_receipt))
+        .route("/health/mandate", get(get_mandate_health))
+        .route("/.well-known/agent-card.json", get(get_agent_card));
+
+    if prometheus_enabled {
+        router = router.route("/metrics/prometheus", get(prometheus_metrics));
+    }
+
+    // NOTE: No auth middleware — UDS connections are trusted (local process identity).
     router.with_state(app_state)
 }
 
@@ -2201,6 +2521,10 @@ mod tests {
             auth_token: None,
             incident_store: None,
             k8s: None,
+            mandate: None,
+            identity: None,
+            commerce_policy: None,
+            claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
         let Json(resp) = super::status_handler(State(app_state)).await;
         let val = serde_json::to_value(resp).unwrap();
@@ -2249,6 +2573,10 @@ mod tests {
             auth_token: None,
             incident_store: None,
             k8s: None,
+            mandate: None,
+            identity: None,
+            commerce_policy: None,
+            claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
 
         let Json(resp) = super::metrics_handler(State(app_state)).await;
@@ -2280,6 +2608,10 @@ mod tests {
             auth_token: None,
             incident_store: None,
             k8s: None,
+            mandate: None,
+            identity: None,
+            commerce_policy: None,
+            claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
         let router = super::all_routes(Arc::clone(&app_state));
         let response = router
@@ -2314,6 +2646,10 @@ mod tests {
             auth_token: None,
             incident_store: None,
             k8s: None,
+            mandate: None,
+            identity: None,
+            commerce_policy: None,
+            claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
         let router = super::all_routes(Arc::clone(&app_state));
         let response = router
@@ -2362,6 +2698,10 @@ mod tests {
             auth_token: None,
             incident_store: None,
             k8s: None,
+            mandate: None,
+            identity: None,
+            commerce_policy: None,
+            claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
         let router = super::all_routes(app_state);
         let response = router
@@ -2395,6 +2735,10 @@ mod tests {
             incident_store: None,
             auth_token: Some("secret123".to_string()),
             k8s: None,
+            mandate: None,
+            identity: None,
+            commerce_policy: None,
+            claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
         let router = super::all_routes(app_state);
         let response = router
@@ -2428,6 +2772,10 @@ mod tests {
             incident_store: None,
             auth_token: Some("secret123".to_string()),
             k8s: None,
+            mandate: None,
+            identity: None,
+            commerce_policy: None,
+            claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
         let router = super::all_routes(app_state);
         let response = router
@@ -2462,6 +2810,10 @@ mod tests {
             incident_store: None,
             auth_token: Some("secret123".to_string()),
             k8s: None,
+            mandate: None,
+            identity: None,
+            commerce_policy: None,
+            claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
         let router = super::all_routes(app_state);
         let response = router
@@ -2496,6 +2848,10 @@ mod tests {
             incident_store: None,
             auth_token: Some("secret123".to_string()),
             k8s: None,
+            mandate: None,
+            identity: None,
+            commerce_policy: None,
+            claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
         let router = super::all_routes(app_state);
         let response = router
@@ -2509,5 +2865,370 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // =========================================================================
+    // Mandate API integration tests
+    // =========================================================================
+
+    fn app_state_with_mandate() -> Arc<AppState> {
+        let mgr = cognitod::mandate::MandateManager::new(
+            [0x0706050403020100, 0x0f0e0d0c0b0a0908],
+            false,
+            linnix_ai_ebpf_common::MandateMode::Monitor,
+        );
+        Arc::new(AppState {
+            context: Arc::new(ContextStore::new(Duration::from_secs(60), 10, None)),
+            metrics: Arc::new(Metrics::new()),
+            alerts: None,
+            insights: Arc::new(InsightStore::new(16, None)),
+            offline: Arc::new(OfflineGuard::new(false)),
+            transport: "perf",
+            probe_state: ProbeState::disabled(),
+            enforcement: None,
+            reasoner: ReasonerConfig::default(),
+            prometheus_enabled: false,
+            alert_history: Arc::new(AlertHistory::new(16)),
+            auth_token: None,
+            incident_store: None,
+            k8s: None,
+            mandate: Some(Arc::new(mgr)),
+            identity: None,
+            commerce_policy: None,
+            claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
+        })
+    }
+
+    #[tokio::test]
+    async fn mandate_health_returns_ok() {
+        let app_state = app_state_with_mandate();
+        let router = super::all_routes(app_state);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/health/mandate")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["enforcement_mode"], "monitor");
+        assert_eq!(val["bpf_lsm_loaded"], false);
+        assert_eq!(val["siphash_key_set"], true);
+    }
+
+    #[tokio::test]
+    async fn mandate_health_503_when_disabled() {
+        let app_state = Arc::new(AppState {
+            context: Arc::new(ContextStore::new(Duration::from_secs(60), 10, None)),
+            metrics: Arc::new(Metrics::new()),
+            alerts: None,
+            insights: Arc::new(InsightStore::new(16, None)),
+            offline: Arc::new(OfflineGuard::new(false)),
+            transport: "perf",
+            probe_state: ProbeState::disabled(),
+            enforcement: None,
+            reasoner: ReasonerConfig::default(),
+            prometheus_enabled: false,
+            alert_history: Arc::new(AlertHistory::new(16)),
+            auth_token: None,
+            incident_store: None,
+            k8s: None,
+            mandate: None,
+            identity: None,
+            commerce_policy: None,
+            claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
+        });
+        let router = super::all_routes(app_state);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/health/mandate")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn mandate_create_get_revoke_lifecycle() {
+        let app_state = app_state_with_mandate();
+        let pid = std::process::id();
+
+        // POST /mandates — create
+        let router = super::all_routes(Arc::clone(&app_state));
+        let body = serde_json::json!({
+            "pid": pid,
+            "args": ["/usr/bin/curl", "https://example.com"],
+            "ttl_ms": 10000
+        });
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mandates")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let resp_body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        let mandate_id = created["id"].as_str().unwrap().to_string();
+        assert_eq!(created["status"], "active");
+        assert_eq!(created["key"]["pid"], pid);
+        assert!(created["key"]["cmd_hash"].as_u64().unwrap() > 0);
+
+        // GET /mandates/{id} — retrieve
+        let router = super::all_routes(Arc::clone(&app_state));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/mandates/{}", mandate_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp_body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let fetched: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(fetched["id"], mandate_id);
+        assert_eq!(fetched["status"], "active");
+
+        // DELETE /mandates/{id} — revoke
+        let router = super::all_routes(Arc::clone(&app_state));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/mandates/{}", mandate_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // GET again — should be revoked
+        let router = super::all_routes(Arc::clone(&app_state));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/mandates/{}", mandate_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp_body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let revoked: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(revoked["status"], "revoked");
+    }
+
+    #[tokio::test]
+    async fn mandate_stats_endpoint() {
+        let app_state = app_state_with_mandate();
+        let pid = std::process::id();
+
+        // Create two mandates
+        let router = super::all_routes(Arc::clone(&app_state));
+        let body = serde_json::json!({"pid": pid, "args": ["/bin/ls"], "ttl_ms": 5000});
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mandates")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let router = super::all_routes(Arc::clone(&app_state));
+        let body = serde_json::json!({"pid": pid, "args": ["/bin/cat"], "ttl_ms": 5000});
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mandates")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // GET /mandates/stats
+        let router = super::all_routes(Arc::clone(&app_state));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/mandates/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp_body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let stats: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(stats["total_created"], 2);
+        assert_eq!(stats["active_count"], 2);
+        assert_eq!(stats["backpressure_active"], false);
+    }
+
+    #[tokio::test]
+    async fn mandate_list_with_filter() {
+        let app_state = app_state_with_mandate();
+        let pid = std::process::id();
+
+        // Create two mandates
+        let router = super::all_routes(Arc::clone(&app_state));
+        let body = serde_json::json!({"pid": pid, "args": ["/bin/a"], "ttl_ms": 60000});
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mandates")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let resp_body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        let id1 = created["id"].as_str().unwrap().to_string();
+
+        let router = super::all_routes(Arc::clone(&app_state));
+        let body = serde_json::json!({"pid": pid, "args": ["/bin/b"], "ttl_ms": 60000});
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mandates")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Revoke first
+        let router = super::all_routes(Arc::clone(&app_state));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/mandates/{}", id1))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // GET /mandates?status=active
+        let router = super::all_routes(Arc::clone(&app_state));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/mandates?status=active")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp_body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let list: Vec<serde_json::Value> = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["status"], "active");
+
+        // GET /mandates (no filter — both)
+        let router = super::all_routes(Arc::clone(&app_state));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/mandates")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp_body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let list: Vec<serde_json::Value> = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(list.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn mandate_get_nonexistent_returns_404() {
+        let app_state = app_state_with_mandate();
+        let router = super::all_routes(app_state);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/mandates/does-not-exist")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn mandate_delete_nonexistent_returns_404() {
+        let app_state = app_state_with_mandate();
+        let router = super::all_routes(app_state);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/mandates/does-not-exist")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn mandate_create_invalid_pid_returns_400() {
+        let app_state = app_state_with_mandate();
+        let router = super::all_routes(app_state);
+        // PID 999999999 almost certainly doesn't exist
+        let body = serde_json::json!({"pid": 999999999, "args": ["/bin/ls"], "ttl_ms": 5000});
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mandates")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp_body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let err: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert!(err["error"].as_str().unwrap().contains("999999999"));
     }
 }

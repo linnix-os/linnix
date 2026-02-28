@@ -45,3 +45,11 @@ enabled = true
 [psi]
 # Duration in seconds of sustained pressure required to trigger attribution
 sustained_pressure_seconds = 15
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Linnix-Claw: Mandate Enforcement (Phase 0)
+# ─────────────────────────────────────────────────────────────────────────────
+[mandate]
+mode = "monitor"                    # "monitor" (log only) or "enforce" (block unauthorized)
+map_capacity = 65536                # max entries in BPF LRU mandate map
+allow_commerce_without_lsm = true   # allow mandate API even without BPF LSM kernel support
