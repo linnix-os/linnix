@@ -97,6 +97,8 @@ pub struct Config {
     pub compliance: ComplianceConfig,
     #[serde(default)]
     pub receipt_privacy: ReceiptPrivacyConfig,
+    #[serde(default)]
+    pub chain: ChainConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -716,6 +718,105 @@ fn default_db_key_path() -> String {
     "/var/lib/linnix/receipt_db.key".to_string()
 }
 
+// =============================================================================
+// LINNIX-CLAW PHASE 5: ON-CHAIN SETTLEMENT (§8)
+// =============================================================================
+
+/// Configuration for on-chain EVM settlement via alloy.
+///
+/// When `enabled = true`, cognitod connects to the configured EVM RPC
+/// endpoint and uses TaskSettlement + AgentRegistry contracts for
+/// trustless, non-custodial agent-to-agent payments.
+///
+/// Example TOML:
+/// ```toml
+/// [chain]
+/// enabled = true
+/// rpc_url = "https://sepolia.base.org"
+/// chain_id = 84532
+/// settlement_contract = "0x1234...abcd"
+/// registry_contract = "0x5678...ef01"
+/// token_address = "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+/// token_decimals = 6
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainConfig {
+    /// Master switch for on-chain settlement. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// EVM JSON-RPC endpoint URL.
+    #[serde(default = "default_rpc_url")]
+    pub rpc_url: String,
+
+    /// Chain ID (e.g., 8453 for Base, 84532 for Base Sepolia).
+    #[serde(default = "default_chain_id")]
+    pub chain_id: u64,
+
+    /// TaskSettlement contract address (hex, 0x-prefixed).
+    #[serde(default)]
+    pub settlement_contract: String,
+
+    /// AgentRegistry contract address (hex, 0x-prefixed).
+    #[serde(default)]
+    pub registry_contract: String,
+
+    /// ERC-20 token address for settlement (e.g., USDC).
+    #[serde(default)]
+    pub token_address: String,
+
+    /// Token decimal places (6 for USDC, 18 for DAI). Default: 6.
+    #[serde(default = "default_token_decimals")]
+    pub token_decimals: u8,
+
+    /// Optional: hex-encoded 32-byte private key for the on-chain signer.
+    /// If empty, falls back to `LINNIX_CHAIN_PRIVATE_KEY` env var.
+    /// The HKDF-derived secp256k1 key from AgentIdentity is used if neither is set.
+    #[serde(default)]
+    pub private_key: String,
+
+    /// Confirmation blocks to wait after tx submission. Default: 1.
+    #[serde(default = "default_confirmations")]
+    pub confirmations: u64,
+
+    /// Auto-register this agent on the AgentRegistry at startup. Default: true.
+    #[serde(default = "default_auto_register")]
+    pub auto_register: bool,
+}
+
+impl Default for ChainConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rpc_url: default_rpc_url(),
+            chain_id: default_chain_id(),
+            settlement_contract: String::new(),
+            registry_contract: String::new(),
+            token_address: String::new(),
+            token_decimals: default_token_decimals(),
+            private_key: String::new(),
+            confirmations: default_confirmations(),
+            auto_register: default_auto_register(),
+        }
+    }
+}
+
+fn default_rpc_url() -> String {
+    "https://sepolia.base.org".to_string()
+}
+fn default_chain_id() -> u64 {
+    84532 // Base Sepolia testnet
+}
+fn default_token_decimals() -> u8 {
+    6 // USDC
+}
+fn default_confirmations() -> u64 {
+    1
+}
+fn default_auto_register() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -840,5 +941,36 @@ encrypt_db = true
         assert_eq!(cfg.redaction_level, "external");
         assert_eq!(cfg.retention_days, 90);
         assert!(!cfg.encrypt_db);
+    }
+
+    #[test]
+    fn chain_config_defaults() {
+        let cfg = ChainConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.chain_id, 84532);
+        assert_eq!(cfg.token_decimals, 6);
+        assert!(cfg.settlement_contract.is_empty());
+        assert!(cfg.auto_register);
+    }
+
+    #[test]
+    fn parse_chain_config() {
+        let toml = r#"
+[chain]
+enabled = true
+rpc_url = "https://mainnet.base.org"
+chain_id = 8453
+settlement_contract = "0x1234567890abcdef1234567890abcdef12345678"
+registry_contract = "0xabcdef1234567890abcdef1234567890abcdef12"
+token_address = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+token_decimals = 6
+confirmations = 2
+auto_register = false
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.chain.enabled);
+        assert_eq!(cfg.chain.chain_id, 8453);
+        assert_eq!(cfg.chain.confirmations, 2);
+        assert!(!cfg.chain.auto_register);
     }
 }

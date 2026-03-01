@@ -1344,6 +1344,55 @@ async fn main() -> Result<(), Box<dyn Error>> {
             cognitod::privacy::ReceiptRedactor::new(level)
         });
 
+    // ── Linnix-Claw: initialize OnChainAdapter (§8) ─────────────────────
+    let payment_adapter: Option<Arc<dyn cognitod::payment::PaymentAdapter>> = if config
+        .chain
+        .enabled
+    {
+        if let Some(ref id) = agent_identity.clone() {
+            match cognitod::onchain::OnChainAdapter::new(config.chain.clone(), Arc::clone(id)) {
+                Ok(adapter) => {
+                    let adapter = Arc::new(adapter);
+                    // Auto-register agent on-chain if configured
+                    if config.chain.auto_register {
+                        let reg_adapter = Arc::clone(&adapter);
+                        tokio::spawn(async move {
+                            match reg_adapter.register_agent().await {
+                                Ok(()) => info!("[claw-onchain] Agent auto-registration complete"),
+                                Err(e) => warn!(
+                                    "[claw-onchain] Agent auto-registration failed: {e:#}. \
+                                     Register manually via API or CLI."
+                                ),
+                            }
+                        });
+                    }
+                    info!(
+                        "[claw-onchain] OnChainAdapter active: chain={}, settlement={}",
+                        config.chain.chain_id, config.chain.settlement_contract
+                    );
+                    Some(adapter as Arc<dyn cognitod::payment::PaymentAdapter>)
+                }
+                Err(e) => {
+                    warn!(
+                        "[claw-onchain] Failed to initialize OnChainAdapter: {e:#}. \
+                         Falling back to NoopAdapter."
+                    );
+                    Some(Arc::new(cognitod::payment::NoopAdapter)
+                        as Arc<dyn cognitod::payment::PaymentAdapter>)
+                }
+            }
+        } else {
+            warn!(
+                "[claw-onchain] chain.enabled=true but agent identity unavailable. \
+                 On-chain settlement disabled."
+            );
+            None
+        }
+    } else {
+        info!("[claw] On-chain settlement disabled (chain.enabled=false)");
+        None
+    };
+
     let app_state = Arc::new(AppState {
         context: Arc::clone(&context),
         metrics: Arc::clone(&metrics),
@@ -1366,6 +1415,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         compliance_engine,
         receipt_redactor,
         claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
+        payment_adapter,
     });
 
     let api = all_routes(app_state.clone());

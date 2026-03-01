@@ -53,3 +53,21 @@ sustained_pressure_seconds = 15
 mode = "monitor"                    # "monitor" (log only) or "enforce" (block unauthorized)
 map_capacity = 65536                # max entries in BPF LRU mandate map
 allow_commerce_without_lsm = true   # allow mandate API even without BPF LSM kernel support
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Linnix-Claw: On-Chain Settlement (Phase 5)
+# ─────────────────────────────────────────────────────────────────────────────
+# Enable trustless agent-to-agent ERC-20 payments via TaskSettlement contract.
+# Requires deployed contracts on an EVM L2 (Base Sepolia for testnet).
+#
+# [chain]
+# enabled = true
+# rpc_url = "https://sepolia.base.org"
+# chain_id = 84532
+# settlement_contract = "0x..."    # Deployed TaskSettlement address
+# registry_contract = "0x..."      # Deployed AgentRegistry address
+# token_address = "0x036CbD53842c5426634e7929541eC2318f3dCF7e"  # USDC on Base Sepolia
+# token_decimals = 6
+# auto_register = true             # Auto-register agent on startup
+# confirmations = 1
+# # private_key = "0x..."          # Optional: explicit signer key (or set LINNIX_CHAIN_PRIVATE_KEY)

@@ -1950,6 +1950,9 @@ pub struct AppState {
     pub compliance_engine: Option<Arc<cognitod::compliance::ComplianceEngine>>,
     /// Privacy redactor for receipt responses (§9).
     pub receipt_redactor: Option<cognitod::privacy::ReceiptRedactor>,
+    /// On-chain payment adapter for settlement (§8).
+    #[allow(dead_code)]
+    pub payment_adapter: Option<Arc<dyn cognitod::payment::PaymentAdapter>>,
 }
 
 pub fn all_routes(app_state: Arc<AppState>) -> Router {
@@ -2605,6 +2608,7 @@ mod tests {
             spend_tracker: None,
             compliance_engine: None,
             receipt_redactor: None,
+            payment_adapter: None,
             claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
         let Json(resp) = super::status_handler(State(app_state)).await;
@@ -2660,6 +2664,7 @@ mod tests {
             spend_tracker: None,
             compliance_engine: None,
             receipt_redactor: None,
+            payment_adapter: None,
             claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
 
@@ -2698,6 +2703,7 @@ mod tests {
             spend_tracker: None,
             compliance_engine: None,
             receipt_redactor: None,
+            payment_adapter: None,
             claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
         let router = super::all_routes(Arc::clone(&app_state));
@@ -2739,6 +2745,7 @@ mod tests {
             spend_tracker: None,
             compliance_engine: None,
             receipt_redactor: None,
+            payment_adapter: None,
             claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
         let router = super::all_routes(Arc::clone(&app_state));
@@ -2794,6 +2801,7 @@ mod tests {
             spend_tracker: None,
             compliance_engine: None,
             receipt_redactor: None,
+            payment_adapter: None,
             claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
         let router = super::all_routes(app_state);
@@ -2834,6 +2842,7 @@ mod tests {
             spend_tracker: None,
             compliance_engine: None,
             receipt_redactor: None,
+            payment_adapter: None,
             claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
         let router = super::all_routes(app_state);
@@ -2874,6 +2883,7 @@ mod tests {
             spend_tracker: None,
             compliance_engine: None,
             receipt_redactor: None,
+            payment_adapter: None,
             claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
         let router = super::all_routes(app_state);
@@ -2915,6 +2925,7 @@ mod tests {
             spend_tracker: None,
             compliance_engine: None,
             receipt_redactor: None,
+            payment_adapter: None,
             claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
         let router = super::all_routes(app_state);
@@ -2956,6 +2967,7 @@ mod tests {
             spend_tracker: None,
             compliance_engine: None,
             receipt_redactor: None,
+            payment_adapter: None,
             claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
         let router = super::all_routes(app_state);
@@ -3003,6 +3015,7 @@ mod tests {
             spend_tracker: None,
             compliance_engine: None,
             receipt_redactor: None,
+            payment_adapter: None,
             claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         })
     }
@@ -3051,6 +3064,7 @@ mod tests {
             spend_tracker: None,
             compliance_engine: None,
             receipt_redactor: None,
+            payment_adapter: None,
             claw_metrics: Arc::new(cognitod::claw_metrics::ClawMetrics::new()),
         });
         let router = super::all_routes(app_state);
