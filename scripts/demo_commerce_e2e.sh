@@ -86,7 +86,12 @@ step "2" "Deploy smart contracts"
 # ─────────────────────────────────────────────────────────────────────────────
 
 cd "$CONTRACTS_DIR"
-DEPLOY_OUTPUT=$(npx hardhat run scripts/deploy.js --network localhost 2>&1) || fail "Deploy failed"
+if [[ "$MODE" == "--local" ]]; then
+    HARDHAT_NETWORK="localhost"
+else
+    HARDHAT_NETWORK="baseSepolia"
+fi
+DEPLOY_OUTPUT=$(npx hardhat run scripts/deploy.js --network "$HARDHAT_NETWORK" 2>&1) || fail "Deploy failed"
 echo "$DEPLOY_OUTPUT"
 
 # Extract deployed addresses

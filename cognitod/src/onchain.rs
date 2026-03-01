@@ -116,6 +116,17 @@ impl OnChainAdapter {
     /// 2. `LINNIX_CHAIN_PRIVATE_KEY` env var if set
     /// 3. The HKDF-derived secp256k1 key from `AgentIdentity` (default)
     pub fn new(config: ChainConfig, identity: Arc<AgentIdentity>) -> Result<Self> {
+        // Validate required contract addresses before proceeding
+        if config.settlement_contract.is_empty() {
+            anyhow::bail!("chain.settlement_contract must be set when chain.enabled=true");
+        }
+        if config.registry_contract.is_empty() {
+            anyhow::bail!("chain.registry_contract must be set when chain.enabled=true");
+        }
+        if config.token_address.is_empty() {
+            anyhow::bail!("chain.token_address must be set when chain.enabled=true");
+        }
+
         let signer = resolve_signer(&config, &identity)?;
         let eth_addr = signer.address();
 
@@ -376,10 +387,13 @@ impl OnChainAdapter {
         digest_input.extend_from_slice(&struct_hash);
         let digest = keccak256(&digest_input);
 
-        // Sign with secp256k1 (recoverable signature)
-        let (sig, recid): (k256::ecdsa::Signature, _) = self
-            .identity
-            .secp256k1_signing_key()
+        // Sign with the configured chain signer (respects chain.private_key /
+        // LINNIX_CHAIN_PRIVATE_KEY, falling back to the HKDF-derived identity key).
+        let signing_key = k256::ecdsa::SigningKey::from_slice(
+            self.signer.credential().to_bytes().as_ref(),
+        )
+        .context("failed to derive signing key from chain signer")?;
+        let (sig, recid): (k256::ecdsa::Signature, _) = signing_key
             .sign_prehash_recoverable(&digest)
             .map_err(|e| anyhow::anyhow!("secp256k1 signing failed: {e}"))?;
 
