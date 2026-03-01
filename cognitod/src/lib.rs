@@ -19,6 +19,7 @@ pub mod k8s;
 pub mod mandate;
 pub mod metrics;
 pub mod notifications;
+pub mod onchain;
 pub mod payment;
 pub mod privacy;
 pub mod receipt;
