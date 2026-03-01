@@ -389,10 +389,9 @@ impl OnChainAdapter {
 
         // Sign with the configured chain signer (respects chain.private_key /
         // LINNIX_CHAIN_PRIVATE_KEY, falling back to the HKDF-derived identity key).
-        let signing_key = k256::ecdsa::SigningKey::from_slice(
-            self.signer.credential().to_bytes().as_ref(),
-        )
-        .context("failed to derive signing key from chain signer")?;
+        let signing_key =
+            k256::ecdsa::SigningKey::from_slice(self.signer.credential().to_bytes().as_ref())
+                .context("failed to derive signing key from chain signer")?;
         let (sig, recid): (k256::ecdsa::Signature, _) = signing_key
             .sign_prehash_recoverable(&digest)
             .map_err(|e| anyhow::anyhow!("secp256k1 signing failed: {e}"))?;
