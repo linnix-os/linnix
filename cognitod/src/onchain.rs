@@ -638,4 +638,244 @@ mod tests {
         let signer_addr = signer.address();
         assert_eq!(signer_addr.as_slice(), &expected_addr);
     }
+
+    #[test]
+    fn resolve_signer_config_key_takes_priority() {
+        let seed = [42u8; 32];
+        let identity = AgentIdentity::from_seed(seed, "did:web:test.example".to_string()).unwrap();
+        // Use a well-known test private key (different from what identity would derive)
+        let config = ChainConfig {
+            private_key: "0x4c0883a6952b0d5f9d0e3e71b5f5e07b5f9f5e9d5a5e3e71b5f5e07b5f9f5e9d"
+                .to_string(),
+            ..ChainConfig::default()
+        };
+        let signer = resolve_signer(&config, &identity).unwrap();
+
+        // Should NOT match identity address since we used a different key
+        let identity_addr = identity.ethereum_address();
+        assert_ne!(signer.address().as_slice(), &identity_addr);
+    }
+
+    #[test]
+    fn new_adapter_validates_empty_settlement_contract() {
+        let seed = [42u8; 32];
+        let identity =
+            Arc::new(AgentIdentity::from_seed(seed, "did:web:test.example".into()).unwrap());
+        // settlement_contract left empty
+        let config = ChainConfig {
+            registry_contract: "0x9a6FeBA6d7B97ef91099051eB61F372d1EcD83a3".into(),
+            token_address: "0x036CbD53842c5426634e7929541eC2318f3dCF7e".into(),
+            ..ChainConfig::default()
+        };
+        match OnChainAdapter::new(config, identity) {
+            Ok(_) => panic!("expected error for empty settlement_contract"),
+            Err(e) => assert!(
+                e.to_string().contains("settlement_contract"),
+                "unexpected error: {e}"
+            ),
+        }
+    }
+
+    #[test]
+    fn new_adapter_validates_empty_registry_contract() {
+        let seed = [42u8; 32];
+        let identity =
+            Arc::new(AgentIdentity::from_seed(seed, "did:web:test.example".into()).unwrap());
+        // registry_contract left empty
+        let config = ChainConfig {
+            settlement_contract: "0x60eE6872920addF41359625B47A07401496bBD5b".into(),
+            token_address: "0x036CbD53842c5426634e7929541eC2318f3dCF7e".into(),
+            ..ChainConfig::default()
+        };
+        match OnChainAdapter::new(config, identity) {
+            Ok(_) => panic!("expected error for empty registry_contract"),
+            Err(e) => assert!(
+                e.to_string().contains("registry_contract"),
+                "unexpected error: {e}"
+            ),
+        }
+    }
+
+    #[test]
+    fn new_adapter_validates_empty_token_address() {
+        let seed = [42u8; 32];
+        let identity =
+            Arc::new(AgentIdentity::from_seed(seed, "did:web:test.example".into()).unwrap());
+        // token_address left empty
+        let config = ChainConfig {
+            settlement_contract: "0x60eE6872920addF41359625B47A07401496bBD5b".into(),
+            registry_contract: "0x9a6FeBA6d7B97ef91099051eB61F372d1EcD83a3".into(),
+            ..ChainConfig::default()
+        };
+        match OnChainAdapter::new(config, identity) {
+            Ok(_) => panic!("expected error for empty token_address"),
+            Err(e) => assert!(
+                e.to_string().contains("token_address"),
+                "unexpected error: {e}"
+            ),
+        }
+    }
+
+    #[test]
+    fn new_adapter_succeeds_with_valid_config() {
+        let seed = [42u8; 32];
+        let identity =
+            Arc::new(AgentIdentity::from_seed(seed, "did:web:test.example".into()).unwrap());
+        let config = test_config();
+        let adapter = OnChainAdapter::new(config, identity).unwrap();
+        assert_eq!(adapter.name(), "on-chain");
+        assert_eq!(adapter.token.symbol, "USDC");
+        assert_eq!(adapter.token.decimals, 6);
+    }
+
+    #[test]
+    fn eip712_signature_is_65_bytes() {
+        let seed = [42u8; 32];
+        let identity =
+            Arc::new(AgentIdentity::from_seed(seed, "did:web:test.example".into()).unwrap());
+        let config = test_config();
+        let adapter = OnChainAdapter::new(config, identity).unwrap();
+
+        let task_id = string_to_bytes32("task-001");
+        let amount = U256::from(1_000_000u64); // 1 USDC
+        let receipt = b"test receipt payload";
+
+        let sig = adapter
+            .compute_solidity_eip712_signature(&task_id, &amount, receipt)
+            .unwrap();
+        assert_eq!(sig.len(), 65, "EIP-712 signature must be 65 bytes (r+s+v)");
+        // v must be 27 or 28
+        assert!(
+            sig[64] == 27 || sig[64] == 28,
+            "v byte must be 27 or 28, got {}",
+            sig[64]
+        );
+    }
+
+    #[test]
+    fn eip712_signature_is_deterministic() {
+        let seed = [42u8; 32];
+        let identity =
+            Arc::new(AgentIdentity::from_seed(seed, "did:web:test.example".into()).unwrap());
+        let config = test_config();
+        let adapter = OnChainAdapter::new(config, identity).unwrap();
+
+        let task_id = string_to_bytes32("task-determ");
+        let amount = U256::from(500_000u64);
+        let receipt = b"deterministic check";
+
+        let sig1 = adapter
+            .compute_solidity_eip712_signature(&task_id, &amount, receipt)
+            .unwrap();
+        let sig2 = adapter
+            .compute_solidity_eip712_signature(&task_id, &amount, receipt)
+            .unwrap();
+        assert_eq!(sig1, sig2, "same inputs must produce same signature");
+    }
+
+    #[test]
+    fn eip712_different_amounts_produce_different_sigs() {
+        let seed = [42u8; 32];
+        let identity =
+            Arc::new(AgentIdentity::from_seed(seed, "did:web:test.example".into()).unwrap());
+        let config = test_config();
+        let adapter = OnChainAdapter::new(config, identity).unwrap();
+
+        let task_id = string_to_bytes32("task-diff");
+        let receipt = b"diff amount test";
+
+        let sig1 = adapter
+            .compute_solidity_eip712_signature(&task_id, &U256::from(1_000_000u64), receipt)
+            .unwrap();
+        let sig2 = adapter
+            .compute_solidity_eip712_signature(&task_id, &U256::from(2_000_000u64), receipt)
+            .unwrap();
+        assert_ne!(sig1, sig2, "different amounts must produce different sigs");
+    }
+
+    #[test]
+    fn string_to_bytes32_deterministic() {
+        let s = "task-12345";
+        let b1 = string_to_bytes32(s);
+        let b2 = string_to_bytes32(s);
+        assert_eq!(b1, b2);
+        assert!(b1.iter().any(|&b| b != 0));
+    }
+
+    #[test]
+    fn string_to_bytes32_different_inputs() {
+        let b1 = string_to_bytes32("task-A");
+        let b2 = string_to_bytes32("task-B");
+        assert_ne!(b1, b2);
+    }
+
+    #[test]
+    fn keccak256_known_vector() {
+        // keccak256("") = c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470
+        let hash = keccak256(b"");
+        assert_eq!(
+            hex::encode(hash),
+            "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_settlement_path_returns_on_chain() {
+        let seed = [42u8; 32];
+        let identity =
+            Arc::new(AgentIdentity::from_seed(seed, "did:web:test.example".into()).unwrap());
+        let config = test_config();
+        let adapter = OnChainAdapter::new(config.clone(), identity).unwrap();
+
+        let path = adapter
+            .resolve_settlement_path("did:web:other.example")
+            .await
+            .unwrap();
+        match path {
+            SettlementPath::OnChain { chain_id, token } => {
+                assert_eq!(chain_id, config.chain_id);
+                assert_eq!(token, config.token_address);
+            }
+            other => panic!("expected OnChain path, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn settle_rejects_non_onchain_path() {
+        let seed = [42u8; 32];
+        let identity =
+            Arc::new(AgentIdentity::from_seed(seed, "did:web:test.example".into()).unwrap());
+        let config = test_config();
+        let adapter = OnChainAdapter::new(config, identity).unwrap();
+
+        let bad_path = SettlementPath::Manual;
+        let result = adapter.settle(r#"{"task_id":"t1"}"#, 100, &bad_path).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("only handles on-chain")
+        );
+    }
+
+    // =========================================================================
+    // Helpers
+    // =========================================================================
+
+    /// Returns a valid ChainConfig pointing to localhost (won't be called in unit tests).
+    fn test_config() -> ChainConfig {
+        ChainConfig {
+            enabled: true,
+            rpc_url: "http://127.0.0.1:8545".to_string(),
+            chain_id: 31337, // Anvil default
+            settlement_contract: "0x5FbDB2315678afecb367f032d93F642f64180aa3".to_string(),
+            registry_contract: "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512".to_string(),
+            token_address: "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0".to_string(),
+            token_decimals: 6,
+            private_key: String::new(),
+            confirmations: 1,
+            auto_register: true,
+        }
+    }
 }
