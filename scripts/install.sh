@@ -43,41 +43,52 @@ else
     exit 1
 fi
 
-# 5. Install Directories
+# 5. Install Directories (allow overrides for testing/packaging)
+BIN_DIR="${BIN_DIR:-/usr/local/bin}"
+CONFIG_DIR="${CONFIG_DIR:-/etc/linnix}"
+SERVICE_DIR="${SERVICE_DIR:-/etc/systemd/system}"
+DATA_DIR="${DATA_DIR:-/var/lib/linnix}"
+
 echo "Setting up directories..."
-mkdir -p /etc/linnix
-mkdir -p /var/lib/linnix
-mkdir -p /usr/local/bin
+mkdir -p "${CONFIG_DIR}"
+mkdir -p "${DATA_DIR}"
+mkdir -p "${BIN_DIR}"
+mkdir -p "${SERVICE_DIR}"
 
 # 6. Install Binary (Mock for now - usually curl download)
 # In a real script: curl -L https://.../cognitod -o /usr/local/bin/cognitod
 if [ -f "./target/release/cognitod" ]; then
     echo "Installing local binary..."
-    cp ./target/release/cognitod /usr/local/bin/cognitod
-    chmod +x /usr/local/bin/cognitod
+    cp ./target/release/cognitod "${BIN_DIR}/cognitod"
+    chmod +x "${BIN_DIR}/cognitod"
 else
     echo -e "${YELLOW}Binary not found in ./target/release. Skipping binary install (assuming dev mode or manual install).${NC}"
 fi
 
-# 7. Create Systemd Service
+# 7. Install Config (if present)
+if [ -f "./configs/linnix.toml" ]; then
+    cp ./configs/linnix.toml "${CONFIG_DIR}/linnix.toml"
+fi
+
+# 8. Create Systemd Service
 echo "Creating systemd service..."
-cat <<EOF > /etc/systemd/system/cognitod.service
+cat <<EOF > "${SERVICE_DIR}/cognitod.service"
 [Unit]
 Description=Linnix Agent (Cognitod)
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/cognitod
+ExecStart=${BIN_DIR}/cognitod
 Restart=always
 User=root
 Environment=RUST_LOG=info
-WorkingDirectory=/var/lib/linnix
+WorkingDirectory=${DATA_DIR}
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# 8. Reload Daemon
+# 9. Reload Daemon
 systemctl daemon-reload
 echo -e "${GREEN}Installation Complete!${NC}"
 echo "Run 'systemctl start cognitod' to start the agent."
