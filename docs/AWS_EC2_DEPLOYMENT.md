@@ -40,7 +40,7 @@ Complete guide for deploying Linnix eBPF observability platform on AWS EC2 insta
 ✅ **Debian 12**
 
 ### Kernel Requirements
-- **Minimum Kernel:** 5.8+
+- **Minimum Kernel:** 5.12+ (x86_64) / 5.18+ (arm64) — required for the `BPF_FETCH` atomics used by the sequencer
 - **Recommended Kernel:** 5.15+ (Ubuntu 22.04), 6.1+ (Amazon Linux 2023)
 - **Required Features:**
   - eBPF support (CONFIG_BPF=y, CONFIG_BPF_SYSCALL=y)
@@ -99,7 +99,7 @@ For Docker-based LLM deployment, use `./quickstart.sh` which includes the LLM se
 
 ### What the docs/examples/install-ec2.sh Script Does
 
-1. ✅ Detects OS and validates kernel version (>= 5.8)
+1. ✅ Detects OS and validates kernel version (>= 5.12 on x86_64, >= 5.18 on arm64)
 2. ✅ Installs system dependencies (libelf, kernel headers, OpenSSL)
 3. ✅ Downloads or builds Linnix binaries
    - Installs Rust toolchain with eBPF support (nightly-2024-12-10)
@@ -189,7 +189,7 @@ ssh -i ~/.ssh/my-keypair.pem ubuntu@$INSTANCE_IP
 ```bash
 # Check kernel version
 uname -r
-# Should be >= 5.8
+# Should be >= 5.12 (x86_64) or >= 5.18 (arm64)
 
 # Check BTF support
 ls -la /sys/kernel/btf/vmlinux

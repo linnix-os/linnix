@@ -9,6 +9,10 @@ reason = "httpmock is used in tests only; async-std is unmaintained but no repla
 id = "RUSTSEC-2024-0436"
 reason = "paste is unmaintained (dtolnay archived repo); pulled in by alloy-primitives, no direct replacement available yet."
 
+[[advisories.ignore]]
+id = "RUSTSEC-2026-0173"
+reason = "proc-macro-error2 is unmaintained; pulled in transitively as a build-time proc-macro by alloy-sol-macro, no safe upgrade available yet."
+
 [licenses]
 # Only these SPDX licenses are allowed; everything else fails.
 allow = [
