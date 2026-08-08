@@ -3,7 +3,6 @@ use btf::btf::{Array, Btf, Struct, Type};
 use linnix_ai_ebpf_common::{TelemetryConfig, rss_source};
 use std::convert::TryFrom;
 use std::env;
-use std::io::Read;
 use sysinfo::System;
 
 const KERNEL_BTF_PATH: &str = "/sys/kernel/btf/vmlinux";
