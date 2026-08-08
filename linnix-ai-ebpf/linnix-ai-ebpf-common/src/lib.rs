@@ -264,7 +264,10 @@ pub struct TelemetryConfig {
     pub _reserved: u32,
     pub total_memory_bytes: u64,
     pub rss_source: u32,
-    pub _pad: u32,
+    /// Byte offset of `start_boottime` field in `task_struct`.
+    /// Used by LSM hooks to build the MandateKey uniquely per process
+    /// across PID recycling.  Discovered via BTF at daemon start.
+    pub task_start_boottime_offset: u32,
 }
 
 impl TelemetryConfig {
@@ -288,7 +291,7 @@ impl TelemetryConfig {
             _reserved: 0,
             total_memory_bytes: 0,
             rss_source: 0,
-            _pad: 0,
+            task_start_boottime_offset: 0,
         }
     }
 }
@@ -326,7 +329,108 @@ pub enum EventType {
     Syscall = 5,
     BlockIo = 6,
     PageFault = 7,
+    MandateAllow = 8,
+    MandateDeny = 9,
 }
+
+// =============================================================================
+// LINNIX-CLAW: MANDATE DATA STRUCTURES
+// =============================================================================
+//
+// Shared between kernel-space (BPF LSM programs) and user-space (cognitod).
+// These structs form the BPF map protocol for the mandate enforcement system.
+//
+// See docs/linnix-claw/specs.md §1.1 for full specification.
+
+/// Key for the MANDATE_MAP BPF LRU hash map.
+///
+/// 24 bytes, naturally aligned. The combination of `pid` + `start_time_ns`
+/// uniquely identifies a process even across PID recycling. The `cmd_hash`
+/// binds the mandate to a specific command (SipHash-2-4 of canonical args).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct MandateKey {
+    /// Target process TID (task group ID), i.e. `current->tgid`.
+    pub pid: u32,
+    /// Alignment padding — must be zero.
+    pub _pad: u32,
+    /// Process start time in boot-monotonic nanoseconds.
+    /// Kernel: `current->group_leader->start_boottime`.
+    /// Userspace: `/proc/<pid>/stat` field 22, converted to ns.
+    pub start_time_ns: u64,
+    /// SipHash-2-4 hash of the canonicalized command arguments.
+    pub cmd_hash: u64,
+}
+
+// 24 bytes exactly
+#[cfg(test)]
+const _: () = {
+    assert!(size_of::<MandateKey>() == 24);
+};
+
+/// Value stored in the MANDATE_MAP for each authorized operation.
+///
+/// 24 bytes. Contains expiry time, flags controlling enforcement mode,
+/// and a sequence number linking to the receipt.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct MandateValue {
+    /// Absolute expiry time in boot-monotonic nanoseconds.
+    /// After this time, the LSM program treats the mandate as absent.
+    pub expires_ns: u64,
+    /// Flags controlling mandate behavior.
+    /// Bit 0: 0 = enforce (deny if absent), 1 = monitor (allow but tag).
+    /// Bits 1-31: reserved, must be zero.
+    pub flags: u32,
+    /// Reserved for future use (alignment padding).
+    pub _reserved: u32,
+    /// Sequence number from the mandate creation, used to correlate receipt.
+    pub mandate_seq: u64,
+}
+
+// 24 bytes exactly
+#[cfg(test)]
+const _: () = {
+    assert!(size_of::<MandateValue>() == 24);
+};
+
+impl MandateValue {
+    /// Flag bit: mandate is in monitor-only mode (allow but tag as unmanaged).
+    pub const FLAG_MONITOR: u32 = 1 << 0;
+
+    /// Check if this mandate has expired relative to the given time.
+    #[inline(always)]
+    pub fn is_expired(&self, now_ns: u64) -> bool {
+        now_ns >= self.expires_ns
+    }
+
+    /// Check if this mandate is in monitor-only mode.
+    #[inline(always)]
+    pub fn is_monitor_mode(&self) -> bool {
+        self.flags & Self::FLAG_MONITOR != 0
+    }
+}
+
+/// Mandate enforcement mode for the global MANDATE_MODE map.
+#[repr(u32)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MandateMode {
+    /// Log violations but allow all operations.
+    Monitor = 0,
+    /// Block unauthorized operations (return -EPERM).
+    Enforce = 1,
+}
+
+/// Maximum number of entries in the MANDATE_MAP BPF LRU hash.
+pub const MANDATE_MAP_MAX_ENTRIES: u32 = 65_536;
+
+/// Watermark threshold (80%) — when map usage exceeds this, cognitod
+/// should apply backpressure (return 429 to new mandate requests).
+pub const MANDATE_MAP_WATERMARK: u32 = MANDATE_MAP_MAX_ENTRIES * 80 / 100;
+
+/// Reconciliation interval in seconds — cognitod scans and evicts expired
+/// mandates from the BPF map at this frequency.
+pub const MANDATE_RECONCILE_INTERVAL_SECS: u64 = 5;
 
 #[cfg(all(feature = "user", not(target_os = "none")))]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -484,6 +588,39 @@ mod tests {
             0,
             "wire format should be 8-byte aligned"
         );
+    }
+
+    #[test]
+    fn mandate_key_layout() {
+        assert_eq!(size_of::<MandateKey>(), 24, "MandateKey must be 24 bytes");
+        assert_eq!(
+            std::mem::align_of::<MandateKey>(),
+            8,
+            "MandateKey must be 8-byte aligned"
+        );
+    }
+
+    #[test]
+    fn mandate_value_layout() {
+        assert_eq!(
+            size_of::<MandateValue>(),
+            24,
+            "MandateValue must be 24 bytes"
+        );
+    }
+
+    #[test]
+    fn mandate_value_flags() {
+        let val = MandateValue {
+            expires_ns: 1_000_000_000,
+            flags: MandateValue::FLAG_MONITOR,
+            _reserved: 0,
+            mandate_seq: 42,
+        };
+        assert!(val.is_monitor_mode());
+        assert!(!val.is_expired(500_000_000));
+        assert!(val.is_expired(1_000_000_000));
+        assert!(val.is_expired(2_000_000_000));
     }
 
     #[test]

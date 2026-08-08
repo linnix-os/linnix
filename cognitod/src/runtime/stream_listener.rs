@@ -23,6 +23,8 @@ fn event_label(kind: u32) -> &'static str {
         x if x == EventType::Syscall as u32 => "Syscall",
         x if x == EventType::BlockIo as u32 => "BlockIo",
         x if x == EventType::PageFault as u32 => "PageFault",
+        x if x == EventType::MandateAllow as u32 => "MandateAllow",
+        x if x == EventType::MandateDeny as u32 => "MandateDeny",
         _ => "Unknown",
     }
 }
