@@ -122,6 +122,24 @@ pub enum Detector {
         #[allow(dead_code)]
         duration: u64,
     },
+    /// Alert when the system-wide CPU PSI (some avg10) exceeds a threshold
+    /// sustained for `duration` seconds.
+    SystemPsiCpu {
+        threshold_pct: f32,
+        duration: u64,
+    },
+    /// Alert when system-wide memory PSI (full avg10) exceeds threshold
+    /// sustained for `duration` seconds.
+    SystemPsiMemory {
+        threshold_pct: f32,
+        duration: u64,
+    },
+    /// Alert when system-wide IO PSI (full avg10) exceeds threshold
+    /// sustained for `duration` seconds.
+    SystemPsiIo {
+        threshold_pct: f32,
+        duration: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -186,6 +204,18 @@ enum RawDetector {
     },
     ZombieCount {
         threshold: u64,
+        duration: u64,
+    },
+    SystemPsiCpu {
+        threshold_pct: f32,
+        duration: u64,
+    },
+    SystemPsiMemory {
+        threshold_pct: f32,
+        duration: u64,
+    },
+    SystemPsiIo {
+        threshold_pct: f32,
         duration: u64,
     },
 }
@@ -266,6 +296,27 @@ impl TryFrom<RawRule> for RuleConfig {
                 threshold,
                 duration,
             },
+            RawDetector::SystemPsiCpu {
+                threshold_pct,
+                duration,
+            } => Detector::SystemPsiCpu {
+                threshold_pct,
+                duration,
+            },
+            RawDetector::SystemPsiMemory {
+                threshold_pct,
+                duration,
+            } => Detector::SystemPsiMemory {
+                threshold_pct,
+                duration,
+            },
+            RawDetector::SystemPsiIo {
+                threshold_pct,
+                duration,
+            } => Detector::SystemPsiIo {
+                threshold_pct,
+                duration,
+            },
         };
 
         Ok(RuleConfig {
@@ -286,6 +337,9 @@ struct RuleState {
     cpu_exceed: HashMap<String, Instant>,
     rss_exceed: HashMap<String, Instant>,
     active: HashMap<String, Instant>,
+    /// Tracks when a PSI threshold was first breached per rule name.
+    /// Used by SystemPsiCpu/Memory/Io detectors for sustained-pressure windows.
+    psi_breach: HashMap<String, Instant>,
 }
 
 pub struct RuleEngine {
@@ -371,6 +425,7 @@ impl RuleEngine {
                 cpu_exceed: HashMap::new(),
                 rss_exceed: HashMap::new(),
                 active: HashMap::new(),
+                psi_breach: HashMap::new(),
             }),
             tx,
             alerts_file,
@@ -869,12 +924,101 @@ impl Handler for RuleEngine {
                     }
                 }
                 Detector::ZombieCount { .. } => {}
+                // PSI detectors fire from on_snapshot, not on individual events.
+                Detector::SystemPsiCpu { .. }
+                | Detector::SystemPsiMemory { .. }
+                | Detector::SystemPsiIo { .. } => {}
             }
         }
     }
 
-    async fn on_snapshot(&self, _snapshot: &SystemSnapshot) {
-        // placeholder for detectors needing snapshots
+    async fn on_snapshot(&self, snapshot: &SystemSnapshot) {
+        let now = Instant::now();
+        let mut state = self.state.lock().await;
+
+        for rule in &self.rules {
+            match &rule.cfg.detector {
+                Detector::SystemPsiCpu {
+                    threshold_pct,
+                    duration,
+                } => {
+                    let current = snapshot.psi_cpu_some_avg10;
+                    let key = rule.cfg.name.clone();
+                    if current > *threshold_pct {
+                        let breach_start = state.psi_breach.entry(key.clone()).or_insert(now);
+                        let elapsed = now.duration_since(*breach_start).as_secs();
+                        if elapsed >= *duration {
+                            state.psi_breach.remove(&key);
+                            drop(state);
+                            self.emit_alert(
+                                &rule.cfg,
+                                format!(
+                                    "CPU PSI {:.1}% > {:.1}% sustained {}s",
+                                    current, threshold_pct, duration
+                                ),
+                            )
+                            .await;
+                            state = self.state.lock().await;
+                        }
+                    } else {
+                        state.psi_breach.remove(&key);
+                    }
+                }
+                Detector::SystemPsiMemory {
+                    threshold_pct,
+                    duration,
+                } => {
+                    let current = snapshot.psi_memory_full_avg10;
+                    let key = rule.cfg.name.clone();
+                    if current > *threshold_pct {
+                        let breach_start = state.psi_breach.entry(key.clone()).or_insert(now);
+                        let elapsed = now.duration_since(*breach_start).as_secs();
+                        if elapsed >= *duration {
+                            state.psi_breach.remove(&key);
+                            drop(state);
+                            self.emit_alert(
+                                &rule.cfg,
+                                format!(
+                                    "memory PSI (full) {:.1}% > {:.1}% sustained {}s",
+                                    current, threshold_pct, duration
+                                ),
+                            )
+                            .await;
+                            state = self.state.lock().await;
+                        }
+                    } else {
+                        state.psi_breach.remove(&key);
+                    }
+                }
+                Detector::SystemPsiIo {
+                    threshold_pct,
+                    duration,
+                } => {
+                    let current = snapshot.psi_io_full_avg10;
+                    let key = rule.cfg.name.clone();
+                    if current > *threshold_pct {
+                        let breach_start = state.psi_breach.entry(key.clone()).or_insert(now);
+                        let elapsed = now.duration_since(*breach_start).as_secs();
+                        if elapsed >= *duration {
+                            state.psi_breach.remove(&key);
+                            drop(state);
+                            self.emit_alert(
+                                &rule.cfg,
+                                format!(
+                                    "IO PSI (full) {:.1}% > {:.1}% sustained {}s",
+                                    current, threshold_pct, duration
+                                ),
+                            )
+                            .await;
+                            state = self.state.lock().await;
+                        }
+                    } else {
+                        state.psi_breach.remove(&key);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -906,6 +1050,7 @@ mod tests {
                 cpu_exceed: HashMap::new(),
                 rss_exceed: HashMap::new(),
                 active: HashMap::new(),
+                psi_breach: HashMap::new(),
             }),
             tx,
             alerts_file: "/dev/null".into(),

@@ -105,6 +105,66 @@ curl "http://localhost:3000/processes?namespace=payments&sort=psi_contribution"
 
 ---
 
+## Commerce / On-Chain Settlement
+
+Linnix includes a trustless payment layer (**Linnix-Claw**) that settles agent-to-agent work on-chain via ERC-20 stablecoins. When one agent delegates a task to another, the result — a signed receipt with telemetry proof — is submitted to a `TaskSettlement` smart contract that releases payment directly from payer to payee.
+
+### Architecture
+
+```
+Agent A (payer)                    Agent B (payee)
+   │  createTask(taskId, payeeDID, maxAmount)
+   │──────────────────────────────────▶│
+   │                                   │ ← does work, captures eBPF telemetry
+   │    submitReceipt(taskId, amount, receipt, sig)
+   │◀──────────────────────────────────│
+   │                                   │
+   └──── TaskSettlement.sol ─── ERC-20 transfer ──▶ payee
+```
+
+**Key contracts** (Base Sepolia testnet):
+
+| Contract | Address |
+| :--- | :--- |
+| AgentRegistry | `0x9a6FeBA6d7B97ef91099051eB61F372d1EcD83a3` |
+| TaskSettlement | `0x60eE6872920addF41359625B47A07401496bBD5b` |
+| StakeBond | `0xEE31fC610B9b64982990adB3ba228E9dBbfF6a73` |
+
+### Configuration
+
+Add a `[chain]` section to your `linnix.toml`:
+
+```toml
+[chain]
+enabled = true
+rpc_url = "https://sepolia.base.org"
+chain_id = 84532
+settlement_contract = "0x60eE6872920addF41359625B47A07401496bBD5b"
+registry_contract = "0x9a6FeBA6d7B97ef91099051eB61F372d1EcD83a3"
+token_address = "0x036CbD53842c5426634e7929541eC2318f3dCF7e"  # USDC on Base Sepolia
+token_decimals = 6
+```
+
+The signer key is resolved in priority order:
+1. `chain.private_key` in config
+2. `LINNIX_CHAIN_PRIVATE_KEY` env var
+3. HKDF-derived secp256k1 key from the agent's Ed25519 identity (default — zero config)
+
+### End-to-End Demo
+
+```bash
+# Deploy contracts to a local Hardhat node
+cd linnix-claw-contracts && npx hardhat node &
+npx hardhat run scripts/deploy.js --network localhost
+
+# Run the commerce demo
+./scripts/demo_commerce_e2e.sh --local
+```
+
+See the [contract source](https://github.com/linnix-os/linnix-claw-contracts) and `cognitod/src/onchain.rs` for implementation details.
+
+---
+
 ## Early Adopters
 
 This project is under active development. If you're using it or evaluating it, open an issue or email parth21.shah@gmail.com.
