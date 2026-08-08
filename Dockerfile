@@ -1,7 +1,7 @@
 # Multi-stage build for Linnix Cognitod
 
 # Stage 1: Build eBPF programs
-FROM rust:1.90-bookworm AS ebpf-builder
+FROM rust:1.93-bookworm AS ebpf-builder
 
 # Install eBPF build dependencies
 RUN apt-get update && apt-get install -y \
@@ -40,7 +40,7 @@ WORKDIR /build/linnix-ai-ebpf/linnix-ai-ebpf-ebpf
 RUN cargo build --release --target=bpfel-unknown-none
 
 # Stage 2: Build Rust userspace binaries
-FROM rust:1.90-bookworm AS rust-builder
+FROM rust:1.93-bookworm AS rust-builder
 
 WORKDIR /build
 

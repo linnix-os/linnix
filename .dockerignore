@@ -28,9 +28,8 @@ CHANGELOG.md
 .github/
 .gitlab-ci.yml
 
-# Testing
-tests/
-**/tests/
+# Testing (top-level only; crate tests/ dirs needed for Cargo.toml [[test]])
+/tests/
 *.test
 
 # Enterprise/Training artifacts
