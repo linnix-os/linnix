@@ -9,10 +9,7 @@ mod safety;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum ActionType {
-    KillProcess {
-        pid: u32,
-        signal: i32,
-    },
+    KillProcess { pid: u32, signal: i32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -31,15 +31,25 @@ mod api;
 mod runtime;
 // mod routes; // Deleted (dead code cleanup)
 
+use crate::api::{AppState, all_routes};
+use crate::bpf_config::{CoreRssMode, derive_telemetry_config};
+use crate::runtime::probes::{ProbeState, RssProbeMode};
+use clap::Parser;
+use cognitod::alerts::RuleEngine;
 use cognitod::bpf_config;
 use cognitod::config;
+use cognitod::config::{Config, OfflineGuard};
 use cognitod::context;
 use cognitod::enforcement;
 use cognitod::handler;
+use cognitod::handler::{HandlerList, JsonlHandler};
 use cognitod::insights;
 use cognitod::metrics;
+use cognitod::metrics::Metrics;
 use cognitod::types;
 use cognitod::ui;
+use serde_json::json;
+use std::{fs, path::Path};
 
 #[repr(transparent)]
 #[derive(Copy, Clone)]
@@ -90,8 +100,6 @@ fn attach_tracepoint_optional(bpf: &mut Ebpf, program: &str, category: &str, nam
         warn!("[cognitod] optional tracepoint {category}:{name} ({program}) not attached: {err:?}");
     }
 }
-
-
 
 fn spawn_metrics_tasks(metrics: Arc<Metrics>) {
     // Roll up events/s every second
@@ -211,10 +219,7 @@ fn read_rss_trace_bytes() -> anyhow::Result<(Vec<u8>, String)> {
 fn init_ebpf(
     bpf_bytes: &[u8],
     telemetry_cfg: TelemetryConfig,
-) -> anyhow::Result<(
-    BpfRuntimeGuards,
-    Vec<PerfEventArrayBuffer<MapData>>,
-)> {
+) -> anyhow::Result<(BpfRuntimeGuards, Vec<PerfEventArrayBuffer<MapData>>)> {
     let telemetry = TelemetryConfigPod(telemetry_cfg);
     let mut loader = EbpfLoader::new();
     loader.set_global("TELEMETRY_CONFIG", &telemetry, true);

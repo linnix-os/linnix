@@ -482,12 +482,4 @@ auth_token = "secret123"
             std::env::remove_var(ENV_CONFIG_PATH);
         }
     }
-
-
-
-
-
-
-
-
 }

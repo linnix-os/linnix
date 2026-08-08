@@ -489,9 +489,6 @@ mod tests {
         );
     }
 
-
-
-
     #[test]
     fn sequenced_slot_layout() {
         // Slot must be exactly 128 bytes (2 cache lines)
