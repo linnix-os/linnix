@@ -888,7 +888,7 @@ async fn get_timeline(
     }
 
     // Sort by timestamp descending (newest first)
-    alerts.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    alerts.sort_by_key(|a| std::cmp::Reverse(a.timestamp));
 
     // Limit to 1000 results
     alerts.truncate(1000);
