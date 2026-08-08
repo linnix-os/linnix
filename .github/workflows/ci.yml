@@ -26,9 +26,7 @@ jobs:
         with:
           tool: nextest
       - name: Run unit tests
-        run: cargo nextest run --workspace --profile default -E 'not binary(bdd_spend)'
-      - name: Run BDD tests (Cucumber)
-        run: cargo test --test bdd_spend
+        run: cargo nextest run --workspace --profile default
 
   test-e2e:
     strategy:
@@ -51,7 +49,7 @@ jobs:
         with:
           tool: nextest
       - name: Run end-to-end tests
-        run: cargo nextest run --workspace --profile e2e --config-file nextest.toml -E 'not binary(bdd_spend)'
+        run: cargo nextest run --workspace --profile e2e --config-file nextest.toml
 
   lint-audit:
     runs-on: ubuntu-latest
