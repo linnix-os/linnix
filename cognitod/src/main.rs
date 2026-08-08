@@ -402,7 +402,9 @@ fn check_capabilities() -> anyhow::Result<()> {
     eprintln!(
         "  docker run --cap-add=BPF --cap-add=PERFMON --cap-drop=ALL ghcr.io/linnix-os/cognitod:latest"
     );
-    eprintln!("\nRequires: Linux 5.8+ with BTF support (/sys/kernel/btf/vmlinux)");
+    eprintln!(
+        "\nRequires: Linux 5.12+ (x86_64) or 5.18+ (arm64) with BTF support (/sys/kernel/btf/vmlinux)"
+    );
     eprintln!("Docs: https://docs.linnix.io/installation\n");
 
     anyhow::bail!("missing CAP_BPF and CAP_PERFMON")

@@ -28,7 +28,7 @@ cargo nextest run --workspace
 Recommended toolchain versions:
 - Rust stable (check `rust-toolchain.toml` if present)
 - `clang`/`llvm` ≥ 14 for eBPF builds
-- Linux kernel 5.8+ with BTF data for local testing
+- Linux kernel 5.12+ (x86_64) / 5.18+ (arm64) with BTF data for local testing
 
 ## Workflow
 

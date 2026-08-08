@@ -1,2 +1,13 @@
 [alias]
 xtask = "run --package xtask --"
+
+# Applies to `cargo xtask build-ebpf`, which runs from the workspace root.
+# Cargo reads .cargo/config.toml from the invocation CWD upward, so the config
+# in linnix-ai-ebpf/ is NOT read for workspace-root builds — that one only
+# covers the Dockerfile, which cds into the crate directory first.
+# Keep the rustflags below in sync with linnix-ai-ebpf/.cargo/config.toml.
+#
+# +alu32 is required: without it LLVM rejects the atomic fetch-and-add in
+# submit_to_sequencer() with "Invalid usage of the XADD return value".
+[target.bpfel-unknown-none]
+rustflags = ["-C", "linker=bpf-linker", "-C", "target-feature=+alu32"]

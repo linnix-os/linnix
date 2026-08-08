@@ -1,3 +1,9 @@
+# Applies when cargo is invoked from within this directory tree — notably the
+# Dockerfile, which does `WORKDIR /build/linnix-ai-ebpf/linnix-ai-ebpf-ebpf`
+# before `cargo build`. It does NOT apply to `cargo xtask build-ebpf`, which
+# runs from the workspace root; the root .cargo/config.toml covers that path.
+# Keep the rustflags here in sync with the root config.
+
 [build]
 target = "bpfel-unknown-none"
 

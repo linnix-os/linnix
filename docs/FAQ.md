@@ -1,8 +1,9 @@
 # Linnix FAQ
 
 ## What kernel versions are supported?
-- **Recommended**: Linux 5.8+ with BTF packages installed (Ubuntu 20.04+, Fedora 33+, modern Debian).
-- **Minimum**: Linux 4.4 with `CONFIG_BPF_SYSCALL` enabled. Older kernels run in a “core-only” mode that captures fork/exec/exit but skips advanced RSS and page-fault metrics.
+- **Minimum**: Linux **5.12** on x86_64, Linux **5.18** on arm64/aarch64. The eBPF programs use atomic fetch-and-add (`BPF_FETCH`) for the sequencer's ticket reservation, and the kernel verifier rejects those instructions below these versions. Support landed in 5.12 for x86_64 and 5.18 for arm64.
+- **Recommended**: Linux 5.15+ (x86_64) / 6.1+ (arm64) with BTF packages installed (Ubuntu 22.04+, Amazon Linux 2023, Fedora 33+, modern Debian).
+- **Below the minimum**: both the primary and the `rss_trace` fallback object fail to load. `cognitod` does not crash — it logs `eBPF initialization failed ...; running without kernel instrumentation` and continues in userspace-only mode, which means **no eBPF telemetry at all**. Check your logs for that warning if metrics look empty.
 - **BTF tips**: Ship `/sys/kernel/btf/vmlinux` (or package-specific paths) so Linnix can compute struct offsets dynamically. Without BTF, the daemon logs a warning and continues with degraded telemetry.
 
 ## How much overhead should I expect?
