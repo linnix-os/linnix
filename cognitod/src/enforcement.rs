@@ -13,11 +13,6 @@ pub enum ActionType {
         pid: u32,
         signal: i32,
     },
-    AuthorizeExec {
-        pid: u32,
-        cmd_hash: u64,
-        expires_at: u64,
-    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -101,9 +96,6 @@ impl EnforcementQueue {
         match &action {
             ActionType::KillProcess { pid, .. } => {
                 safety::SafetyGuard::is_safe_to_kill(*pid)?;
-            }
-            ActionType::AuthorizeExec { .. } => {
-                // Mandate authorizations don't need kill-safety checks.
             }
         }
 

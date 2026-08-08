@@ -36,8 +36,7 @@ pub fn derive_telemetry_config() -> Result<TelemetryConfigResult> {
 
     // `start_boottime` (or legacy `real_start_time`) stores the task start
     // time in boot-monotonic nanoseconds.  This is the same value the
-    // MandateKey.start_time_ns field must contain for kernel/userspace
-    // to refer to the same process without PID confusion.
+    // uniquely identifies a task across PID recycling.
     let start_boottime_bits = member_offset(task_struct, "start_boottime")
         .or_else(|_| member_offset(task_struct, "real_start_time"))
         .map(|(bits, _)| bits)
@@ -442,49 +441,6 @@ fn to_bytes(bits: u32) -> Result<u32> {
     }
 }
 
-// =============================================================================
-// BPF LSM CAPABILITY DETECTION
-// =============================================================================
-//
-// Linnix-Claw requires CONFIG_BPF_LSM=y and the "bpf" entry in the kernel's
-// active LSM list. Without it, cognitod runs in observability-only mode —
-// mandates are tracked via the API but the kernel doesn't enforce them.
-//
-// This mirrors the existing BTF degradation pattern: try to load, warn if
-// unavailable, continue with reduced functionality.
-
-const LSM_PATH: &str = "/sys/kernel/security/lsm";
-
-/// Check whether the running kernel has BPF LSM support enabled.
-///
-/// Reads `/sys/kernel/security/lsm` and looks for the "bpf" entry in the
-/// comma-separated list. This file is always readable (mode 0444).
-///
-/// Returns `true` if "bpf" is found, `false` otherwise.
-pub fn is_bpf_lsm_available() -> bool {
-    let Ok(content) = std::fs::read_to_string(LSM_PATH) else {
-        return false;
-    };
-
-    content.trim().split(',').any(|entry| entry.trim() == "bpf")
-}
-
-/// Generate a 128-bit SipHash key from /dev/urandom.
-///
-/// This key is injected into the eBPF SIPHASH_KEY map at load time.
-/// It MUST match what the userspace MandateManager uses.
-pub fn generate_siphash_key() -> Result<[u64; 2]> {
-    let mut buf = [0u8; 16];
-    let mut f = std::fs::File::open("/dev/urandom").context("failed to open /dev/urandom")?;
-    f.read_exact(&mut buf)
-        .context("failed to read 16 bytes from /dev/urandom")?;
-
-    let k0 = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-    let k1 = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-
-    Ok([k0, k1])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,15 +450,5 @@ mod tests {
         assert_eq!(to_bytes(0).unwrap(), 0);
         assert_eq!(to_bytes(8).unwrap(), 1);
         assert!(to_bytes(3).is_err());
-    }
-
-    #[test]
-    fn lsm_detection_returns_result() {
-        // This test just verifies the function doesn't panic.
-        // On most CI systems CONFIG_BPF_LSM may not be set.
-        let available = is_bpf_lsm_available();
-        // We can't assert true/false since it depends on kernel config,
-        // but we can assert it runs without error.
-        let _ = available;
     }
 }
