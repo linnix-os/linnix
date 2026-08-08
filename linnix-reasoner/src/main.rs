@@ -327,7 +327,7 @@ async fn main() -> anyhow::Result<()> {
         .iter()
         .filter(|(_, p)| p.memory() > 1024 * 1024) // >1MB
         .collect();
-    processes_by_mem.sort_by(|a, b| b.1.memory().cmp(&a.1.memory()));
+    processes_by_mem.sort_by_key(|b| std::cmp::Reverse(b.1.memory()));
     let top_mem = processes_by_mem.iter().take(10).collect::<Vec<_>>();
 
     // Build process context string with human-readable names in table format
