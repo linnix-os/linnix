@@ -8,7 +8,7 @@ use aya::maps::{
     MapData,
     perf::{PerfEventArray, PerfEventArrayBuffer},
 };
-use aya::programs::{KProbe, Lsm, TracePoint};
+use aya::programs::{KProbe, TracePoint};
 use aya::util::online_cpus;
 use aya::{Ebpf, EbpfLoader};
 use aya_log::EbpfLogger;
