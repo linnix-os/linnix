@@ -89,6 +89,7 @@ jobs:
           components: rust-src, llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - name: Install LLVM 20
+        if: matrix.runner == 'ubuntu-latest'
         run: |
           wget https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
@@ -96,7 +97,16 @@ jobs:
           sudo apt-get install -y llvm-20-dev libpolly-20-dev
           echo "LLVM_SYS_200_PREFIX=/usr/lib/llvm-20" >> $GITHUB_ENV
       - name: Install bpf-linker
+        if: matrix.runner == 'ubuntu-latest'
         run: cargo install bpf-linker --version 0.9.13 --locked
+      - name: Install bpf-linker (prebuilt, aarch64)
+        # v0.9.13 has no aarch64 release binary and building it from source via the
+        # rustc LLVM proxy crashes (LLVMInitializeBPFTarget panic) on arm64 runners.
+        if: matrix.runner == 'ubuntu-22.04-arm'
+        run: |
+          curl -sSL -o bpf-linker.tar.zst https://github.com/aya-rs/bpf-linker/releases/download/v0.10.4/bpf-linker-aarch64-unknown-linux-musl.tar.zst
+          tar --zstd -xf bpf-linker.tar.zst
+          sudo install -m 755 "$(find . -maxdepth 2 -type f -name bpf-linker)" /usr/local/bin/bpf-linker
       - name: Build eBPF artifacts
         run: cargo xtask build-ebpf
 
