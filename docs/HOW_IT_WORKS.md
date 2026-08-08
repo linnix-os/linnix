@@ -55,7 +55,7 @@ Linnix combines eBPF probes, BTF-powered compatibility helpers, and an AI reason
 
 | Step | Component | What to check |
 |------|-----------|---------------|
-| 1 | Kernel | `uname -r` ≥ 5.8 recommended, `ls /sys/kernel/btf/vmlinux` to confirm BTF |
+| 1 | Kernel | `uname -r` ≥ 5.12 (x86_64) / ≥ 5.18 (arm64) required, `ls /sys/kernel/btf/vmlinux` to confirm BTF |
 | 2 | eBPF assets | `cargo xtask build-ebpf` (development) or use shipped object files |
 | 3 | Daemon | `sudo systemctl status cognitod` or `./quickstart.sh` |
 | 4 | LLM endpoint | `curl http://localhost:8090/v1/models` |
