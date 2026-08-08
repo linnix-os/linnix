@@ -5,4 +5,4 @@ target = "bpfel-unknown-none"
 build-std = ["core"]
 
 [target.bpfel-unknown-none]
-rustflags = ["-C", "linker=bpf-linker", "-C", "target-feature=+alu32"]
+rustflags = ["-C", "linker=bpf-linker", "-C", "target-feature=+alu32", "-C", "link-arg=--cpu=v3"]
