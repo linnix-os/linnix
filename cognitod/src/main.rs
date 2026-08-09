@@ -794,11 +794,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Start PSI monitor (after incident store is ready)
     if let Some(ctx) = &k8s_context {
-        let sink = Arc::new(cognitod::attribution::AttributionSink::new(
-            blame_metrics.clone(),
-            alert_tx.clone(),
-            ctx.node_name.clone(),
-        ));
+        let sink = Arc::new(
+            cognitod::attribution::AttributionSink::new(
+                blame_metrics.clone(),
+                alert_tx.clone(),
+                ctx.node_name.clone(),
+            )
+            .with_threshold_us(config.psi.attribution_threshold_ms.saturating_mul(1_000))
+            .with_cooldown(std::time::Duration::from_secs(
+                config.psi.attribution_cooldown_seconds,
+            )),
+        );
         let psi_monitor = cognitod::collectors::psi::PsiMonitor::new(
             ctx.clone(),
             context.clone(),

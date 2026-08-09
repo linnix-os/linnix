@@ -337,18 +337,41 @@ pub struct PsiConfig {
     /// Duration in seconds of sustained pressure required to trigger attribution
     #[serde(default = "default_psi_sustained_pressure_seconds")]
     pub sustained_pressure_seconds: u64,
+    /// Stall attributed to a single offender, in milliseconds, before it is
+    /// reported. A large stall split across many neighbours is not a noisy
+    /// neighbour, so this is deliberately separate from the threshold that
+    /// decides whether the victim is stalling at all.
+    #[serde(default = "default_attribution_threshold_ms")]
+    pub attribution_threshold_ms: u64,
+    /// How long to wait before reporting the same offender/victim pair again.
+    /// Pressure lasting an hour would otherwise re-alert every
+    /// `sustained_pressure_seconds` for that whole hour. Set to 0 to report
+    /// every occurrence. The Prometheus counters are unaffected either way —
+    /// they remain the continuous signal.
+    #[serde(default = "default_attribution_cooldown_seconds")]
+    pub attribution_cooldown_seconds: u64,
 }
 
 impl Default for PsiConfig {
     fn default() -> Self {
         Self {
             sustained_pressure_seconds: default_psi_sustained_pressure_seconds(),
+            attribution_threshold_ms: default_attribution_threshold_ms(),
+            attribution_cooldown_seconds: default_attribution_cooldown_seconds(),
         }
     }
 }
 
 fn default_psi_sustained_pressure_seconds() -> u64 {
     15
+}
+
+fn default_attribution_threshold_ms() -> u64 {
+    100
+}
+
+fn default_attribution_cooldown_seconds() -> u64 {
+    300
 }
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct ProbesConfig {

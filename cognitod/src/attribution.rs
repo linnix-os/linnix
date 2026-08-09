@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use log::warn;
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,11 @@ use crate::collectors::psi::BlameAttribution;
 /// victim is stalling at all: one 500ms stall split across six neighbours is
 /// not six noisy neighbours.
 pub const DEFAULT_ATTRIBUTED_STALL_THRESHOLD_US: u64 = 100_000; // 100ms
+
+/// How long an offender/victim pair stays quiet after being reported. Without
+/// this, sustained pressure re-reports every detection window for as long as it
+/// lasts — the alert channel feeds Slack and Apprise, so that is a pager storm.
+pub const DEFAULT_COOLDOWN_SECONDS: u64 = 300; // 5 minutes
 
 /// Upper bound on distinct series held per counter family. Generous on purpose:
 /// eviction breaks `rate()` continuity for the evicted series, so the cap is a
@@ -435,6 +441,10 @@ pub struct AttributionSink {
     alerts: Option<broadcast::Sender<Alert>>,
     host: String,
     threshold_us: u64,
+    cooldown: Duration,
+    /// When each offender/victim pair was last reported, so a stall that lasts
+    /// an hour does not report every `sustained_pressure_seconds` for an hour.
+    reported: Mutex<HashMap<String, Instant>>,
 }
 
 impl AttributionSink {
@@ -448,6 +458,8 @@ impl AttributionSink {
             alerts,
             host: host.into(),
             threshold_us: DEFAULT_ATTRIBUTED_STALL_THRESHOLD_US,
+            cooldown: Duration::from_secs(DEFAULT_COOLDOWN_SECONDS),
+            reported: Mutex::new(HashMap::new()),
         }
     }
 
@@ -456,13 +468,59 @@ impl AttributionSink {
         self
     }
 
+    /// Sets how long the same offender/victim pair stays quiet after being
+    /// reported. Zero reports every occurrence.
+    pub fn with_cooldown(mut self, cooldown: Duration) -> Self {
+        self.cooldown = cooldown;
+        self
+    }
+
     pub fn metrics(&self) -> &std::sync::Arc<BlameMetrics> {
         &self.metrics
     }
 
-    /// Every attribution updates the counters; only those over the threshold
-    /// produce a JSON line and an alert. Returns the events that were emitted
-    /// so callers (and tests) can see exactly what a user would observe.
+    /// Whether this pair may be reported now, recording the report if so.
+    ///
+    /// Suppression is per pair rather than per rule: a second, unrelated noisy
+    /// neighbour appearing during an ongoing incident is news and must not be
+    /// swallowed by the first one's cooldown.
+    fn claim_report_slot(&self, attr: &BlameAttribution) -> bool {
+        if self.cooldown.is_zero() {
+            return true;
+        }
+
+        let key = format!(
+            "{}/{}->{}/{}",
+            attr.offender_namespace, attr.offender_pod, attr.victim_namespace, attr.victim_pod
+        );
+        let now = Instant::now();
+
+        let Ok(mut reported) = self.reported.lock() else {
+            // A poisoned lock must not silence alerting.
+            return true;
+        };
+
+        if let Some(last) = reported.get(&key)
+            && now.duration_since(*last) < self.cooldown
+        {
+            return false;
+        }
+
+        // Drop pairs that have gone quiet, so a cluster that churns through
+        // many short-lived offenders does not grow this map without bound.
+        if reported.len() >= DEFAULT_MAX_SERIES {
+            let cooldown = self.cooldown;
+            reported.retain(|_, last| now.duration_since(*last) < cooldown);
+        }
+
+        reported.insert(key, now);
+        true
+    }
+
+    /// Every attribution updates the counters; only those over the threshold,
+    /// and not already reported within the cooldown, produce a JSON line and an
+    /// alert. Returns the events that were emitted so callers (and tests) can
+    /// see exactly what a user would observe.
     pub fn emit(&self, attributions: &[BlameAttribution]) -> Vec<AttributionEvent> {
         let mut emitted = Vec::new();
 
@@ -470,6 +528,12 @@ impl AttributionSink {
             self.metrics.record_attribution(attr);
 
             if attr.attributed_stall_us < self.threshold_us {
+                continue;
+            }
+
+            // Counters above are updated unconditionally: they stay the
+            // continuous signal while reporting is throttled.
+            if !self.claim_report_slot(attr) {
                 continue;
             }
 

@@ -379,6 +379,112 @@ fn a_flood_of_distinct_offenders_stays_bounded() {
 }
 
 #[test]
+fn sustained_pressure_reports_once_then_goes_quiet() {
+    let metrics = Arc::new(BlameMetrics::new("node-1"));
+    let (alert_tx, mut alert_rx) = tokio::sync::broadcast::channel(64);
+    let sink = AttributionSink::new(metrics.clone(), Some(alert_tx), "node-1")
+        .with_cooldown(Duration::from_secs(300));
+
+    let attributions = calculate_blame_attributions(&build_stall_event(&SCENARIOS[0]));
+
+    // A noisy neighbour that keeps going is detected once per detection window.
+    // Reporting all twelve would page someone twelve times for one incident.
+    let mut reported = 0;
+    for _ in 0..12 {
+        reported += sink.emit(&attributions).len();
+    }
+
+    assert_eq!(reported, 1, "one incident should report once");
+    let mut alerts = 0;
+    while alert_rx.try_recv().is_ok() {
+        alerts += 1;
+    }
+    assert_eq!(alerts, 1, "one incident should page once");
+
+    // The counters are the continuous signal and must keep climbing while
+    // reporting is suppressed, otherwise the dashboard would show the problem
+    // ending when it merely stopped being announced.
+    assert!(
+        scrape_pair_seconds(&metrics, "image-resize-worker", VICTIM_POD) > 8.0,
+        "counters should reflect all twelve windows, not just the reported one"
+    );
+}
+
+#[test]
+fn a_second_offender_is_not_silenced_by_the_first() {
+    let metrics = Arc::new(BlameMetrics::new("node-1"));
+    let (alert_tx, mut alert_rx) = tokio::sync::broadcast::channel(64);
+    let sink = AttributionSink::new(metrics, Some(alert_tx), "node-1")
+        .with_cooldown(Duration::from_secs(300));
+
+    // The image resizer is already being reported on.
+    sink.emit(&calculate_blame_attributions(&build_stall_event(
+        &SCENARIOS[0],
+    )));
+    while alert_rx.try_recv().is_ok() {}
+
+    // A different offender starts hurting the same victim. This is new
+    // information: suppressing it because an unrelated pair is in cooldown
+    // would hide the second half of a spreading incident.
+    let second = StallEvent {
+        victim_pod: VICTIM_POD.to_string(),
+        victim_namespace: VICTIM_NS.to_string(),
+        stall_delta_us: 800_000,
+        timestamp: Instant::now(),
+        concurrent_consumers: vec![CpuConsumer {
+            pod: "batch-etl".to_string(),
+            namespace: VICTIM_NS.to_string(),
+            cpu_percent: 95.0,
+        }],
+        fork_counts: HashMap::new(),
+        short_job_counts: HashMap::new(),
+    };
+
+    let emitted = sink.emit(&calculate_blame_attributions(&second));
+    assert_eq!(emitted.len(), 1, "a new offender must still be reported");
+    assert_eq!(emitted[0].offender.pod, "batch-etl");
+    assert!(
+        alert_rx.try_recv().is_ok(),
+        "a new offender must still page"
+    );
+}
+
+#[test]
+fn an_ongoing_offender_reports_again_once_the_cooldown_lapses() {
+    let metrics = Arc::new(BlameMetrics::new("node-1"));
+    let sink =
+        AttributionSink::new(metrics, None, "node-1").with_cooldown(Duration::from_millis(150));
+
+    let attributions = calculate_blame_attributions(&build_stall_event(&SCENARIOS[0]));
+
+    assert_eq!(sink.emit(&attributions).len(), 1);
+    assert_eq!(sink.emit(&attributions).len(), 0, "still within cooldown");
+
+    // A problem that is still happening after the quiet period re-announces
+    // itself, rather than being silenced permanently by its first report.
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        sink.emit(&attributions).len(),
+        1,
+        "an ongoing problem should re-announce after the cooldown"
+    );
+}
+
+#[test]
+fn a_zero_cooldown_reports_every_occurrence() {
+    let metrics = Arc::new(BlameMetrics::new("node-1"));
+    let sink = AttributionSink::new(metrics, None, "node-1").with_cooldown(Duration::from_secs(0));
+
+    let attributions = calculate_blame_attributions(&build_stall_event(&SCENARIOS[0]));
+    let reported: usize = (0..5).map(|_| sink.emit(&attributions).len()).sum();
+
+    assert_eq!(
+        reported, 5,
+        "opting out of throttling should report each time"
+    );
+}
+
+#[test]
 fn a_crashlooping_pod_keeps_accumulating_across_restarts() {
     let metrics = BlameMetrics::new("node-1");
 
