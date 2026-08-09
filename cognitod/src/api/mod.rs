@@ -1201,8 +1201,66 @@ pub async fn get_insights(
     Ok(Json(output))
 }
 
-pub async fn healthz() -> axum::Json<serde_json::Value> {
-    axum::Json(serde_json::json!({ "status": "ok" }))
+/// Liveness. Answers "is the process alive?" and nothing more.
+///
+/// Deliberately returns 200 even when the eBPF probes failed to attach: a
+/// kernel that cannot load our programs will never load them, so failing
+/// liveness would produce a restart loop that hides the real cause. The
+/// degradation is reported here for humans, and gated on by /readyz.
+pub async fn healthz(State(app_state): State<Arc<AppState>>) -> axum::Json<serde_json::Value> {
+    let instrumented = kernel_instrumentation_active(&app_state);
+    axum::Json(serde_json::json!({
+        "status": "ok",
+        "kernel_instrumentation": if instrumented { "active" } else { "unavailable" },
+        "transport": app_state.transport,
+    }))
+}
+
+/// True when the eBPF probes actually attached and events can flow.
+///
+/// `transport` is set to "perf" only after `init_ebpf` succeeds; it stays
+/// "userspace" when the object failed to load or verify.
+pub fn kernel_instrumentation_active(app_state: &AppState) -> bool {
+    app_state.transport != "userspace"
+}
+
+/// Readiness. Answers "is this instance doing its job?"
+///
+/// Linnix exists to attribute stalls to processes using kernel telemetry. When
+/// the probes are not attached, PSI still reports that pressure exists — but the
+/// per-process attribution, the part that distinguishes Linnix from reading
+/// /proc/pressure directly, is gone. Reporting ready in that state hides a dead
+/// collector behind a green pod.
+pub async fn readyz(State(app_state): State<Arc<AppState>>) -> impl IntoResponse {
+    let instrumented = kernel_instrumentation_active(&app_state);
+    let required = app_state.require_kernel_instrumentation;
+    let ready = instrumented || !required;
+
+    let body = serde_json::json!({
+        "ready": ready,
+        "kernel_instrumentation": if instrumented { "active" } else { "unavailable" },
+        "transport": app_state.transport,
+        "btf_available": app_state.probe_state.btf_available,
+        "rss_probe": app_state.probe_state.rss_probe.as_str(),
+        "reason": if ready {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(
+                "eBPF probes are not attached; running userspace-only, so no \
+                 per-process stall attribution is being produced. Check the kernel \
+                 version (5.12+ x86_64 / 5.18+ arm64), BTF availability, tracefs \
+                 mount, and CAP_BPF/CAP_PERFMON."
+                    .to_string(),
+            )
+        },
+    });
+
+    let code = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (code, axum::Json(body))
 }
 
 async fn get_actions(
@@ -1376,6 +1434,17 @@ pub async fn prometheus_metrics(State(app_state): State<Arc<AppState>>) -> Respo
     };
 
     let mut body = String::new();
+
+    let _ = writeln!(
+        body,
+        "# HELP linnix_kernel_instrumentation_active 1 if the eBPF probes are attached, 0 if running userspace-only."
+    );
+    let _ = writeln!(body, "# TYPE linnix_kernel_instrumentation_active gauge");
+    let _ = writeln!(
+        body,
+        "linnix_kernel_instrumentation_active {}",
+        u8::from(kernel_instrumentation_active(&app_state))
+    );
 
     let _ = writeln!(
         body,
@@ -1612,6 +1681,8 @@ pub struct AppState {
     pub offline: Arc<OfflineGuard>,
     pub transport: &'static str,
     pub probe_state: ProbeState,
+    /// When true, /readyz returns 503 if the eBPF probes are not attached.
+    pub require_kernel_instrumentation: bool,
     pub reasoner: ReasonerConfig,
     pub prometheus_enabled: bool,
     pub alert_history: Arc<AlertHistory>,
@@ -1654,6 +1725,7 @@ pub fn all_routes(app_state: Arc<AppState>) -> Router {
         .route("/metrics", get(metrics_handler))
         .route("/status", get(status_handler))
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         // .route("/insights/schema", get(get_insight_schema_route)) // Removed (YAGNI cleanup)
         .route("/actions", get(get_actions))
         .route("/actions/{id}", get(get_action_by_id))
@@ -1711,6 +1783,7 @@ pub fn uds_routes(app_state: Arc<AppState>) -> Router {
         .route("/metrics", get(metrics_handler))
         .route("/status", get(status_handler))
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/actions", get(get_actions))
         .route("/actions/{id}", get(get_action_by_id))
         .route("/actions/{id}/approve", axum::routing::post(approve_action))
@@ -2231,6 +2304,72 @@ mod tests {
         assert!(metrics.dropped_events_total.load(Ordering::Relaxed) > 0);
     }
 
+    /// AppState for a node where the eBPF probes failed to attach:
+    /// transport stays "userspace", which is what init_ebpf leaves on failure.
+    fn degraded_app_state() -> Arc<AppState> {
+        Arc::new(AppState {
+            context: Arc::new(ContextStore::new(Duration::from_secs(60), 10, None)),
+            metrics: Arc::new(Metrics::new()),
+            alerts: None,
+            insights: Arc::new(InsightStore::new(16, None)),
+            offline: Arc::new(OfflineGuard::new(false)),
+            transport: "userspace",
+            probe_state: ProbeState::disabled(),
+            require_kernel_instrumentation: true,
+            enforcement: None,
+            reasoner: ReasonerConfig::default(),
+            prometheus_enabled: false,
+            alert_history: Arc::new(AlertHistory::new(16)),
+            auth_token: None,
+            incident_store: None,
+            k8s: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn readyz_503_when_probes_not_attached() {
+        // transport stays "userspace" when init_ebpf fails -- the exact state a
+        // node below the kernel floor ends up in. It must not report ready.
+        let app_state = degraded_app_state();
+        let app = all_routes(Arc::clone(&app_state));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["ready"], false);
+        assert_eq!(v["kernel_instrumentation"], "unavailable");
+        assert!(v["reason"].as_str().unwrap().contains("userspace-only"));
+    }
+
+    #[tokio::test]
+    async fn healthz_stays_200_when_degraded() {
+        // Liveness must not flap on an unsupported kernel -- restarting cannot fix it.
+        let app_state = degraded_app_state();
+        let app = all_routes(Arc::clone(&app_state));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["kernel_instrumentation"], "unavailable");
+    }
+
     #[tokio::test]
     async fn status_keys_present() {
         let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10, None));
@@ -2243,6 +2382,7 @@ mod tests {
             offline: Arc::new(OfflineGuard::new(false)),
             transport: "perf",
             probe_state: ProbeState::disabled(),
+            require_kernel_instrumentation: true,
             enforcement: None,
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: false,
@@ -2291,6 +2431,7 @@ mod tests {
                 rss_probe: RssProbeMode::CoreMm,
                 btf_available: true,
             },
+            require_kernel_instrumentation: true,
             enforcement: None,
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: false,
@@ -2322,6 +2463,7 @@ mod tests {
             offline: Arc::new(OfflineGuard::new(false)),
             transport: "perf",
             probe_state: ProbeState::disabled(),
+            require_kernel_instrumentation: true,
             enforcement: None,
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: false,
@@ -2356,6 +2498,7 @@ mod tests {
             offline: Arc::new(OfflineGuard::new(false)),
             transport: "perf",
             probe_state: ProbeState::disabled(),
+            require_kernel_instrumentation: true,
             enforcement: None,
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: true,
@@ -2404,6 +2547,7 @@ mod tests {
             offline: Arc::new(OfflineGuard::new(false)),
             transport: "perf",
             probe_state: ProbeState::disabled(),
+            require_kernel_instrumentation: true,
             enforcement: None,
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: false,
@@ -2437,6 +2581,7 @@ mod tests {
             offline: Arc::new(OfflineGuard::new(false)),
             transport: "perf",
             probe_state: ProbeState::disabled(),
+            require_kernel_instrumentation: true,
             enforcement: None,
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: false,
@@ -2470,6 +2615,7 @@ mod tests {
             offline: Arc::new(OfflineGuard::new(false)),
             transport: "perf",
             probe_state: ProbeState::disabled(),
+            require_kernel_instrumentation: true,
             enforcement: None,
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: false,
@@ -2504,6 +2650,7 @@ mod tests {
             offline: Arc::new(OfflineGuard::new(false)),
             transport: "perf",
             probe_state: ProbeState::disabled(),
+            require_kernel_instrumentation: true,
             enforcement: None,
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: false,
@@ -2538,6 +2685,7 @@ mod tests {
             offline: Arc::new(OfflineGuard::new(false)),
             transport: "perf",
             probe_state: ProbeState::disabled(),
+            require_kernel_instrumentation: true,
             enforcement: None,
             reasoner: ReasonerConfig::default(),
             prometheus_enabled: false,

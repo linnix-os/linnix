@@ -47,6 +47,27 @@ spec:
           ports:
             - containerPort: 3000
               name: http
+          # Liveness only asks "is the process alive?". It deliberately does NOT
+          # check eBPF: a kernel that cannot load our programs never will, so
+          # failing liveness would CrashLoopBackOff and bury the real reason.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          # Readiness reflects whether this agent is actually producing
+          # per-process stall attribution. A node below the kernel floor
+          # (5.12+ x86_64 / 5.18+ arm64), without BTF, or missing CAP_BPF runs
+          # userspace-only -- it stays up but collects nothing useful, and shows
+          # as 0/1 Ready instead of silently looking healthy.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            failureThreshold: 2
       volumes:
         - name: config
           configMap:

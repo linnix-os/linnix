@@ -50,6 +50,7 @@ fn uds_config_round_trip() {
         listen_addr: "0.0.0.0:3000".to_string(),
         auth_token: Some("secret".to_string()),
         unix_socket: Some("/tmp/test.sock".to_string()),
+        require_kernel_instrumentation: true,
     };
     let serialized = toml::to_string(&api).expect("serialize");
     let back: ApiConfig = toml::from_str(&serialized).expect("deserialize");

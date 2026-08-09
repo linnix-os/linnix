@@ -6,6 +6,27 @@
 - **Below the minimum**: both the primary and the `rss_trace` fallback object fail to load. `cognitod` does not crash — it logs `eBPF initialization failed ...; running without kernel instrumentation` and continues in userspace-only mode, which means **no eBPF telemetry at all**. Check your logs for that warning if metrics look empty.
 - **BTF tips**: Ship `/sys/kernel/btf/vmlinux` (or package-specific paths) so Linnix can compute struct offsets dynamically. Without BTF, the daemon logs a warning and continues with degraded telemetry.
 
+## How do I tell whether Linnix is actually collecting?
+
+Linnix does not fail closed. If the eBPF probes cannot attach, `cognitod` keeps
+running and still serves PSI read from `/proc/pressure` — but the per-process
+stall attribution, the part you installed it for, is gone. Two endpoints
+distinguish these states:
+
+- **`/healthz`** — liveness. 200 whenever the process is up. It stays 200 even
+  when degraded, because restarting cannot fix an unsupported kernel; the body
+  carries `kernel_instrumentation: active | unavailable`.
+- **`/readyz`** — readiness. **503** when the probes are not attached, with a
+  `reason` explaining what to check. This is what the Kubernetes readinessProbe
+  and the container HEALTHCHECK use, so a degraded node shows as `0/1 Ready`
+  rather than looking healthy.
+
+For alerting, scrape `linnix_kernel_instrumentation_active` (1 = probes
+attached, 0 = userspace-only) from `/metrics/prometheus`.
+
+Deployments that intentionally run without kernel instrumentation can set
+`require_kernel_instrumentation = false` under `[api]` in `linnix.toml`.
+
 ## How much overhead should I expect?
 - The end-to-end pipeline (eBPF + cognitod) stays under **1% CPU and 10–20 MB RAM** on typical hosts.
 - Reasons it is lightweight:
