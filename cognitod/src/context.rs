@@ -607,7 +607,11 @@ mod tests {
         store.add(exit);
 
         let recent = store.get_recent();
-        assert_eq!(recent.len(), 1, "exit event should remain after exec eviction");
+        assert_eq!(
+            recent.len(),
+            1,
+            "exit event should remain after exec eviction"
+        );
         assert_eq!(recent[0].event_type, EventType::Exit as u32);
     }
 }
