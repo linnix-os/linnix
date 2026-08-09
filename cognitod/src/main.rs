@@ -782,13 +782,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // KB Index removed (YAGNI cleanup)
 
+    // Blame metrics live for the process lifetime: the PSI monitor writes to
+    // them and /metrics/prometheus reads them, so a scrape never has to query
+    // the incident database.
+    let blame_metrics = Arc::new(cognitod::attribution::BlameMetrics::new(
+        k8s_context
+            .as_ref()
+            .map(|ctx| ctx.node_name.clone())
+            .unwrap_or_else(|| "unknown".to_string()),
+    ));
+
     // Start PSI monitor (after incident store is ready)
     if let Some(ctx) = &k8s_context {
+        let sink = Arc::new(cognitod::attribution::AttributionSink::new(
+            blame_metrics.clone(),
+            alert_tx.clone(),
+            ctx.node_name.clone(),
+        ));
         let psi_monitor = cognitod::collectors::psi::PsiMonitor::new(
             ctx.clone(),
             context.clone(),
             incident_store.clone(),
             config.psi.sustained_pressure_seconds,
+            sink,
         );
         tokio::spawn(async move {
             psi_monitor.run().await;
@@ -1151,6 +1167,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         enforcement: enforcement_queue.clone(),
         incident_store: incident_store.clone(),
         k8s: k8s_context.clone(),
+        blame_metrics: blame_metrics.clone(),
     });
 
     let api = all_routes(app_state.clone());

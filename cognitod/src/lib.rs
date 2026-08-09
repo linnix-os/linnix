@@ -2,6 +2,7 @@
 // Both local stable and Docker stable support it without feature flags
 
 pub mod alerts;
+pub mod attribution;
 pub mod bpf_config;
 pub mod collectors;
 pub mod config;
