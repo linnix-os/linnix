@@ -362,31 +362,50 @@ impl PsiMonitor {
 /// Kubernetes API to talk to.
 pub fn calculate_blame_attributions(event: &StallEvent) -> Vec<BlameAttribution> {
     {
-        let total_cpu: f32 = event
-            .concurrent_consumers
-            .iter()
-            .map(|c| c.cpu_percent)
-            .sum();
-
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
+        // A pod cannot be its own noisy neighbour. CPU-bound victims show up in
+        // their own consumer list, and left in they would absorb most of their
+        // own stall and alert about themselves.
+        let victim_key = format!("{}/{}", event.victim_namespace, event.victim_pod);
+
+        // Consumers arrive per process, so a pod with several busy processes
+        // appears several times. Fold them together before scoring: comparing
+        // one process's CPU against every process's total would under-credit
+        // exactly the multi-process pods most likely to be causing the stall.
+        let mut cpu_by_pod: HashMap<String, f32> = HashMap::new();
+        for c in &event.concurrent_consumers {
+            let key = format!("{}/{}", c.namespace, c.pod);
+            if key == victim_key {
+                continue;
+            }
+            *cpu_by_pod.entry(key).or_insert(0.0) += c.cpu_percent;
+        }
+
+        let total_cpu: f32 = cpu_by_pod.values().sum();
+
         // Collect all potential offenders (CPU consumers + forkers + short-job creators)
         let mut offenders: HashMap<String, (String, String)> = HashMap::new(); // key -> (ns, pod)
 
-        for c in &event.concurrent_consumers {
-            let key = format!("{}/{}", c.namespace, c.pod);
-            offenders.insert(key, (c.namespace.clone(), c.pod.clone()));
-        }
-        for key in event.fork_counts.keys() {
+        for key in cpu_by_pod.keys() {
             if let Some((ns, pod)) = key.split_once('/') {
                 offenders.insert(key.clone(), (ns.to_string(), pod.to_string()));
             }
         }
+        for key in event.fork_counts.keys() {
+            if let Some((ns, pod)) = key.split_once('/')
+                && key != &victim_key
+            {
+                offenders.insert(key.clone(), (ns.to_string(), pod.to_string()));
+            }
+        }
         for key in event.short_job_counts.keys() {
-            if let Some((ns, pod)) = key.split_once('/') {
+            if let Some((ns, pod)) = key.split_once('/')
+                && key != &victim_key
+            {
                 offenders.insert(key.clone(), (ns.to_string(), pod.to_string()));
             }
         }
@@ -394,13 +413,7 @@ pub fn calculate_blame_attributions(event: &StallEvent) -> Vec<BlameAttribution>
         let mut attributions = Vec::new();
 
         for (key, (ns, pod)) in offenders {
-            // CPU Share
-            let cpu_percent = event
-                .concurrent_consumers
-                .iter()
-                .find(|c| c.namespace == ns && c.pod == pod)
-                .map(|c| c.cpu_percent)
-                .unwrap_or(0.0);
+            let cpu_percent = cpu_by_pod.get(&key).copied().unwrap_or(0.0);
 
             let cpu_share = if total_cpu > 0.0 {
                 (cpu_percent / total_cpu) as f64

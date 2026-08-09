@@ -88,6 +88,51 @@ const SCENARIOS: &[Scenario] = &[
         expect_counted_only: &[],
     },
     Scenario {
+        name: "a CPU-bound victim is never blamed for stalling itself",
+        victim_stall_us: 900_000,
+        // The victim burns more CPU than anyone: it is busy *because* it is
+        // being starved. Blaming it would both mis-name the culprit and eat
+        // most of the stall budget.
+        consumers: &[("payment-api", 70.0), ("image-resize-worker", 30.0)],
+        forks: &[("prod/payment-api", 300)],
+        short_jobs: &[],
+        expect_reported: &[ExpectedOffender {
+            pod: "image-resize-worker",
+            reason: BlameReason::HighCpuContention,
+            stall_ms: (890, 900),
+        }],
+        expect_counted_only: &[],
+    },
+    Scenario {
+        name: "a pod busy across many processes is credited for all of them",
+        victim_stall_us: 1_000_000,
+        // Consumers arrive per process: the worker has four busy processes at
+        // 20% each, the single-process neighbour has one at 30%. The worker is
+        // the bigger consumer and must rank first.
+        consumers: &[
+            ("multi-proc-worker", 20.0),
+            ("multi-proc-worker", 20.0),
+            ("multi-proc-worker", 20.0),
+            ("multi-proc-worker", 20.0),
+            ("single-proc-neighbour", 30.0),
+        ],
+        forks: &[],
+        short_jobs: &[],
+        expect_reported: &[
+            ExpectedOffender {
+                pod: "multi-proc-worker",
+                reason: BlameReason::HighCpuContention,
+                stall_ms: (700, 730),
+            },
+            ExpectedOffender {
+                pod: "single-proc-neighbour",
+                reason: BlameReason::HighCpuContention,
+                stall_ms: (260, 280),
+            },
+        ],
+        expect_counted_only: &[],
+    },
+    Scenario {
         name: "a stall split thinly across many neighbours reports nobody",
         victim_stall_us: 300_000,
         consumers: &[
@@ -223,6 +268,15 @@ fn scenarios_produce_the_expected_events_alerts_and_metrics() {
         // shows the full picture even when nothing was worth alerting on.
         let mut body = String::new();
         metrics.render_prometheus(&mut body);
+
+        // No scenario has the victim genuinely stalling itself, so it must
+        // never appear as its own offender in any output.
+        assert!(
+            !body.contains(&format!("offender_pod=\"{}\"", VICTIM_POD)),
+            "[{}] the victim was blamed for its own stall:\n{}",
+            scenario.name,
+            body
+        );
         for pod in scenario.expect_counted_only {
             assert!(
                 body.contains(&format!("offender_pod=\"{}\"", pod)),

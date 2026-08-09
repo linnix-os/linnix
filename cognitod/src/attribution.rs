@@ -16,7 +16,7 @@ use std::fmt::Write as _;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use log::{info, warn};
+use log::warn;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
@@ -162,7 +162,12 @@ impl CappedCounters {
     }
 
     /// Evicts the lowest-valued entry, parking its value in `carry`.
-    fn evict_one(&mut self) -> Option<String> {
+    ///
+    /// `incoming` is the key being made room for. It is never chosen as the
+    /// carry entry to discard: dropping the carried total of the very series
+    /// about to be re-inserted would restart it from zero, which is the counter
+    /// reset this carry mechanism exists to prevent.
+    fn evict_one(&mut self, incoming: &str) -> Option<String> {
         let victim = self
             .values
             .iter()
@@ -175,6 +180,7 @@ impl CappedCounters {
             && let Some(drop_key) = self
                 .carry
                 .iter()
+                .filter(|(k, _)| k.as_str() != incoming)
                 .min_by_key(|(_, v)| **v)
                 .map(|(k, _)| k.clone())
         {
@@ -190,7 +196,7 @@ impl CappedCounters {
         if self.values.contains_key(key) || self.values.len() < self.cap {
             return false;
         }
-        self.evict_one().is_some()
+        self.evict_one(key).is_some()
     }
 
     fn add(&mut self, key: &str, delta: u64) -> bool {
@@ -469,8 +475,12 @@ impl AttributionSink {
 
             let event = AttributionEvent::from_attribution(attr);
 
+            // Logged at warn to match the severity the event declares: these
+            // would otherwise vanish under RUST_LOG=warn, which is exactly the
+            // filter an operator sets when they only want the events that
+            // matter.
             match serde_json::to_string(&event) {
-                Ok(line) => info!("{}", line),
+                Ok(line) => warn!("{}", line),
                 Err(e) => warn!("[attribution] failed to serialize attribution event: {}", e),
             }
 
@@ -536,6 +546,27 @@ mod tests {
         // "b" comes back and resumes from where it left off rather than zero.
         counters.add("b", 5);
         assert_eq!(counters.values.get("b"), Some(&15));
+    }
+
+    #[test]
+    fn a_returning_series_keeps_its_carry_when_both_maps_are_full() {
+        let mut counters = CappedCounters::new(2);
+        counters.add("a", 100);
+        counters.add("b", 200);
+
+        // Push "a" and "b" out, filling carry with both.
+        counters.add("c", 900);
+        counters.add("d", 900);
+        assert_eq!(counters.carry.len(), 2);
+
+        // "a" holds the smallest carried value, so a naive eviction would
+        // discard it while making room for "a" itself.
+        counters.add("a", 50);
+        assert_eq!(
+            counters.values.get("a"),
+            Some(&150),
+            "the returning series should resume from its carried total"
+        );
     }
 
     #[test]
