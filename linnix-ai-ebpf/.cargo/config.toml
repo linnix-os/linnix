@@ -1,7 +1,11 @@
-# Applies when cargo is invoked from within this directory tree — notably the
-# Dockerfile, which does `WORKDIR /build/linnix-ai-ebpf/linnix-ai-ebpf-ebpf`
-# before `cargo build`. It does NOT apply to `cargo xtask build-ebpf`, which
-# runs from the workspace root; the root .cargo/config.toml covers that path.
+# Applies only when cargo is invoked from within this directory tree, i.e. a
+# manual `cd linnix-ai-ebpf/... && cargo build`. The canonical build is
+# `cargo xtask build-ebpf` from the workspace root (used by CI and the
+# Dockerfile), which reads the ROOT .cargo/config.toml instead.
+#
+# This file is kept because without it an in-directory `cargo build` would
+# target the host rather than bpfel-unknown-none and silently produce a no-op
+# binary (see the `cfg(not(target_arch = "bpf"))` main in src/main.rs).
 # Keep the rustflags here in sync with the root config.
 
 [build]

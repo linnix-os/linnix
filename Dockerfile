@@ -34,9 +34,13 @@ COPY linnix-reasoner/Cargo.toml ./linnix-reasoner/
 # Copy source code
 COPY . .
 
-# Build eBPF programs
-WORKDIR /build/linnix-ai-ebpf/linnix-ai-ebpf-ebpf
-RUN cargo build --release --target=bpfel-unknown-none
+# Build eBPF programs.
+# Use the xtask entrypoint so this shares one build path (and one set of
+# rustflags, incl. +alu32) with CI and local dev. Building from inside the
+# crate directory instead would pick up linnix-ai-ebpf/.cargo/config.toml,
+# which the workspace-root path does not read -- that divergence is what let
+# the aarch64 eBPF build break unnoticed (see #48).
+RUN cargo xtask build-ebpf
 
 # Stage 2: Build Rust userspace binaries
 FROM rust:1.93-bookworm AS rust-builder
