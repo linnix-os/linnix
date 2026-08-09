@@ -24,8 +24,8 @@ The Linnix collector uses eBPF to capture kernel events with minimal overhead.
 
 | Kernel | Support Level |
 |--------|--------------|
-| 5.4+ | Basic (sched tracepoints) |
-| 5.8+ | Full (BTF support) |
+| < 5.12 (x86_64) / < 5.18 (arm64) | **Unsupported** — verifier rejects the sequencer's `BPF_FETCH` atomics; daemon falls back to userspace-only |
+| 5.12+ (x86_64) / 5.18+ (arm64) | Supported (requires BTF) |
 | 5.15+ | Enhanced (page fault tracking) |
 
 ## Required Capabilities

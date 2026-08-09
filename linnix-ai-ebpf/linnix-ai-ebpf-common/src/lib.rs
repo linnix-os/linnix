@@ -264,7 +264,10 @@ pub struct TelemetryConfig {
     pub _reserved: u32,
     pub total_memory_bytes: u64,
     pub rss_source: u32,
-    pub _pad: u32,
+    /// Byte offset of `start_boottime` field in `task_struct`.
+    /// Identifies a task uniquely across PID recycling.
+    /// across PID recycling.  Discovered via BTF at daemon start.
+    pub task_start_boottime_offset: u32,
 }
 
 impl TelemetryConfig {
@@ -288,7 +291,7 @@ impl TelemetryConfig {
             _reserved: 0,
             total_memory_bytes: 0,
             rss_source: 0,
-            _pad: 0,
+            task_start_boottime_offset: 0,
         }
     }
 }

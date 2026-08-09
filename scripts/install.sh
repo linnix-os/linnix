@@ -27,9 +27,18 @@ KERNEL_VERSION=$(uname -r)
 MAJOR_VERSION=$(echo "$KERNEL_VERSION" | cut -d. -f1)
 MINOR_VERSION=$(echo "$KERNEL_VERSION" | cut -d. -f2)
 
+# The eBPF objects use BPF_FETCH atomics (atomic fetch-and-add) in the sequencer's
+# ticket reservation. Kernel support: 5.12+ on x86_64, 5.18+ on arm64.
+# Below this the verifier rejects the programs and cognitod runs userspace-only.
+case "$(uname -m)" in
+    aarch64|arm64) MIN_MINOR=18 ;;
+    *)             MIN_MINOR=12 ;;
+esac
+
 echo -n "Checking Kernel ($KERNEL_VERSION)... "
-if [ "$MAJOR_VERSION" -lt 5 ] || ([ "$MAJOR_VERSION" -eq 5 ] && [ "$MINOR_VERSION" -lt 8 ]); then
-    echo -e "${YELLOW}Warning: Kernel 5.8+ recommended for CO-RE. You may need to compile from source.${NC}"
+if [ "$MAJOR_VERSION" -lt 5 ] || ([ "$MAJOR_VERSION" -eq 5 ] && [ "$MINOR_VERSION" -lt "$MIN_MINOR" ]); then
+    echo -e "${YELLOW}Warning: Kernel 5.$MIN_MINOR+ required on $(uname -m) for eBPF instrumentation.${NC}"
+    echo -e "${YELLOW}         cognitod will start but fall back to userspace-only monitoring.${NC}"
 else
     echo -e "${GREEN}OK${NC}"
 fi

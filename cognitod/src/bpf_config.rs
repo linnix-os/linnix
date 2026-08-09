@@ -33,6 +33,14 @@ pub fn derive_telemetry_config() -> Result<TelemetryConfigResult> {
     let (comm_bits, _) = member_offset(task_struct, "comm")?;
     let (se_bits, se_type) = member_offset(task_struct, "se")?;
 
+    // `start_boottime` (or legacy `real_start_time`) stores the task start
+    // time in boot-monotonic nanoseconds.  This is the same value the
+    // uniquely identifies a task across PID recycling.
+    let start_boottime_bits = member_offset(task_struct, "start_boottime")
+        .or_else(|_| member_offset(task_struct, "real_start_time"))
+        .map(|(bits, _)| bits)
+        .unwrap_or(0); // 0 disables start_time check in LSM if field not found
+
     let signal_candidate = rss_layout_for_field(&btf, task_struct, "signal")?;
     let mm_candidate = rss_layout_for_field(&btf, task_struct, "mm")?;
 
@@ -96,6 +104,11 @@ pub fn derive_telemetry_config() -> Result<TelemetryConfigResult> {
     telemetry.rss_anon_index = anon_index;
     telemetry.page_size = page_size;
     telemetry.total_memory_bytes = total_memory_bytes;
+    telemetry.task_start_boottime_offset = if start_boottime_bits > 0 {
+        to_bytes(start_boottime_bits).unwrap_or(0)
+    } else {
+        0
+    };
 
     if let Some(bits) = signal_bits {
         telemetry.task_signal_offset = to_bytes(bits)?;

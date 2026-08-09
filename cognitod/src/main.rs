@@ -31,15 +31,25 @@ mod api;
 mod runtime;
 // mod routes; // Deleted (dead code cleanup)
 
+use crate::api::{AppState, all_routes};
+use crate::bpf_config::{CoreRssMode, derive_telemetry_config};
+use crate::runtime::probes::{ProbeState, RssProbeMode};
+use clap::Parser;
+use cognitod::alerts::RuleEngine;
 use cognitod::bpf_config;
 use cognitod::config;
+use cognitod::config::{Config, OfflineGuard};
 use cognitod::context;
 use cognitod::enforcement;
 use cognitod::handler;
+use cognitod::handler::{HandlerList, JsonlHandler};
 use cognitod::insights;
 use cognitod::metrics;
+use cognitod::metrics::Metrics;
 use cognitod::types;
 use cognitod::ui;
+use serde_json::json;
+use std::{fs, path::Path};
 
 #[repr(transparent)]
 #[derive(Copy, Clone)]
@@ -91,18 +101,6 @@ fn attach_tracepoint_optional(bpf: &mut Ebpf, program: &str, category: &str, nam
     }
 }
 
-use crate::api::{AppState, all_routes};
-use crate::bpf_config::{CoreRssMode, derive_telemetry_config};
-use crate::runtime::probes::{ProbeState, RssProbeMode};
-use clap::Parser;
-use cognitod::alerts::RuleEngine;
-use cognitod::config::{Config, OfflineGuard};
-use cognitod::handler::{HandlerList, JsonlHandler};
-use cognitod::metrics::Metrics;
-use serde_json::json;
-use std::{fs, path::Path};
-
-/// Spawn background tasks for metrics collection and logging.
 fn spawn_metrics_tasks(metrics: Arc<Metrics>) {
     // Roll up events/s every second
     {
@@ -341,7 +339,9 @@ fn check_capabilities() -> anyhow::Result<()> {
     eprintln!(
         "  docker run --cap-add=BPF --cap-add=PERFMON --cap-drop=ALL ghcr.io/linnix-os/cognitod:latest"
     );
-    eprintln!("\nRequires: Linux 5.8+ with BTF support (/sys/kernel/btf/vmlinux)");
+    eprintln!(
+        "\nRequires: Linux 5.12+ (x86_64) or 5.18+ (arm64) with BTF support (/sys/kernel/btf/vmlinux)"
+    );
     eprintln!("Docs: https://docs.linnix.io/installation\n");
 
     anyhow::bail!("missing CAP_BPF and CAP_PERFMON")
@@ -1170,6 +1170,52 @@ async fn main() -> Result<(), Box<dyn Error>> {
             eprintln!("server error: {e}");
         }
     });
+
+    // ── Unix domain socket listener (bypasses token auth) ──
+    let uds_path = std::env::var("LINNIX_UDS_PATH")
+        .ok()
+        .or_else(|| config.api.unix_socket.clone());
+
+    if let Some(ref socket_path) = uds_path {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::net::UnixListener;
+
+        // Remove stale socket file if it exists
+        let _ = std::fs::remove_file(socket_path);
+
+        // Ensure parent directory exists
+        if let Some(parent) = std::path::Path::new(socket_path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        match UnixListener::bind(socket_path) {
+            Ok(uds_listener) => {
+                // Set socket permissions: owner + group read/write (0o660)
+                if let Err(e) =
+                    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o660))
+                {
+                    warn!("Failed to set UDS permissions: {}", e);
+                }
+
+                let uds_api = api::uds_routes(app_state.clone());
+                info!(
+                    "[cognitod] UDS server on {} (no auth — local connections only)",
+                    socket_path
+                );
+                tokio::spawn(async move {
+                    if let Err(e) = axum::serve(uds_listener, uds_api).await {
+                        eprintln!("UDS server error: {e}");
+                    }
+                });
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to bind UDS at {}: {}. UDS disabled.",
+                    socket_path, e
+                );
+            }
+        }
+    }
 
     tokio::spawn(async {
         let mut sigterm = signal(SignalKind::terminate()).unwrap();

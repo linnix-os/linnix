@@ -12,6 +12,11 @@ pub struct ApiConfig {
     pub listen_addr: String,
     #[serde(default)]
     pub auth_token: Option<String>,
+    /// Optional Unix domain socket path for local-only connections.
+    /// UDS connections bypass token auth (local identity verified by socket credentials).
+    /// Default: None (UDS disabled). Set to e.g. "/var/run/linnix/cognitod.sock" to enable.
+    #[serde(default)]
+    pub unix_socket: Option<String>,
 }
 
 impl Default for ApiConfig {
@@ -19,6 +24,7 @@ impl Default for ApiConfig {
         Self {
             listen_addr: default_listen_addr(),
             auth_token: None,
+            unix_socket: None,
         }
     }
 }
@@ -332,7 +338,6 @@ impl Default for PsiConfig {
 fn default_psi_sustained_pressure_seconds() -> u64 {
     15
 }
-
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct ProbesConfig {
     // Configuration for probe settings (reserved for future use)
@@ -436,7 +441,6 @@ fn default_require_human_approval() -> bool {
 fn default_circuit_breaker_mode() -> String {
     "monitor".to_string() // Default to safe mode
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

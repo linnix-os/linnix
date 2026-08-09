@@ -111,3 +111,8 @@ run-cognitod-k8s.sh
 scripts/full_test_suite.sh
 scripts/generate_wiki.sh
 scripts/validate_api_docs.sh
+
+# Video / demo-script artifacts
+scripts/YOUTUBE_DEMO_SCRIPT.md
+scripts/generate_demo_video.py
+videos/

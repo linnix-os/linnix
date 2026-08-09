@@ -1,7 +1,7 @@
 # Multi-stage build for Linnix Cognitod
 
 # Stage 1: Build eBPF programs
-FROM rust:1.90-bookworm AS ebpf-builder
+FROM rust:1.93-bookworm AS ebpf-builder
 
 # Install eBPF build dependencies
 RUN apt-get update && apt-get install -y \
@@ -23,7 +23,6 @@ WORKDIR /build
 
 # Copy Cargo files for dependency caching
 COPY Cargo.toml Cargo.lock ./
-COPY linnix-ai-ebpf/Cargo.toml.bak ./linnix-ai-ebpf/
 COPY linnix-ai-ebpf/linnix-ai-ebpf/Cargo.toml ./linnix-ai-ebpf/linnix-ai-ebpf/
 COPY linnix-ai-ebpf/linnix-ai-ebpf-common/Cargo.toml ./linnix-ai-ebpf/linnix-ai-ebpf-common/
 COPY linnix-ai-ebpf/linnix-ai-ebpf-ebpf/Cargo.toml ./linnix-ai-ebpf/linnix-ai-ebpf-ebpf/
@@ -40,13 +39,12 @@ WORKDIR /build/linnix-ai-ebpf/linnix-ai-ebpf-ebpf
 RUN cargo build --release --target=bpfel-unknown-none
 
 # Stage 2: Build Rust userspace binaries
-FROM rust:1.90-bookworm AS rust-builder
+FROM rust:1.93-bookworm AS rust-builder
 
 WORKDIR /build
 
 # Copy Cargo files
 COPY Cargo.toml Cargo.lock ./
-COPY linnix-ai-ebpf/Cargo.toml.bak ./linnix-ai-ebpf/
 COPY linnix-ai-ebpf/linnix-ai-ebpf/Cargo.toml ./linnix-ai-ebpf/linnix-ai-ebpf/
 COPY linnix-ai-ebpf/linnix-ai-ebpf-common/Cargo.toml ./linnix-ai-ebpf/linnix-ai-ebpf-common/
 COPY cognitod/Cargo.toml ./cognitod/

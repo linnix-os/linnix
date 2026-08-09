@@ -18,6 +18,7 @@ allow = [
   "Unicode-3.0",
   "Zlib",                  # <- NEW: for foldhash
   "CDLA-Permissive-2.0",   # <- NEW: for webpki-roots
+  "CC0-1.0",               # Creative Commons Zero — tiny-keccak
 ]
 # (Optional) warn if you listed a license above that doesn't actually appear
 unused-allowed-license = "warn"

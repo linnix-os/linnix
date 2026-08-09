@@ -888,7 +888,7 @@ async fn get_timeline(
     }
 
     // Sort by timestamp descending (newest first)
-    alerts.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    alerts.sort_by_key(|a| std::cmp::Reverse(a.timestamp));
 
     // Limit to 1000 results
     alerts.truncate(1000);
@@ -1303,7 +1303,6 @@ async fn reject_action(
         Err(StatusCode::NOT_FOUND)
     }
 }
-
 #[derive(Serialize)]
 struct DropBreakdown {
     event_type: u32,
@@ -1672,6 +1671,56 @@ pub fn all_routes(app_state: Arc<AppState>) -> Router {
         ));
     }
 
+    router.with_state(app_state)
+}
+
+/// Build routes for the Unix domain socket listener.
+///
+/// UDS connections bypass token auth — local process identity is verified
+/// by socket credentials (`SO_PEERCRED`). The routes are identical to `all_routes`
+/// but never apply the auth middleware layer.
+pub fn uds_routes(app_state: Arc<AppState>) -> Router {
+    let prometheus_enabled = app_state.prometheus_enabled;
+
+    let mut router = Router::new()
+        .route("/", get(crate::ui::dashboard_handler))
+        .route("/dashboard", get(crate::ui::dashboard_handler))
+        .route("/context", get(get_context_route))
+        .route("/processes", get(get_processes))
+        .route("/processes/live", get(stream_processes_live))
+        .route("/processes/{pid}", get(get_process_by_pid))
+        .route("/ppid/{ppid}", get(get_by_ppid))
+        .route("/graph/{pid}", get(get_graph))
+        .route("/events", get(stream_events))
+        .route("/stream", get(stream_events))
+        .route("/system", get(system_snapshot))
+        .route("/timeline", get(get_timeline))
+        .route("/metrics/system", get(get_system_metrics))
+        .route("/alerts", get(stream_alerts))
+        .route("/insights", get(get_insights))
+        .route("/insights/recent", get(get_recent_insights))
+        .route("/insights/{id}", get(get_insight_by_id))
+        .route("/insights/{id}/feedback", post(submit_feedback))
+        .route("/api/feedback", post(submit_feedback_api))
+        .route("/api/slack/interactions", post(handle_slack_interaction))
+        .route("/incidents", get(get_incidents))
+        .route("/incidents/summary", get(get_incident_summary))
+        .route("/incidents/stats", get(get_incident_stats))
+        .route("/incidents/{id}", get(get_incident_by_id))
+        .route("/attribution", get(get_attributions))
+        .route("/metrics", get(metrics_handler))
+        .route("/status", get(status_handler))
+        .route("/healthz", get(healthz))
+        .route("/actions", get(get_actions))
+        .route("/actions/{id}", get(get_action_by_id))
+        .route("/actions/{id}/approve", axum::routing::post(approve_action))
+        .route("/actions/{id}/reject", axum::routing::post(reject_action));
+
+    if prometheus_enabled {
+        router = router.route("/metrics/prometheus", get(prometheus_metrics));
+    }
+
+    // NOTE: No auth middleware — UDS connections are trusted (local process identity).
     router.with_state(app_state)
 }
 

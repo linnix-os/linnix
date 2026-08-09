@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Linux kernel 5.4+ (5.8+ recommended)
+- Linux kernel 5.12+ on x86_64 / 5.18+ on arm64 (5.15+ / 6.1+ recommended)
 - Docker and Docker Compose (for quick start)
 - Or: Rust toolchain (for building from source)
 
