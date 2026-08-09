@@ -17,6 +17,17 @@ pub struct ApiConfig {
     /// Default: None (UDS disabled). Set to e.g. "/var/run/linnix/cognitod.sock" to enable.
     #[serde(default)]
     pub unix_socket: Option<String>,
+    /// When true (default), /readyz reports NOT ready if the eBPF probes failed
+    /// to attach. Linnix's whole function is kernel-derived stall attribution, so
+    /// a node running userspace-only is not doing its job and should be visible
+    /// as such rather than reporting healthy. Set false for deployments that
+    /// intentionally run without kernel instrumentation.
+    #[serde(default = "default_require_kernel_instrumentation")]
+    pub require_kernel_instrumentation: bool,
+}
+
+fn default_require_kernel_instrumentation() -> bool {
+    true
 }
 
 impl Default for ApiConfig {
@@ -25,6 +36,7 @@ impl Default for ApiConfig {
             listen_addr: default_listen_addr(),
             auth_token: None,
             unix_socket: None,
+            require_kernel_instrumentation: default_require_kernel_instrumentation(),
         }
     }
 }

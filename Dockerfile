@@ -99,7 +99,7 @@ ENV RUST_LOG=info
 EXPOSE 3000
 
 HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
-    CMD curl -f http://localhost:3000/healthz || exit 1
+    CMD curl -f http://localhost:3000/readyz || exit 1
 
 # Security: runs as root with minimal capabilities (CAP_BPF + CAP_PERFMON)
 # Docker capabilities require root user. See SECURITY.md for details.

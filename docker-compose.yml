@@ -62,7 +62,7 @@ services:
     restart: unless-stopped
 
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/healthz"]
+      test: ["CMD", "curl", "-f", "http://localhost:3000/readyz"]
       interval: 10s
       timeout: 5s
       retries: 3

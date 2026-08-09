@@ -1143,6 +1143,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         offline: Arc::clone(&offline_guard),
         transport,
         probe_state,
+        require_kernel_instrumentation: config.api.require_kernel_instrumentation,
         reasoner: config.reasoner.clone(),
         prometheus_enabled: config.outputs.prometheus,
         alert_history: Arc::clone(&alert_history),
