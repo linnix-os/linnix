@@ -1608,6 +1608,9 @@ pub async fn prometheus_metrics(State(app_state): State<Arc<AppState>>) -> Respo
         );
     }
 
+    // Who is stalling, and who is stalling them.
+    app_state.blame_metrics.render_prometheus(&mut body);
+
     Response::builder()
         .status(StatusCode::OK)
         .header(
@@ -1690,6 +1693,8 @@ pub struct AppState {
     pub enforcement: Option<Arc<crate::enforcement::EnforcementQueue>>,
     pub incident_store: Option<Arc<IncidentStore>>,
     pub k8s: Option<Arc<cognitod::k8s::K8sContext>>,
+    /// Noisy-neighbour counters fed by the PSI monitor's attribution sink.
+    pub blame_metrics: Arc<cognitod::attribution::BlameMetrics>,
 }
 
 pub fn all_routes(app_state: Arc<AppState>) -> Router {
@@ -2323,6 +2328,7 @@ mod tests {
             auth_token: None,
             incident_store: None,
             k8s: None,
+            blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         })
     }
 
@@ -2390,6 +2396,7 @@ mod tests {
             auth_token: None,
             incident_store: None,
             k8s: None,
+            blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         });
         let Json(resp) = super::status_handler(State(app_state)).await;
         let val = serde_json::to_value(resp).unwrap();
@@ -2439,6 +2446,7 @@ mod tests {
             auth_token: None,
             incident_store: None,
             k8s: None,
+            blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         });
 
         let Json(resp) = super::metrics_handler(State(app_state)).await;
@@ -2471,6 +2479,7 @@ mod tests {
             auth_token: None,
             incident_store: None,
             k8s: None,
+            blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         });
         let router = super::all_routes(Arc::clone(&app_state));
         let response = router
@@ -2506,6 +2515,7 @@ mod tests {
             auth_token: None,
             incident_store: None,
             k8s: None,
+            blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         });
         let router = super::all_routes(Arc::clone(&app_state));
         let response = router
@@ -2555,6 +2565,7 @@ mod tests {
             auth_token: None,
             incident_store: None,
             k8s: None,
+            blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         });
         let router = super::all_routes(app_state);
         let response = router
@@ -2589,6 +2600,7 @@ mod tests {
             incident_store: None,
             auth_token: Some("secret123".to_string()),
             k8s: None,
+            blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         });
         let router = super::all_routes(app_state);
         let response = router
@@ -2623,6 +2635,7 @@ mod tests {
             incident_store: None,
             auth_token: Some("secret123".to_string()),
             k8s: None,
+            blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         });
         let router = super::all_routes(app_state);
         let response = router
@@ -2658,6 +2671,7 @@ mod tests {
             incident_store: None,
             auth_token: Some("secret123".to_string()),
             k8s: None,
+            blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         });
         let router = super::all_routes(app_state);
         let response = router
@@ -2693,6 +2707,7 @@ mod tests {
             incident_store: None,
             auth_token: Some("secret123".to_string()),
             k8s: None,
+            blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         });
         let router = super::all_routes(app_state);
         let response = router

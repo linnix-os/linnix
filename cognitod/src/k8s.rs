@@ -226,6 +226,16 @@ impl K8sContext {
         let map = self.container_map.read().unwrap();
         map.get(container_id).cloned()
     }
+
+    /// Inserts container metadata directly, bypassing the API watcher.
+    ///
+    /// Lets callers that already know a container's identity — notably tests
+    /// driving the collectors against a fixture cgroup tree — populate the
+    /// cache without a reachable Kubernetes API.
+    pub fn insert_metadata(&self, container_id: impl Into<String>, metadata: K8sMetadata) {
+        let mut map = self.container_map.write().unwrap();
+        map.insert(container_id.into(), metadata);
+    }
 }
 
 #[derive(Deserialize)]

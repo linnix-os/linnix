@@ -45,3 +45,11 @@ enabled = true
 [psi]
 # Duration in seconds of sustained pressure required to trigger attribution
 sustained_pressure_seconds = 15
+# Stall attributed to a single offender, in milliseconds, before it is reported.
+# A large stall spread thinly across many neighbours is not a noisy neighbour.
+attribution_threshold_ms = 100
+# How long before the same offender/victim pair is reported again. Pressure
+# lasting an hour would otherwise alert every sustained_pressure_seconds for the
+# whole hour. Set to 0 to report every occurrence; the Prometheus counters are
+# unaffected either way.
+attribution_cooldown_seconds = 300

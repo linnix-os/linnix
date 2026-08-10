@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use walkdir::WalkDir;
 
+use crate::attribution::AttributionSink;
 use crate::context::ContextStore;
 use crate::k8s::K8sContext;
 
@@ -49,7 +50,12 @@ pub struct BlameAttribution {
     pub offender_pod: String,
     pub offender_namespace: String,
     pub blame_score: f64,
+    /// The victim's total stall for this window. Identical across every
+    /// attribution for the same event, so summing it double-counts.
     pub stall_us: u64,
+    /// This offender's share of `stall_us`, split by blame score. Summing this
+    /// across an event's attributions stays within the stall that happened.
+    pub attributed_stall_us: u64,
     pub timestamp: u64,
     pub cpu_share: f64,
     pub fork_count: u64,
@@ -122,9 +128,13 @@ pub struct PsiMonitor {
     k8s_ctx: Arc<K8sContext>,
     context: Arc<ContextStore>,
     incident_store: Option<Arc<crate::incidents::IncidentStore>>,
+    sink: Arc<AttributionSink>,
     history: HashMap<String, VecDeque<PsiSnapshot>>,
     pressure_start_time: HashMap<String, Instant>,
     sustained_pressure_duration: Duration,
+    cgroup_root: PathBuf,
+    /// When set, `run` stops after this many scans instead of looping forever.
+    max_iterations: Option<u64>,
 }
 
 impl PsiMonitor {
@@ -133,23 +143,41 @@ impl PsiMonitor {
         context: Arc<ContextStore>,
         incident_store: Option<Arc<crate::incidents::IncidentStore>>,
         sustained_pressure_seconds: u64,
+        sink: Arc<AttributionSink>,
     ) -> Self {
         Self {
             k8s_ctx,
             context,
             incident_store,
+            sink,
             history: HashMap::new(),
             pressure_start_time: HashMap::new(),
             sustained_pressure_duration: Duration::from_secs(sustained_pressure_seconds),
+            cgroup_root: PathBuf::from("/sys/fs/cgroup"),
+            max_iterations: None,
         }
+    }
+
+    /// Points the monitor at a different cgroup hierarchy. Exists so the scan
+    /// loop can be driven against a fixture tree rather than the live kernel.
+    pub fn with_cgroup_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.cgroup_root = root.into();
+        self
+    }
+
+    /// Bounds the scan loop so it terminates. Only useful for tests.
+    pub fn with_max_iterations(mut self, iterations: u64) -> Self {
+        self.max_iterations = Some(iterations);
+        self
     }
 
     pub async fn run(mut self) {
         info!("[psi] starting PSI monitor");
-        let base_path = Path::new("/sys/fs/cgroup");
+        let base_path = self.cgroup_root.clone();
+        let mut iterations = 0u64;
 
         loop {
-            let psi_files = find_psi_files(base_path);
+            let psi_files = find_psi_files(&base_path);
             debug!("[psi] scanning {} cgroups", psi_files.len());
 
             for path in psi_files {
@@ -159,6 +187,13 @@ impl PsiMonitor {
                     && let Ok(snapshot) = parse_psi_file(&content)
                 {
                     let key = format!("{}/{}", meta.namespace, meta.pod_name);
+
+                    self.sink.metrics().record_victim_pressure(
+                        &meta.namespace,
+                        &meta.pod_name,
+                        &container_id,
+                        snapshot.some_total,
+                    );
 
                     // Get or create history for this pod
                     let hist = self.history.entry(key.clone()).or_default();
@@ -223,7 +258,7 @@ impl PsiMonitor {
                                 );
 
                                 // Calculate blame attributions
-                                let attributions = self.calculate_blame_attributions(&stall_event);
+                                let attributions = calculate_blame_attributions(&stall_event);
 
                                 // Log top 3 attributions
                                 for (i, attr) in attributions.iter().take(3).enumerate() {
@@ -238,6 +273,10 @@ impl PsiMonitor {
                                         attr.short_job_count
                                     );
                                 }
+
+                                // Structured events, alerts and metrics all
+                                // leave through here.
+                                self.sink.emit(&attributions);
 
                                 // Persist to database if available
                                 if let Some(ref store) = self.incident_store {
@@ -279,6 +318,12 @@ impl PsiMonitor {
                 }
             }
 
+            iterations += 1;
+            if self.max_iterations.is_some_and(|max| iterations >= max) {
+                info!("[psi] scan limit reached, stopping PSI monitor");
+                return;
+            }
+
             sleep(Duration::from_secs(1)).await;
         }
     }
@@ -308,33 +353,59 @@ impl PsiMonitor {
         });
         consumers
     }
+}
 
-    fn calculate_blame_attributions(&self, event: &StallEvent) -> Vec<BlameAttribution> {
-        let total_cpu: f32 = event
-            .concurrent_consumers
-            .iter()
-            .map(|c| c.cpu_percent)
-            .sum();
-
+/// Splits a victim's stall across the pods that plausibly caused it.
+///
+/// Free-standing because it is pure: it needs the stall event and nothing from
+/// the monitor's own state, which also means it can be exercised without a
+/// Kubernetes API to talk to.
+pub fn calculate_blame_attributions(event: &StallEvent) -> Vec<BlameAttribution> {
+    {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
+        // A pod cannot be its own noisy neighbour. CPU-bound victims show up in
+        // their own consumer list, and left in they would absorb most of their
+        // own stall and alert about themselves.
+        let victim_key = format!("{}/{}", event.victim_namespace, event.victim_pod);
+
+        // Consumers arrive per process, so a pod with several busy processes
+        // appears several times. Fold them together before scoring: comparing
+        // one process's CPU against every process's total would under-credit
+        // exactly the multi-process pods most likely to be causing the stall.
+        let mut cpu_by_pod: HashMap<String, f32> = HashMap::new();
+        for c in &event.concurrent_consumers {
+            let key = format!("{}/{}", c.namespace, c.pod);
+            if key == victim_key {
+                continue;
+            }
+            *cpu_by_pod.entry(key).or_insert(0.0) += c.cpu_percent;
+        }
+
+        let total_cpu: f32 = cpu_by_pod.values().sum();
+
         // Collect all potential offenders (CPU consumers + forkers + short-job creators)
         let mut offenders: HashMap<String, (String, String)> = HashMap::new(); // key -> (ns, pod)
 
-        for c in &event.concurrent_consumers {
-            let key = format!("{}/{}", c.namespace, c.pod);
-            offenders.insert(key, (c.namespace.clone(), c.pod.clone()));
-        }
-        for key in event.fork_counts.keys() {
+        for key in cpu_by_pod.keys() {
             if let Some((ns, pod)) = key.split_once('/') {
                 offenders.insert(key.clone(), (ns.to_string(), pod.to_string()));
             }
         }
+        for key in event.fork_counts.keys() {
+            if let Some((ns, pod)) = key.split_once('/')
+                && key != &victim_key
+            {
+                offenders.insert(key.clone(), (ns.to_string(), pod.to_string()));
+            }
+        }
         for key in event.short_job_counts.keys() {
-            if let Some((ns, pod)) = key.split_once('/') {
+            if let Some((ns, pod)) = key.split_once('/')
+                && key != &victim_key
+            {
                 offenders.insert(key.clone(), (ns.to_string(), pod.to_string()));
             }
         }
@@ -342,13 +413,7 @@ impl PsiMonitor {
         let mut attributions = Vec::new();
 
         for (key, (ns, pod)) in offenders {
-            // CPU Share
-            let cpu_percent = event
-                .concurrent_consumers
-                .iter()
-                .find(|c| c.namespace == ns && c.pod == pod)
-                .map(|c| c.cpu_percent)
-                .unwrap_or(0.0);
+            let cpu_percent = cpu_by_pod.get(&key).copied().unwrap_or(0.0);
 
             let cpu_share = if total_cpu > 0.0 {
                 (cpu_percent / total_cpu) as f64
@@ -387,11 +452,24 @@ impl PsiMonitor {
                     offender_namespace: ns,
                     blame_score,
                     stall_us: event.stall_delta_us,
+                    // Filled in below, once the total blame is known.
+                    attributed_stall_us: 0,
                     timestamp,
                     cpu_share,
                     fork_count,
                     short_job_count,
                 });
+            }
+        }
+
+        // Split the observed stall proportionally to blame. Truncating each
+        // share keeps the sum at or below the stall that actually occurred, so
+        // the derived counters can never claim more stall than the kernel saw.
+        let total_blame: f64 = attributions.iter().map(|a| a.blame_score).sum();
+        if total_blame > 0.0 {
+            for attr in &mut attributions {
+                attr.attributed_stall_us =
+                    ((attr.blame_score / total_blame) * event.stall_delta_us as f64) as u64;
             }
         }
 
@@ -433,24 +511,6 @@ mod tests {
 
     #[test]
     fn test_calculate_blame_attributions_with_forks() {
-        // Set env vars to force K8sContext creation
-        unsafe {
-            std::env::set_var("K8S_API_URL", "http://localhost:8001");
-            std::env::set_var("K8S_TOKEN", "dummy");
-        }
-
-        let k8s_ctx = K8sContext::new().expect("Failed to create K8sContext");
-        let monitor = PsiMonitor::new(
-            k8s_ctx.clone(),
-            Arc::new(ContextStore::new(
-                Duration::from_secs(60),
-                1000,
-                Some(k8s_ctx),
-            )),
-            None,
-            15,
-        );
-
         let mut fork_counts = HashMap::new();
         fork_counts.insert("default/fork-bomb".to_string(), 200);
 
@@ -478,7 +538,7 @@ mod tests {
             short_job_counts,
         };
 
-        let attributions = monitor.calculate_blame_attributions(&event);
+        let attributions = calculate_blame_attributions(&event);
 
         // We expect 3 offenders: cpu-hog, fork-bomb, short-job-pod
         assert_eq!(attributions.len(), 3);
