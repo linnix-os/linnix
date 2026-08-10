@@ -28,5 +28,16 @@ data:
     enabled = false  # Disable LLM by default in K8s to save resources
     endpoint = "http://localhost:8090/v1/chat/completions"
 
-    [prometheus]
-    enabled = true
+    [outputs]
+    # Serves the Prometheus text exposition at /metrics/prometheus, including
+    # the per-pod stall attribution metrics the Grafana dashboard charts.
+    prometheus = true
+
+    [psi]
+    # Seconds of sustained pressure before a stall is attributed to neighbours.
+    sustained_pressure_seconds = 15
+    # Stall attributed to a single offender, in milliseconds, before it is
+    # reported as a JSON event and an alert.
+    attribution_threshold_ms = 100
+    # Quiet period before the same offender/victim pair is reported again.
+    attribution_cooldown_seconds = 300

@@ -13,6 +13,18 @@ spec:
     metadata:
       labels:
         app: linnix
+      annotations:
+        # Picked up by Prometheus' standard kubernetes-pods scrape job. Without
+        # these the endpoint is served but never collected, so the dashboard
+        # stays empty. Prometheus Operator users should add a PodMonitor
+        # instead; these annotations are ignored by it.
+        #
+        # If you set api.auth_token in the ConfigMap, the metrics route requires
+        # it too and this annotation-based scrape gets 401. See
+        # k8s/grafana/README.md for a scrape job that sends the token.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3000"
+        prometheus.io/path: "/metrics/prometheus"
     spec:
       serviceAccountName: linnix-agent
       hostPID: true  # Required to monitor host processes
