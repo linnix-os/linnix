@@ -17,11 +17,14 @@ Linnix uses **eBPF** + **PSI (Pressure Stall Information)** to answer this. PSI 
 **What Linnix detects:**
 - **Noisy Neighbors**: Which container is starving others
 - **Fork Storms**: Runaway process creation before it crashes the node
-- **Stall Attribution**: "Pod X caused 300ms stall to Pod Y"
+- **Stall Attribution**: "Pod X caused 300ms stall to Pod Y" — exposed as a Prometheus counter keyed on the offender/victim pair
 - **PSI Saturation**: CPU/IO/Memory pressure that doesn't show in `top`
 
 > [!IMPORTANT]
 > **Monitor-only by default.** Linnix detects and reports — it never takes action without explicit configuration.
+
+> [!NOTE]
+> **We tell you when attribution is degraded.** If eBPF can't attach (unsupported kernel, missing BTF), Linnix keeps serving PSI from `/proc/pressure` — pressure exists, but you lose *who caused it*, the reason you installed Linnix. `/readyz` reports 503 in that state instead of looking healthy. See [FAQ](docs/FAQ.md#how-do-i-tell-whether-linnix-is-actually-collecting).
 
 ### 🔒 Security & Privacy
 

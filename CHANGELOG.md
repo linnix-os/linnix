@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-08-09
+
+### Added
+- **Stall Attribution Emit Seam**: All completed PSI stall attributions now route through a single `AttributionSink` (`cognitod/src/attribution.rs`), fanning out to a structured JSON event, an alert on the existing broadcast channel, and pod-labeled Prometheus counters (`linnix_stall_induced_seconds_total{offender_pod, victim_pod, ...}`)
+  - New `attributed_stall_us` field splits a victim's stall proportionally across offenders by blame score, instead of duplicating the full stall duration per offender
+  - `calculate_blame_attributions` extracted as a free function for testability
+
+### Changed
+- **Degraded eBPF Visibility**: New `/readyz` endpoint returns 503 when eBPF probes fail to attach, naming likely causes (kernel floor, missing BTF, tracefs, CAP_BPF/CAP_PERFMON). Previously `/healthz` stayed `200 ok` in this state, silently falling back to PSI-only (pressure signal, no per-process attribution)
+  - New `linnix_kernel_instrumentation_active` gauge
+  - New `api.require_kernel_instrumentation` config flag (default `true`)
+  - K8s DaemonSet, Dockerfile, and compose healthchecks updated to use `/readyz`
+- **Linnix-Claw extracted**: the agent-to-agent payment/settlement subsystem moved to its own repo (`linnix-os/linnix-claw`), letting core Linnix focus solely on PSI/eBPF stall attribution
+  - eBPF object size reduced 43,096 → 27,184 bytes (-37%)
+  - Dropped the `lsm=bpf` boot-parameter requirement
+
 ## [0.2.0] - 2025-11-26
 
 ### Added

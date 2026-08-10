@@ -28,12 +28,13 @@ Deployments that intentionally run without kernel instrumentation can set
 `require_kernel_instrumentation = false` under `[api]` in `linnix.toml`.
 
 ## How much overhead should I expect?
-- The end-to-end pipeline (eBPF + cognitod) stays under **1% CPU and 10–20 MB RAM** on typical hosts.
+- The in-kernel eBPF probes add **under 1% CPU** (see [performance-proof.md](performance-proof.md)) — event-driven tracepoints, not polling.
+- The full `cognitod` userspace daemon (PSI polling, attribution, API) runs **~3.6-4.1% of one core** and 10-20 MB RAM on typical hosts (see [OVERHEAD.md](OVERHEAD.md)).
 - Reasons it is lightweight:
   1. Tracepoints fire only when the kernel already handles fork/exec/exit events (event-driven, no polling).
   2. Per-CPU buffers and lock-free maps avoid contention.
   3. Binary payloads (~200 bytes) minimize copies between kernel and userspace.
-- If you see sustained >1% CPU, check for debug builds, noisy workloads during benchmarking, or missing BTF (which forces slower fallback paths). Run `sudo ./test_ebpf_overhead.sh` to capture a reproducible report.
+- If you see overhead well above these figures, check for debug builds, noisy workloads during benchmarking, or missing BTF (which forces slower fallback paths). Run `sudo ./test_ebpf_overhead.sh` to capture a reproducible report.
 
 ## How does Linnix handle data privacy?
 - **On-host processing**: All capture, reasoning, and dashboards run on your infrastructure. There is no mandatory SaaS ingestion or remote control plane.

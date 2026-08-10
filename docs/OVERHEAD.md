@@ -17,7 +17,7 @@ Linnix is designed to be lightweight and unobtrusive. We continuously benchmark 
 | **CPU Stress** | 3.63% | 69.7 MB | System under 100% CPU load |
 | **Fork Stress** | 4.10% | 69.9 MB | High process churn (stress-ng --fork 4) |
 
-> **Note:** These numbers represent the userspace daemon overhead. The eBPF probes running in kernel space add negligible overhead (<1%) due to the JIT-compiled, event-driven nature of eBPF.
+> **Note:** These numbers represent the userspace daemon overhead only (BPF disabled for benchmark isolation, per Configuration above) — this is the ~4% figure cited elsewhere as "full daemon overhead." The in-kernel eBPF probes themselves add <1% CPU, measured separately (see [performance-proof.md](performance-proof.md)), due to the JIT-compiled, event-driven, per-CPU-buffered nature of eBPF versus polling-based collection. Quote both numbers together: **<1% eBPF (kernel-side), ~4% full userspace daemon**.
 
 ## Methodology
 
