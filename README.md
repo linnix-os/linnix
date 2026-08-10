@@ -92,6 +92,41 @@ See [SAFETY.md](SAFETY.md) for our detailed safety model.
 
 ---
 
+## Visualize in 30 seconds
+
+Linnix exports the attribution as Prometheus counters, so the "who is stalling whom" view works in the Grafana you already run.
+
+```bash
+kubectl apply -f k8s/                       # scrape annotations included
+# Grafana → Dashboards → New → Import → Upload JSON file
+#   k8s/grafana/linnix-noisy-neighbor.json
+```
+
+<!-- TODO: screenshot of the imported dashboard against a cluster with real stall data -->
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `linnix_pod_psi_pressure_total` | counter (µs) | `namespace`, `pod`, `node` |
+| `linnix_stall_induced_seconds_total` | counter (s) | `offender_pod`, `offender_namespace`, `victim_pod`, `victim_namespace` |
+| `linnix_blame_series_evicted_total` | counter | — |
+
+The second one is the differentiator: a workload **pair** series. Most monitoring can tell you a pod is under pressure; this says which other pod is causing it.
+
+```promql
+# Who is suffering
+topk(10, rate(linnix_pod_psi_pressure_total[5m]))
+
+# Who is causing it
+topk(10, sum by (offender_pod) (rate(linnix_stall_induced_seconds_total[5m])))
+
+# Blame for one victim
+sum by (offender_pod) (rate(linnix_stall_induced_seconds_total{victim_pod="payment-api"}[5m]))
+```
+
+Each victim's stall is split across its offenders in proportion to blame, so summing these never exceeds the stall that actually occurred. Attributions above `attribution_threshold_ms` also emit a JSON line on stdout with `"event_type": "linnix.stall_attribution"` for log-based tooling.
+
+---
+
 ## Kubernetes Features
 
 Linnix has first-class Kubernetes support:
