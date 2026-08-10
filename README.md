@@ -17,7 +17,7 @@ Linnix uses **eBPF** + **PSI (Pressure Stall Information)** to answer this. PSI 
 **What Linnix detects:**
 - **Noisy Neighbors**: Which container is starving others
 - **Fork Storms**: Runaway process creation before it crashes the node
-- **Stall Attribution**: "Pod X caused 300ms stall to Pod Y" — exposed as a Prometheus counter keyed on the offender/victim pair, see [prometheus-integration.md](docs/prometheus-integration.md)
+- **Stall Attribution**: "Pod X caused 300ms stall to Pod Y" — exposed as a Prometheus counter keyed on the offender/victim pair
 - **PSI Saturation**: CPU/IO/Memory pressure that doesn't show in `top`
 
 > [!IMPORTANT]
