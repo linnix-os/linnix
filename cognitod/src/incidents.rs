@@ -49,7 +49,13 @@ pub struct Incident {
 pub struct StallAttribution {
     pub offender_pod: String,
     pub offender_namespace: String,
+    /// The victim's total stall for the window. The same value repeats across
+    /// every offender of one event, so summing it double-counts.
     pub stall_us: u64,
+    /// This offender's share of `stall_us`, matching what
+    /// `linnix_stall_induced_seconds_total` reports. `None` on rows written
+    /// before the split existed and whose blame could not be renormalised.
+    pub attributed_stall_us: Option<u64>,
     pub blame_score: f64,
     pub timestamp: u64,
     // Detailed metrics
@@ -116,7 +122,12 @@ impl IncidentStore {
                 timestamp INTEGER NOT NULL,
                 cpu_share REAL DEFAULT 0.0,
                 fork_count INTEGER DEFAULT 0,
-                short_job_count INTEGER DEFAULT 0
+                short_job_count INTEGER DEFAULT 0,
+                -- This offender's share of stall_us. Nullable rather than
+                -- defaulted: a row written before this column existed has an
+                -- unknown share, and zero would claim the offender caused no
+                -- stall at all.
+                attributed_stall_us INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_victim_time ON stall_attributions(victim_pod, victim_namespace, timestamp);
             CREATE INDEX IF NOT EXISTS idx_offender_time ON stall_attributions(offender_pod, offender_namespace, timestamp);
@@ -140,6 +151,46 @@ impl IncidentStore {
         )
         .execute(&pool)
         .await;
+        let _ =
+            sqlx::query("ALTER TABLE stall_attributions ADD COLUMN attributed_stall_us INTEGER")
+                .execute(&pool)
+                .await;
+
+        // Rows written before the column existed stored only the victim's
+        // total stall, repeated against every offender. The share each was
+        // actually responsible for is recoverable: attributions from one event
+        // share a (victim, timestamp), so blame can be renormalised within that
+        // group. Nothing prunes this table, so old rows stay queryable and are
+        // worth reconciling rather than leaving unknown.
+        let backfilled = sqlx::query(
+            r#"
+            UPDATE stall_attributions AS a
+            SET attributed_stall_us = CAST(
+                a.stall_us * a.blame_score / (
+                    SELECT SUM(b.blame_score) FROM stall_attributions AS b
+                    WHERE b.victim_pod = a.victim_pod
+                      AND b.victim_namespace = a.victim_namespace
+                      AND b.timestamp = a.timestamp
+                ) AS INTEGER)
+            WHERE a.attributed_stall_us IS NULL
+              AND (
+                    SELECT SUM(b.blame_score) FROM stall_attributions AS b
+                    WHERE b.victim_pod = a.victim_pod
+                      AND b.victim_namespace = a.victim_namespace
+                      AND b.timestamp = a.timestamp
+                  ) > 0
+            "#,
+        )
+        .execute(&pool)
+        .await;
+        if let Ok(result) = backfilled
+            && result.rows_affected() > 0
+        {
+            info!(
+                "Backfilled attributed stall for {} historical attribution rows",
+                result.rows_affected()
+            );
+        }
 
         info!(
             "Incident store initialized at {}",
@@ -224,45 +275,47 @@ impl IncidentStore {
 
     /// Insert stall attribution event
     #[allow(clippy::too_many_arguments)]
+    /// Persists one blame attribution.
+    ///
+    /// Takes the attribution whole rather than a dozen positional arguments:
+    /// five of the columns are bare integers and transposing two of them would
+    /// compile cleanly and corrupt the record.
     pub async fn insert_stall_attribution(
         &self,
-        victim_pod: &str,
-        victim_namespace: &str,
-        offender_pod: &str,
-        offender_namespace: &str,
-        stall_us: u64,
-        blame_score: f64,
-        timestamp: u64,
-        cpu_share: f64,
-        fork_count: u64,
-        short_job_count: u64,
+        attr: &crate::collectors::psi::BlameAttribution,
     ) -> Result<i64, sqlx::Error> {
         let result = sqlx::query(
             r#"
             INSERT INTO stall_attributions (
                 victim_pod, victim_namespace, offender_pod, offender_namespace,
                 stall_us, blame_score, timestamp,
-                cpu_share, fork_count, short_job_count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                cpu_share, fork_count, short_job_count, attributed_stall_us
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
-        .bind(victim_pod)
-        .bind(victim_namespace)
-        .bind(offender_pod)
-        .bind(offender_namespace)
-        .bind(stall_us as i64)
-        .bind(blame_score)
-        .bind(timestamp as i64)
-        .bind(cpu_share)
-        .bind(fork_count as i64)
-        .bind(short_job_count as i64)
+        .bind(&attr.victim_pod)
+        .bind(&attr.victim_namespace)
+        .bind(&attr.offender_pod)
+        .bind(&attr.offender_namespace)
+        .bind(attr.stall_us as i64)
+        .bind(attr.blame_score)
+        .bind(attr.timestamp as i64)
+        .bind(attr.cpu_share)
+        .bind(attr.fork_count as i64)
+        .bind(attr.short_job_count as i64)
+        .bind(attr.attributed_stall_us as i64)
         .execute(&self.pool)
         .await?;
 
         let id = result.last_insert_rowid();
         debug!(
             "Inserted stall attribution #{}: {}/{} blamed {}/{} (score={:.2})",
-            id, victim_namespace, victim_pod, offender_namespace, offender_pod, blame_score
+            id,
+            attr.victim_namespace,
+            attr.victim_pod,
+            attr.offender_namespace,
+            attr.offender_pod,
+            attr.blame_score
         );
         Ok(id)
     }
@@ -283,7 +336,7 @@ impl IncidentStore {
         let rows = sqlx::query(
             r#"
             SELECT offender_pod, offender_namespace, stall_us, blame_score, timestamp,
-                   cpu_share, fork_count, short_job_count
+                   cpu_share, fork_count, short_job_count, attributed_stall_us
             FROM stall_attributions
             WHERE victim_pod = ? AND victim_namespace = ? AND timestamp >= ?
             ORDER BY blame_score DESC
@@ -297,15 +350,20 @@ impl IncidentStore {
 
         Ok(rows
             .into_iter()
+            // Columns are read by name: positional access silently shifts
+            // every field after any column added to the SELECT above.
             .map(|r| StallAttribution {
-                offender_pod: r.get(0),
-                offender_namespace: r.get(1),
-                stall_us: r.get::<i64, _>(2) as u64,
-                blame_score: r.get(3),
-                timestamp: r.get::<i64, _>(4) as u64,
-                cpu_share: r.get(5),
-                fork_count: r.get::<i64, _>(6) as u64,
-                short_job_count: r.get::<i64, _>(7) as u64,
+                offender_pod: r.get("offender_pod"),
+                offender_namespace: r.get("offender_namespace"),
+                stall_us: r.get::<i64, _>("stall_us") as u64,
+                blame_score: r.get("blame_score"),
+                timestamp: r.get::<i64, _>("timestamp") as u64,
+                cpu_share: r.get("cpu_share"),
+                fork_count: r.get::<i64, _>("fork_count") as u64,
+                short_job_count: r.get::<i64, _>("short_job_count") as u64,
+                attributed_stall_us: r
+                    .get::<Option<i64>, _>("attributed_stall_us")
+                    .map(|v| v as u64),
             })
             .collect())
     }

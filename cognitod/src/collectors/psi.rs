@@ -1,5 +1,5 @@
 use anyhow::Result;
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -281,22 +281,8 @@ impl PsiMonitor {
                                 // Persist to database if available
                                 if let Some(ref store) = self.incident_store {
                                     for attr in &attributions {
-                                        if let Err(e) = store
-                                            .insert_stall_attribution(
-                                                &attr.victim_pod,
-                                                &attr.victim_namespace,
-                                                &attr.offender_pod,
-                                                &attr.offender_namespace,
-                                                attr.stall_us,
-                                                attr.blame_score,
-                                                attr.timestamp,
-                                                attr.cpu_share,
-                                                attr.fork_count,
-                                                attr.short_job_count,
-                                            )
-                                            .await
-                                        {
-                                            debug!("[psi] Failed to persist attribution: {}", e);
+                                        if let Err(e) = store.insert_stall_attribution(attr).await {
+                                            warn!("[psi] Failed to persist attribution: {}", e);
                                         }
                                     }
                                 }
