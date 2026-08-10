@@ -25,9 +25,9 @@ window_seconds = 10
 timeout_ms = 30000
 min_eps_to_enable = 10  # Enable for testing
 
-[prometheus]
-# Prometheus metrics endpoint
-enabled = true
+[outputs]
+# Serve the Prometheus text exposition at /metrics/prometheus
+prometheus = true
 
 [probes]
 # eBPF probe configuration

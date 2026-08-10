@@ -84,6 +84,9 @@ pub struct Config {
     #[serde(default)]
     #[allow(dead_code)]
     pub outputs: OutputConfig,
+    /// Deprecated `[prometheus]` section, folded into `outputs` on load.
+    #[serde(default)]
+    pub prometheus: Option<LegacyPrometheusConfig>,
     #[serde(default)]
     #[allow(dead_code)]
     pub rules: RulesFileConfig,
@@ -158,8 +161,11 @@ impl Config {
             std::env::var(ENV_CONFIG_PATH).unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
         let path = PathBuf::from(path);
         match fs::read_to_string(&path) {
-            Ok(contents) => match toml::from_str(&contents) {
-                Ok(config) => config,
+            Ok(contents) => match toml::from_str::<Config>(&contents) {
+                Ok(mut config) => {
+                    config.apply_prometheus_compat();
+                    config
+                }
                 Err(e) => {
                     log::warn!(
                         "Failed to parse config file at {}: {}. Using defaults.",
@@ -172,6 +178,36 @@ impl Config {
             Err(_) => Config::default(),
         }
     }
+
+    /// Honours the legacy `[prometheus] enabled` spelling.
+    ///
+    /// Every config this project has shipped — `configs/linnix.toml`, the
+    /// Darwin variant, and `k8s/configmap.yaml` — used a `[prometheus]`
+    /// section, but the only key the daemon reads is `outputs.prometheus`.
+    /// Unknown sections deserialize silently, so those deployments served 404
+    /// on `/metrics/prometheus` while their config looked correct. The shipped
+    /// files now use the canonical spelling; this keeps already-deployed ones
+    /// working instead of silently exporting nothing.
+    fn apply_prometheus_compat(&mut self) {
+        if let Some(legacy) = &self.prometheus
+            && legacy.enabled
+            && !self.outputs.prometheus
+        {
+            log::warn!(
+                "[config] `[prometheus] enabled` is deprecated; use `[outputs] prometheus = true`. \
+                 Enabling the metrics endpoint from the legacy key."
+            );
+            self.outputs.prometheus = true;
+        }
+    }
+}
+
+/// The legacy `[prometheus]` section. Retained only so existing configs keep
+/// working; `[outputs] prometheus` is the supported spelling.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct LegacyPrometheusConfig {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -491,6 +527,88 @@ offline = true
         assert!(cfg.runtime.offline);
         assert_eq!(cfg.api.listen_addr, "127.0.0.1:3000");
         assert!(cfg.api.auth_token.is_none());
+    }
+
+    #[test]
+    fn the_canonical_spelling_enables_the_metrics_endpoint() {
+        let toml = r#"[outputs]
+prometheus = true
+"#;
+        let mut cfg: Config = toml::from_str(toml).unwrap();
+        cfg.apply_prometheus_compat();
+        assert!(cfg.outputs.prometheus);
+    }
+
+    #[test]
+    fn the_legacy_prometheus_section_still_enables_the_endpoint() {
+        // Every config this project shipped used this spelling while the daemon
+        // read only `outputs.prometheus`, so those deployments served 404 on
+        // /metrics/prometheus with a config that looked correct. Already-
+        // deployed configs must keep working.
+        let toml = r#"[prometheus]
+enabled = true
+"#;
+        let mut cfg: Config = toml::from_str(toml).unwrap();
+        assert!(
+            !cfg.outputs.prometheus,
+            "the legacy key alone never set the real field — that was the bug"
+        );
+
+        cfg.apply_prometheus_compat();
+        assert!(
+            cfg.outputs.prometheus,
+            "a deployed config using the old spelling must still export metrics"
+        );
+    }
+
+    #[test]
+    fn the_metrics_endpoint_stays_off_when_nothing_asks_for_it() {
+        let toml = r#"[runtime]
+offline = true
+"#;
+        let mut cfg: Config = toml::from_str(toml).unwrap();
+        cfg.apply_prometheus_compat();
+        assert!(!cfg.outputs.prometheus);
+    }
+
+    #[test]
+    fn the_shipped_configs_enable_the_metrics_endpoint() {
+        // Guards the actual regression: a shipped config that looks like it
+        // turns metrics on but does not.
+        for path in ["../configs/linnix.toml", "../configs/linnix.darwin.toml"] {
+            let contents = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {}", path, e));
+            let mut cfg: Config = toml::from_str(&contents)
+                .unwrap_or_else(|e| panic!("{} does not parse: {}", path, e));
+            cfg.apply_prometheus_compat();
+            assert!(
+                cfg.outputs.prometheus,
+                "{} should serve /metrics/prometheus",
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn the_kubernetes_configmap_enables_the_metrics_endpoint() {
+        // The DaemonSet is the deployment path the dashboard depends on, and
+        // the one where the wrong spelling went unnoticed longest. Parse the
+        // config out of the manifest exactly as the daemon would see it.
+        let manifest = std::fs::read_to_string("../k8s/configmap.yaml")
+            .expect("cannot read k8s/configmap.yaml");
+        let doc: serde_yaml::Value =
+            serde_yaml::from_str(&manifest).expect("configmap.yaml is not valid YAML");
+        let embedded = doc["data"]["linnix.toml"]
+            .as_str()
+            .expect("configmap has no data['linnix.toml']");
+
+        let mut cfg: Config =
+            toml::from_str(embedded).expect("the embedded linnix.toml does not parse");
+        cfg.apply_prometheus_compat();
+        assert!(
+            cfg.outputs.prometheus,
+            "the DaemonSet must serve /metrics/prometheus or the dashboard is empty"
+        );
     }
 
     #[test]
