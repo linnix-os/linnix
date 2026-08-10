@@ -106,18 +106,20 @@ kubectl apply -f k8s/                       # scrape annotations included
 
 | Metric | Type | Labels |
 | --- | --- | --- |
-| `linnix_pod_psi_pressure_total` | counter (µs) | `namespace`, `pod`, `node` |
+| `linnix_pod_psi_pressure_total` | counter (µs) | `victim_namespace`, `victim_pod`, `node` |
 | `linnix_stall_induced_seconds_total` | counter (s) | `offender_pod`, `offender_namespace`, `victim_pod`, `victim_namespace` |
 | `linnix_blame_series_evicted_total` | counter | — |
+
+Labels are `victim_`-prefixed rather than plain `pod`/`namespace` on purpose: Prometheus' `kubernetes-pods` job attaches target labels of those names, and would rename the metric's own to `exported_*`, leaving queries silently grouped by the Linnix agent pod instead of the pod that stalled.
 
 The second one is the differentiator: a workload **pair** series. Most monitoring can tell you a pod is under pressure; this says which other pod is causing it.
 
 ```promql
 # Who is suffering
-topk(10, rate(linnix_pod_psi_pressure_total[5m]))
+topk(10, sum by (victim_namespace, victim_pod) (rate(linnix_pod_psi_pressure_total[5m])))
 
 # Who is causing it
-topk(10, sum by (offender_pod) (rate(linnix_stall_induced_seconds_total[5m])))
+topk(10, sum by (offender_namespace, offender_pod) (rate(linnix_stall_induced_seconds_total[5m])))
 
 # Blame for one victim
 sum by (offender_pod) (rate(linnix_stall_induced_seconds_total{victim_pod="payment-api"}[5m]))

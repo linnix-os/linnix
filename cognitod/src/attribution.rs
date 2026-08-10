@@ -330,8 +330,15 @@ impl BlameMetrics {
             return;
         }
 
+        // Deliberately not `namespace`/`pod`. Prometheus' standard
+        // kubernetes-pods job attaches target labels of those names, and with
+        // the default honor_labels=false the metric's own copies are renamed to
+        // exported_namespace/exported_pod. Queries would then group by the
+        // Linnix agent pod rather than the pod that stalled — silently, and
+        // wrongly. The victim_ prefix also matches the offender/victim naming
+        // the pair metric already uses.
         let key = format!(
-            "namespace=\"{}\",pod=\"{}\",node=\"{}\"",
+            "victim_namespace=\"{}\",victim_pod=\"{}\",node=\"{}\"",
             escape_label(namespace),
             escape_label(pod),
             escape_label(&self.node)
@@ -649,7 +656,11 @@ mod tests {
         metrics.record_victim_pressure("prod", "we\"ird\\pod", "container-1", 42);
         let mut body = String::new();
         metrics.render_prometheus(&mut body);
-        assert!(body.contains(r#"pod="we\"ird\\pod""#), "body was: {}", body);
+        assert!(
+            body.contains(r#"victim_pod="we\"ird\\pod""#),
+            "body was: {}",
+            body
+        );
     }
 
     #[test]

@@ -519,7 +519,7 @@ fn scrape_victim_us(metrics: &BlameMetrics, pod: &str) -> u64 {
     let mut body = String::new();
     metrics.render_prometheus(&mut body);
 
-    let needle = format!("pod=\"{}\"", pod);
+    let needle = format!("victim_pod=\"{}\"", pod);
     body.lines()
         .find(|line| line.starts_with("linnix_pod_psi_pressure_total{") && line.contains(&needle))
         .and_then(|line| line.rsplit(' ').next())
@@ -639,8 +639,24 @@ async fn scan_loop_surfaces_a_stalling_pod_on_the_metrics_endpoint() {
     .expect("victim pressure never reached the second reading");
     handle.abort();
 
-    assert!(line.contains(r#"pod="checkout-api""#), "line was: {}", line);
-    assert!(line.contains(r#"namespace="prod""#), "line was: {}", line);
+    // victim_-prefixed, not pod/namespace: Prometheus' kubernetes-pods job
+    // attaches target labels of those plain names and would rename the
+    // metric's own, leaving queries grouped by the agent pod instead.
+    assert!(
+        line.contains(r#"victim_pod="checkout-api""#),
+        "line was: {}",
+        line
+    );
+    assert!(
+        line.contains(r#"victim_namespace="prod""#),
+        "line was: {}",
+        line
+    );
+    assert!(
+        !line.contains(r#",pod=""#) && !line.starts_with("linnix_pod_psi_pressure_total{pod="),
+        "a bare pod label collides with the scrape target's own: {}",
+        line
+    );
     assert!(line.contains(r#"node="node-1""#), "line was: {}", line);
 }
 

@@ -21,6 +21,56 @@ The victim metric is in microseconds and the offender metric is in seconds —
 they come from different sources, so the panels carry different units on
 purpose. Don't sum across the two.
 
+## If you set an API token
+
+`api.auth_token` protects every route, `/metrics/prometheus` included, and the
+scrape annotations carry no credential — so an authenticated deployment returns
+401 to the annotation-based job and the dashboard stays empty. Point Prometheus
+at the same token instead of relying on annotations:
+
+```yaml
+# prometheus.yml — replaces the annotation-driven job for Linnix
+- job_name: linnix
+  kubernetes_sd_configs:
+    - role: pod
+  authorization:
+    type: Bearer
+    credentials_file: /etc/prometheus/secrets/linnix-token/token
+  # The metric's own victim_* labels never collide with the target labels
+  # Prometheus attaches, so honor_labels is not needed.
+  relabel_configs:
+    - source_labels: [__meta_kubernetes_pod_label_app]
+      action: keep
+      regex: linnix
+    - source_labels: [__meta_kubernetes_pod_ip]
+      target_label: __address__
+      replacement: $1:3000
+    - target_label: __metrics_path__
+      replacement: /metrics/prometheus
+    - source_labels: [__meta_kubernetes_pod_node_name]
+      target_label: kube_node
+```
+
+With Prometheus Operator, the same thing as a `PodMonitor`:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: linnix
+spec:
+  selector:
+    matchLabels:
+      app: linnix
+  podMetricsEndpoints:
+    - port: api
+      path: /metrics/prometheus
+      authorization:
+        credentials:
+          name: linnix-api-token
+          key: token
+```
+
 ## If the panels are empty
 
 1. **Is the endpoint on?** `kubectl exec` into an agent pod and
