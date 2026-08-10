@@ -151,6 +151,86 @@ async fn upgrading_an_old_database_backfills_the_offender_share() {
 }
 
 #[tokio::test]
+async fn two_events_in_one_second_are_backfilled_separately() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("incidents.db");
+    let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+    {
+        let pool = SqlitePoolOptions::new().connect(&db_url).await.unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE stall_attributions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                victim_pod TEXT NOT NULL,
+                victim_namespace TEXT NOT NULL,
+                offender_pod TEXT NOT NULL,
+                offender_namespace TEXT NOT NULL,
+                stall_us INTEGER NOT NULL,
+                blame_score REAL NOT NULL,
+                timestamp INTEGER NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Timestamps have one-second resolution, and one victim can stall twice
+        // within a second — its containers are scanned separately and collapse
+        // to the same pod key. These two events must not pool their blame.
+        //
+        // Event A: 400ms stall, blamed 3:1. Event B: 800ms stall, blamed 1:1.
+        for (offender, stall, blame) in [
+            ("hog-a", 400_000, 3.0),
+            ("hog-b", 400_000, 1.0),
+            ("hog-c", 800_000, 1.0),
+            ("hog-d", 800_000, 1.0),
+        ] {
+            sqlx::query(
+                "INSERT INTO stall_attributions (victim_pod, victim_namespace, offender_pod,
+                 offender_namespace, stall_us, blame_score, timestamp)
+                 VALUES ('payment-api', 'prod', ?, 'prod', ?, ?, 1700000000)",
+            )
+            .bind(offender)
+            .bind(stall as i64)
+            .bind(blame)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        pool.close().await;
+    }
+
+    let store = IncidentStore::new(&db_path).await.unwrap();
+    let window = (now_secs() - 1_700_000_000 + 60) as i64;
+    let rows = store
+        .query_attributions("payment-api", "prod", window)
+        .await
+        .unwrap();
+
+    let share = |pod: &str| {
+        rows.iter()
+            .find(|r| r.offender_pod == pod)
+            .unwrap()
+            .attributed_stall_us
+    };
+
+    // Each event renormalises within itself: 3:1 of 400ms, and 1:1 of 800ms.
+    assert_eq!(share("hog-a"), Some(300_000));
+    assert_eq!(share("hog-b"), Some(100_000));
+    assert_eq!(share("hog-c"), Some(400_000));
+    assert_eq!(share("hog-d"), Some(400_000));
+
+    // Pooling the denominators would leave each event's shares reconciling to
+    // neither stall; here both add up exactly.
+    let event_a: u64 = [share("hog-a"), share("hog-b")].iter().flatten().sum();
+    let event_b: u64 = [share("hog-c"), share("hog-d")].iter().flatten().sum();
+    assert_eq!(event_a, 400_000);
+    assert_eq!(event_b, 800_000);
+}
+
+#[tokio::test]
 async fn a_row_with_no_recoverable_blame_stays_unknown_rather_than_zero() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("incidents.db");

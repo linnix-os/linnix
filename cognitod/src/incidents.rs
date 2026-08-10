@@ -159,9 +159,18 @@ impl IncidentStore {
         // Rows written before the column existed stored only the victim's
         // total stall, repeated against every offender. The share each was
         // actually responsible for is recoverable: attributions from one event
-        // share a (victim, timestamp), so blame can be renormalised within that
-        // group. Nothing prunes this table, so old rows stay queryable and are
-        // worth reconciling rather than leaving unknown.
+        // share a (victim, timestamp, stall_us), so blame can be renormalised
+        // within that group. Nothing prunes this table, so old rows stay
+        // queryable and are worth reconciling rather than leaving unknown.
+        //
+        // stall_us belongs in the grouping key, not just the numerator. The
+        // timestamp has one-second resolution and a single victim can produce
+        // two events within one second — a pod's containers are scanned
+        // separately, and they collapse to the same pod key. Grouping on victim
+        // and timestamp alone would pool both events' blame into one
+        // denominator while each numerator kept its own stall, leaving shares
+        // that reconcile to neither event. stall_us is a microsecond delta, so
+        // it separates them.
         let backfilled = sqlx::query(
             r#"
             UPDATE stall_attributions AS a
@@ -171,6 +180,7 @@ impl IncidentStore {
                     WHERE b.victim_pod = a.victim_pod
                       AND b.victim_namespace = a.victim_namespace
                       AND b.timestamp = a.timestamp
+                      AND b.stall_us = a.stall_us
                 ) AS INTEGER)
             WHERE a.attributed_stall_us IS NULL
               AND (
@@ -178,6 +188,7 @@ impl IncidentStore {
                     WHERE b.victim_pod = a.victim_pod
                       AND b.victim_namespace = a.victim_namespace
                       AND b.timestamp = a.timestamp
+                      AND b.stall_us = a.stall_us
                   ) > 0
             "#,
         )
