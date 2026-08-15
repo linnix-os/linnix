@@ -1075,8 +1075,10 @@ pub async fn get_insights(
     // Call LLM - supports both local models and OpenAI
     // Default to local Linnix model if available
     let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| "linnix-3b-distilled".to_string());
-    let llm_endpoint = std::env::var("LLM_ENDPOINT")
-        .unwrap_or_else(|_| "http://localhost:8090/v1/chat/completions".to_string());
+    // Falls back to [reasoner].endpoint so linnix.toml actually controls where
+    // insights are generated; the env var stays as an explicit override.
+    let llm_endpoint =
+        std::env::var("LLM_ENDPOINT").unwrap_or_else(|_| app_state.reasoner.endpoint.clone());
 
     // API key is optional for local models
     let api_key =

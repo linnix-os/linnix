@@ -28,7 +28,6 @@ pub use linnix_ai_ebpf_common::ProcessEventExt as ProcessEvent;
 use linnix_ai_ebpf_common::TelemetryConfig;
 
 mod api;
-mod runtime;
 // mod routes; // Deleted (dead code cleanup)
 
 use crate::api::{AppState, all_routes};
@@ -41,11 +40,13 @@ use cognitod::config;
 use cognitod::config::{Config, OfflineGuard};
 use cognitod::context;
 use cognitod::enforcement;
-use cognitod::handler;
 use cognitod::handler::{HandlerList, JsonlHandler};
 use cognitod::insights;
 use cognitod::metrics;
 use cognitod::metrics::Metrics;
+// Re-imported (not `mod runtime;`) so the binary shares the library's single
+// compilation of these types instead of building a second, incompatible copy.
+use cognitod::runtime;
 use cognitod::types;
 use cognitod::ui;
 use serde_json::json;
