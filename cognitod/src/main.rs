@@ -613,6 +613,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let incident_analyzer = if config.reasoner.enabled && !config.reasoner.endpoint.is_empty() {
         match cognitod::IncidentAnalyzer::new(
             config.reasoner.endpoint.clone(),
+            config.reasoner.model.clone(),
             Duration::from_millis(config.reasoner.timeout_ms),
         ) {
             Ok(analyzer) => {

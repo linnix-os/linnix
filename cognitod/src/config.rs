@@ -307,6 +307,8 @@ pub struct ReasonerConfig {
     pub enabled: bool,
     #[serde(default = "default_reasoner_endpoint")]
     pub endpoint: String,
+    #[serde(default = "default_reasoner_model")]
+    pub model: String,
     #[serde(default = "default_reasoner_timeout")]
     pub timeout_ms: u64,
 }
@@ -316,6 +318,7 @@ impl Default for ReasonerConfig {
         Self {
             enabled: default_reasoner_enabled(),
             endpoint: default_reasoner_endpoint(),
+            model: default_reasoner_model(),
             timeout_ms: default_reasoner_timeout(),
         }
     }
@@ -331,6 +334,12 @@ fn default_reasoner_endpoint() -> String {
     // ships — linnix.toml, the systemd unit, docker-compose, k8s/configmap.yaml,
     // quickstart.sh — uses 8090; nothing listens on the 8087 this used to name.
     "http://localhost:8090/v1/chat/completions".to_string()
+}
+
+fn default_reasoner_model() -> String {
+    // Matches the model name both LLM call sites previously hardcoded, and the
+    // `model` key both shipped configs already set.
+    "linnix-3b-distilled".to_string()
 }
 
 fn default_reasoner_timeout() -> u64 {

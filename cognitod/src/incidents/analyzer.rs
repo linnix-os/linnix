@@ -33,15 +33,20 @@ pub struct PodContribution {
 /// Incident analyzer using local LLM
 pub struct IncidentAnalyzer {
     endpoint: String,
+    model: String,
     client: reqwest::Client,
 }
 
 impl IncidentAnalyzer {
     /// Create a new incident analyzer
-    pub fn new(endpoint: String, timeout: Duration) -> Result<Self, reqwest::Error> {
+    pub fn new(endpoint: String, model: String, timeout: Duration) -> Result<Self, reqwest::Error> {
         let client = reqwest::Client::builder().timeout(timeout).build()?;
 
-        Ok(Self { endpoint, client })
+        Ok(Self {
+            endpoint,
+            model,
+            client,
+        })
     }
 
     /// Analyze an incident using the LLM
@@ -52,7 +57,7 @@ impl IncidentAnalyzer {
         let prompt = self.build_analysis_prompt(incident);
 
         let request_body = json!({
-            "model": "linnix-3b-distilled",
+            "model": self.model,
             "messages": [
                 {
                     "role": "system",
@@ -246,6 +251,7 @@ Here is the analysis:
 
         let analyzer = IncidentAnalyzer::new(
             "http://localhost:8090/v1/chat/completions".to_string(),
+            "linnix-3b-distilled".to_string(),
             Duration::from_secs(30),
         )
         .unwrap();
