@@ -20,13 +20,6 @@ listen_addr = "127.0.0.1:3000"
 [runtime]
 offline = false
 
-[telemetry]
-# Sample interval for CPU/memory metrics (milliseconds)
-sample_interval_ms = 1000
-
-# Event retention window (seconds)
-retention_seconds = 60
-
 [reasoner]
 # AI-powered incident detection
 enabled = true
@@ -65,12 +58,6 @@ enabled = true
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `offline` | bool | false | Disable all external HTTP egress |
-
-### [telemetry]
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `sample_interval_ms` | u64 | 1000 | CPU/memory sampling interval |
-| `retention_seconds` | u64 | 60 | Event retention window |
 
 ### [reasoner]
 | Field | Type | Default | Description |

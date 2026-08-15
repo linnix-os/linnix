@@ -137,9 +137,16 @@ fn spawn_metrics_tasks(metrics: Arc<Metrics>) {
 #[command(name = "cognitod")]
 #[command(about = "Linnix Cognition Daemon")]
 struct Args {
-    /// Path to config file
-    #[arg(long, value_name = "PATH", default_value = "/etc/linnix/linnix.toml")]
-    config: PathBuf,
+    /// Path to config file. Overrides LINNIX_CONFIG; defaults to
+    /// /etc/linnix/linnix.toml. Optional (not `default_value`) so that an
+    /// unset flag stays distinguishable from one pointing at the default path,
+    /// which is what lets LINNIX_CONFIG keep working.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+    /// Validate the config file and exit. Reports parse errors and any key the
+    /// daemon does not read; exits non-zero if anything is wrong.
+    #[arg(long)]
+    check_config: bool,
     #[arg(long)]
     handler: Vec<String>,
     #[arg(long)]
@@ -384,6 +391,23 @@ fn parse_kernel_version(raw: &str) -> Option<(u32, u32)> {
 async fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
     let args = Args::parse();
+
+    // Before ensure_environment(): validating a config file needs no
+    // capabilities, so this must work as an unprivileged user in CI.
+    if args.check_config {
+        let path = config::resolve_config_path(args.config.clone());
+        let problems = Config::check(&path);
+        if problems.is_empty() {
+            println!("[cognitod] config OK: {}", path.display());
+            return Ok(());
+        }
+        eprintln!("[cognitod] config has {} problem(s):", problems.len());
+        for problem in &problems {
+            eprintln!("  - {problem}");
+        }
+        std::process::exit(1);
+    }
+
     let handler = args.handler.clone();
     let detach = args.detach;
     if detach {
@@ -395,10 +419,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     println!("[cognitod] Starting Cognition Daemon...");
 
-    ensure_environment()?;
+    // Load configuration before the capability check. A malformed file is now
+    // fatal rather than silently swapped for defaults, so the daemon can no
+    // longer run with settings the operator never chose — and a config error is
+    // diagnosable without privileges, so reporting it first is more useful than
+    // failing on CAP_BPF and hiding it.
+    let mut config = Config::load(args.config.clone()).inspect_err(|e| {
+        log::error!("[cognitod] {e:#}");
+        log::error!(
+            "[cognitod] refusing to start with defaults; fix the file or run \
+             `cognitod --check-config` to see what is wrong"
+        );
+    })?;
 
-    // Load configuration
-    let mut config = Config::load();
+    ensure_environment()?;
 
     // Resolve the LLM env overrides once, here, so every consumer sees the same
     // effective values. Applying them per-call-site let the two LLM paths drift:

@@ -245,21 +245,13 @@ cat >> "$WIKI_DIR/Configuration-Guide.md" << 'EOF'
 |-------|------|---------|-------------|
 | `offline` | bool | false | Disable all external HTTP egress |
 
-### [telemetry]
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `sample_interval_ms` | u64 | 1000 | CPU/memory sampling interval |
-| `retention_seconds` | u64 | 60 | Event retention window |
-
 ### [reasoner]
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | true | Enable AI reasoning |
 | `endpoint` | string | "http://localhost:8090/v1/chat/completions" | LLM endpoint URL |
 | `model` | string | "linnix-3b-distilled" | Model name |
-| `window_seconds` | u64 | 10 | Analysis window |
 | `timeout_ms` | u64 | 30000 | Request timeout |
-| `min_eps_to_enable` | u64 | 10 | Minimum events/sec threshold |
 
 ### [prometheus]
 | Field | Type | Default | Description |
@@ -698,17 +690,16 @@ cat > "$WIKI_DIR/Troubleshooting.md" << 'EOF'
 
 **Solutions**:
 1. Check LLM server: `curl localhost:8090/health`
-2. Verify reasoner config in linnix.toml
-3. Check `min_eps_to_enable` threshold
-4. Generate some activity: `stress --cpu 1 --timeout 10`
+2. Verify reasoner config in linnix.toml — `endpoint` and `model` are both
+   read from `[reasoner]`; `LLM_ENDPOINT` / `LLM_MODEL` override them
+3. Generate some activity: `stress --cpu 1 --timeout 10`
 
 ### High CPU Usage
 
 **Symptom**: cognitod using >5% CPU
 
 **Solutions**:
-1. Increase `sample_interval_ms`
-2. Disable optional probes
+1. Disable optional probes
 3. Check for fork storms on host
 4. Review event rate: `curl localhost:3000/metrics | jq .events_per_second`
 

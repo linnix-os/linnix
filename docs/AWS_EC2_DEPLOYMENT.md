@@ -443,9 +443,6 @@ Key settings to configure:
 [runtime]
 offline = true  # Set to false if you need external HTTP
 
-[telemetry]
-sample_interval_ms = 1000  # Adjust sampling rate
-
 [api]
 listen_addr = "0.0.0.0:3000"  # API server binding
 

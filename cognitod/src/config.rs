@@ -1,9 +1,18 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/linnix/linnix.toml";
 const ENV_CONFIG_PATH: &str = "LINNIX_CONFIG";
+
+/// Which config file to read: `--config` beats `LINNIX_CONFIG` beats the
+/// packaged path. The CLI flag is the most explicit signal, so it wins; it used
+/// to be declared and then never read at all.
+pub fn resolve_config_path(explicit: Option<PathBuf>) -> PathBuf {
+    explicit
+        .or_else(|| std::env::var(ENV_CONFIG_PATH).ok().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH))
+}
 
 /// API server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +113,11 @@ pub struct Config {
     pub privacy: PrivacyConfig,
     #[serde(default)]
     pub psi: PsiConfig,
+    /// Top-level sections/keys no field matches. Captured so `--check-config`
+    /// can name them; a typo'd `[reasner]` is otherwise indistinguishable from
+    /// having configured nothing.
+    #[serde(flatten)]
+    pub unknown: std::collections::BTreeMap<String, toml::Value>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -153,31 +167,84 @@ fn default_noise_budget_enabled() -> bool {
 }
 
 impl Config {
-    /// Load configuration from file. The path can be overridden
-    /// with the `LINNIX_CONFIG` environment variable. If the file
-    /// is missing or fails to parse, defaults are returned.
-    pub fn load() -> Self {
-        let path =
-            std::env::var(ENV_CONFIG_PATH).unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
-        let path = PathBuf::from(path);
-        match fs::read_to_string(&path) {
-            Ok(contents) => match toml::from_str::<Config>(&contents) {
-                Ok(mut config) => {
-                    config.warn_unknown_keys();
-                    config.apply_prometheus_compat();
-                    config
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Failed to parse config file at {}: {}. Using defaults.",
-                        path.display(),
-                        e
-                    );
-                    Config::default()
-                }
-            },
-            Err(_) => Config::default(),
+    /// Load configuration, resolving the path as `--config` > `LINNIX_CONFIG` >
+    /// the packaged default. A missing file yields defaults; a malformed one is
+    /// an error. See [`Config::load_from`].
+    pub fn load(explicit: Option<PathBuf>) -> anyhow::Result<Self> {
+        Self::load_from(&resolve_config_path(explicit))
+    }
+
+    /// Load from a specific path.
+    ///
+    /// A **missing** file yields defaults — that is a legitimate way to run.
+    /// A file that exists but cannot be read or parsed is a hard error.
+    ///
+    /// Both cases used to return `Config::default()` with a single `warn!`, so a
+    /// typo in `linnix.toml` silently swapped every setting for a default the
+    /// operator never chose — different thresholds, endpoints and PSI paths,
+    /// with the daemon reporting healthy throughout. Failing loudly is the point
+    /// of this function.
+    pub fn load_from(path: &Path) -> anyhow::Result<Self> {
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                log::info!(
+                    "[config] no config file at {}; using built-in defaults",
+                    path.display()
+                );
+                return Ok(Config::default());
+            }
+            // Permission denied and friends: the file is there and we were meant
+            // to read it. Do not pretend it is absent.
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "config file at {} exists but could not be read: {e}",
+                    path.display()
+                ));
+            }
+        };
+
+        let mut config: Config = toml::from_str(&contents).map_err(|e| {
+            anyhow::anyhow!("config file at {} could not be parsed: {e}", path.display())
+        })?;
+
+        config.warn_unknown_keys();
+        config.apply_prometheus_compat();
+        Ok(config)
+    }
+
+    /// Strict validation for `--check-config`. Returns every problem found,
+    /// empty when the file is clean.
+    ///
+    /// This is where `deny_unknown_fields`-style strictness belongs: failing
+    /// here costs nothing, whereas failing at startup would strand a fleet whose
+    /// configs still carry a retired key.
+    pub fn check(path: &Path) -> Vec<String> {
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return vec![format!("no config file at {}", path.display())];
+            }
+            Err(e) => return vec![format!("cannot read {}: {e}", path.display())],
+        };
+
+        let config: Config = match toml::from_str(&contents) {
+            Ok(config) => config,
+            Err(e) => return vec![format!("parse error: {e}")],
+        };
+
+        let mut problems = Vec::new();
+        for key in config.unknown.keys() {
+            problems.push(format!(
+                "unrecognised top-level section or key `{key}` (not read by the daemon)"
+            ));
         }
+        for key in config.reasoner.unknown.keys() {
+            problems.push(format!(
+                "unrecognised key `{key}` in [reasoner] (not read by the daemon)"
+            ));
+        }
+        problems
     }
 
     /// Names any `[reasoner]` key that no field matches.
@@ -190,15 +257,24 @@ impl Config {
     /// load that `apply_prometheus_compat` was also written to preserve, while
     /// making the orphan visible at startup instead of never.
     fn warn_unknown_keys(&self) {
-        if self.reasoner.unknown.is_empty() {
-            return;
+        if !self.unknown.is_empty() {
+            let keys: Vec<&str> = self.unknown.keys().map(String::as_str).collect();
+            log::warn!(
+                "[config] ignoring unrecognised top-level section(s)/key(s): {}. \
+                 These are not read by the daemon and have no effect. \
+                 Run `cognitod --check-config` to validate.",
+                keys.join(", ")
+            );
         }
-        let keys: Vec<&str> = self.reasoner.unknown.keys().map(String::as_str).collect();
-        log::warn!(
-            "[config] ignoring unrecognised key(s) in [reasoner]: {}. \
-             These are not read by the daemon and have no effect.",
-            keys.join(", ")
-        );
+        if !self.reasoner.unknown.is_empty() {
+            let keys: Vec<&str> = self.reasoner.unknown.keys().map(String::as_str).collect();
+            log::warn!(
+                "[config] ignoring unrecognised key(s) in [reasoner]: {}. \
+                 These are not read by the daemon and have no effect. \
+                 Run `cognitod --check-config` to validate.",
+                keys.join(", ")
+            );
+        }
     }
 
     /// Honours the legacy `[prometheus] enabled` spelling.
@@ -673,7 +749,7 @@ auth_token = "secret123"
         unsafe {
             std::env::set_var(ENV_CONFIG_PATH, file.path());
         }
-        let cfg = Config::load();
+        let cfg = Config::load(None).expect("valid config must load");
         assert!(!cfg.runtime.offline);
         unsafe {
             std::env::remove_var(ENV_CONFIG_PATH);
@@ -747,5 +823,88 @@ timeout_ms = 30000
             cfg.reasoner.unknown.is_empty(),
             "shipped config must be clean"
         );
+    }
+
+    #[test]
+    fn an_explicit_path_beats_the_env_var_and_the_default() {
+        // `--config` used to be declared and never read. Whatever the
+        // environment says, the explicit path wins.
+        let explicit = PathBuf::from("/tmp/explicit-linnix.toml");
+        assert_eq!(
+            resolve_config_path(Some(explicit.clone())),
+            explicit,
+            "--config must take precedence"
+        );
+    }
+
+    #[test]
+    fn no_config_file_still_yields_defaults() {
+        let missing = PathBuf::from("/nonexistent/linnix/does-not-exist.toml");
+        let cfg = Config::load_from(&missing).expect("a missing file is not an error");
+        assert_eq!(cfg.api.listen_addr, default_listen_addr());
+    }
+
+    #[test]
+    fn a_malformed_file_is_an_error_rather_than_a_silent_reset() {
+        // The regression this whole change exists to prevent: a typo used to
+        // swap every setting for a default the operator never chose, announced
+        // by one warn! line.
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "[api]\nlisten_addr = = broken").unwrap();
+
+        let err = Config::load_from(file.path()).expect_err("malformed config must fail");
+        assert!(
+            err.to_string().contains("could not be parsed"),
+            "error should name the problem, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_wrong_type_is_also_fatal() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "[reasoner]\ntimeout_ms = \"thirty seconds\"").unwrap();
+        assert!(
+            Config::load_from(file.path()).is_err(),
+            "a string where u64 is expected must not silently become the default"
+        );
+    }
+
+    #[test]
+    fn check_names_unknown_sections_and_keys() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[reasner]\nendpoint = \"typo\"\n\n[reasoner]\nwindow_seconds = 10"
+        )
+        .unwrap();
+
+        let problems = Config::check(file.path());
+        assert_eq!(problems.len(), 2, "got: {problems:?}");
+        assert!(problems.iter().any(|p| p.contains("reasner")));
+        assert!(problems.iter().any(|p| p.contains("window_seconds")));
+    }
+
+    #[test]
+    fn check_passes_on_a_clean_file() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[reasoner]\nenabled = true\nmodel = \"linnix-3b-distilled\""
+        )
+        .unwrap();
+        assert!(Config::check(file.path()).is_empty());
+    }
+
+    #[test]
+    fn the_shipped_configs_pass_their_own_validator() {
+        // Guards the bug class directly: if anyone adds a key to a shipped
+        // config that no field reads, this fails in CI instead of shipping.
+        for name in ["linnix.toml", "linnix.darwin.toml"] {
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../configs")
+                .join(name);
+            let problems = Config::check(&path);
+            assert!(problems.is_empty(), "{name} has problems: {problems:?}");
+        }
     }
 }

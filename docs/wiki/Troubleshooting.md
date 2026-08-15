@@ -37,10 +37,9 @@
 **Symptom**: cognitod using >5% CPU
 
 **Solutions**:
-1. Increase `sample_interval_ms`
-2. Disable optional probes
-3. Check for fork storms on host
-4. Review event rate: `curl localhost:3000/metrics | jq .events_per_second`
+1. Disable optional probes
+2. Check for fork storms on host
+3. Review event rate: `curl localhost:3000/metrics | jq .events_per_second`
 
 ## Diagnostic Commands
 

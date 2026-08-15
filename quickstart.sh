@@ -204,9 +204,6 @@ setup_config() {
 # Linnix Configuration
 [runtime]
 offline = false
-[telemetry]
-sample_interval_ms = 1000
-retention_seconds = 60
 [probes]
 enable_page_faults = false
 [reasoner]
