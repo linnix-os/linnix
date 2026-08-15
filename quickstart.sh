@@ -213,9 +213,7 @@ enable_page_faults = false
 enabled = true
 endpoint = "http://llama-server:8090/v1/chat/completions"
 model = "linnix-3b-distilled"
-window_seconds = 30
 timeout_ms = 30000
-min_eps_to_enable = 0
 [prometheus]
 enabled = true
 EOF

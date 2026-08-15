@@ -28,9 +28,9 @@
 
 **Solutions**:
 1. Check LLM server: `curl localhost:8090/health`
-2. Verify reasoner config in linnix.toml
-3. Check `min_eps_to_enable` threshold
-4. Generate some activity: `stress --cpu 1 --timeout 10`
+2. Verify reasoner config in linnix.toml — `endpoint` and `model` are both read
+   from `[reasoner]`, and `LLM_ENDPOINT` / `LLM_MODEL` override them if set
+3. Generate some activity: `stress --cpu 1 --timeout 10`
 
 ### High CPU Usage
 

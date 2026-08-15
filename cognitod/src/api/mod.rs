@@ -1072,13 +1072,12 @@ pub async fn get_insights(
         alert_summary
     );
 
-    // Call LLM - supports both local models and OpenAI
-    // Default to local Linnix model if available
-    let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| "linnix-3b-distilled".to_string());
-    // Falls back to [reasoner].endpoint so linnix.toml actually controls where
-    // insights are generated; the env var stays as an explicit override.
-    let llm_endpoint =
-        std::env::var("LLM_ENDPOINT").unwrap_or_else(|_| app_state.reasoner.endpoint.clone());
+    // Call LLM - supports both local models and OpenAI.
+    // LLM_ENDPOINT/LLM_MODEL are already folded into [reasoner] at startup, so
+    // read the resolved config rather than the environment: consulting env here
+    // too is what let this path and the incident analyzer target different models.
+    let model = app_state.reasoner.model.clone();
+    let llm_endpoint = app_state.reasoner.endpoint.clone();
 
     // API key is optional for local models
     let api_key =

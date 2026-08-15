@@ -32,9 +32,7 @@ retention_seconds = 60
 enabled = true
 endpoint = "http://localhost:8090/v1/chat/completions"
 model = "linnix-3b-distilled"
-window_seconds = 10
 timeout_ms = 30000
-min_eps_to_enable = 10  # Enable for testing
 
 [prometheus]
 # Prometheus metrics endpoint
@@ -80,9 +78,7 @@ enabled = true
 | `enabled` | bool | true | Enable AI reasoning |
 | `endpoint` | string | "http://localhost:8090/v1/chat/completions" | LLM endpoint URL |
 | `model` | string | "linnix-3b-distilled" | Model name |
-| `window_seconds` | u64 | 10 | Analysis window |
 | `timeout_ms` | u64 | 30000 | Request timeout |
-| `min_eps_to_enable` | u64 | 10 | Minimum events/sec threshold |
 
 ### [prometheus]
 | Field | Type | Default | Description |

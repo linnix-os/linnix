@@ -398,7 +398,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
     ensure_environment()?;
 
     // Load configuration
-    let config = Config::load();
+    let mut config = Config::load();
+
+    // Resolve the LLM env overrides once, here, so every consumer sees the same
+    // effective values. Applying them per-call-site let the two LLM paths drift:
+    // the shipped systemd unit sets LLM_MODEL=linnix-qwen-v1 while linnix.toml
+    // says linnix-3b-distilled, so /insights and the incident analyzer were
+    // asking one server for two different models. Precedence is env > TOML >
+    // default, matching LINNIX_LISTEN_ADDR and LINNIX_API_TOKEN below.
+    if let Ok(endpoint) = std::env::var("LLM_ENDPOINT") {
+        config.reasoner.endpoint = endpoint;
+    }
+    if let Ok(model) = std::env::var("LLM_MODEL") {
+        config.reasoner.model = model;
+    }
+    let config = config;
     let offline_guard = Arc::new(OfflineGuard::new(config.runtime.offline));
 
     // Initialize metrics and spawn background reporting tasks
@@ -613,6 +627,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let incident_analyzer = if config.reasoner.enabled && !config.reasoner.endpoint.is_empty() {
         match cognitod::IncidentAnalyzer::new(
             config.reasoner.endpoint.clone(),
+            config.reasoner.model.clone(),
             Duration::from_millis(config.reasoner.timeout_ms),
         ) {
             Ok(analyzer) => {
