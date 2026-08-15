@@ -70,6 +70,16 @@ class DocValidator:
         
         for doc_file in doc_files:
             if not doc_file.exists():
+                # Do not skip silently. docs/prometheus-integration.md was
+                # gitignored, so CI never had it and validated nothing while
+                # still reporting success.
+                self.add_result(
+                    "docs",
+                    False,
+                    f"{doc_file.relative_to(self.root)} is listed for validation but missing "
+                    "(not committed, or excluded by .gitignore)",
+                    file=str(doc_file),
+                )
                 continue
             content = doc_file.read_text()
             # Match routes in curl commands or markdown
