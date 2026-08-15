@@ -116,3 +116,6 @@ scripts/validate_api_docs.sh
 scripts/YOUTUBE_DEMO_SCRIPT.md
 scripts/generate_demo_video.py
 videos/
+
+# Local analysis scratch
+ARCHITECTURE-AUDIT.md
