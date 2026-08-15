@@ -4,7 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`cognitod --check-config`**: validates a config file and exits non-zero if anything is wrong — parse errors, plus any section or key the daemon does not read. Runs unprivileged, so it belongs in CI and pre-deploy checks. This is where strict validation lives; startup stays permissive so a node carrying a retired key still boots.
+- **`--config <PATH>` now works.** The flag was declared with a doc comment and a default, but never read — `Config::load()` only ever consulted `LINNIX_CONFIG` or the packaged path, so `cognitod --config /my.toml` silently loaded something else. Precedence is now `--config` > `LINNIX_CONFIG` > `/etc/linnix/linnix.toml`.
+
+### Changed
+- **A malformed config file is now fatal.** Previously "file absent" and "file present but unparseable" both returned `Config::default()` behind one `warn!`, so a typo silently swapped every setting — thresholds, endpoints, PSI paths — for defaults the operator never chose, while the daemon reported healthy. A missing file still yields defaults; an unreadable or unparseable one aborts startup. Config is also loaded before the capability check, so config errors are reported rather than hidden behind a `CAP_BPF` failure.
+
 ### Removed
+- **`[telemetry]` section** (`sample_interval_ms`, `retention_seconds`) from the shipped configs, `quickstart.sh`, the deployment examples, and the wiki generator. Neither key appears anywhere in the source; `sample_interval_ms` occurs zero times. `Troubleshooting.md` advised increasing it to fix high CPU — advice for a knob that does nothing. Surfaced by the new validator, which now runs against the shipped configs as a unit test.
+- `scripts/generate_wiki.sh` still emitted `window_seconds` and `min_eps_to_enable` rows after #58 removed them from the generated docs; regenerating the wiki would have reintroduced them.
 - **Dead ILM telemetry surface**: the `local_ilm` handler was deleted in `737b763` (v0.2.0 era), but its counters, exporters, and status fields survived it. Nothing has incremented them since, so they reported zero/false unconditionally.
   - **Breaking (metrics)**: `linnix_ilm_windows_total`, `linnix_ilm_timeouts_total`, `linnix_ilm_insights_total`, `linnix_ilm_schema_errors_total`, and the `linnix_ilm_enabled` gauge are no longer exported. All were permanently `0`, so no dashboard could have been showing meaningful data; no shipped Grafana dashboard referenced them.
   - **Breaking (API)**: `/status` no longer returns `reasoner.ilm_enabled`, `reasoner.ilm_disabled_reason`, `ilm_windows`, `ilm_timeouts`, `ilm_insights`, or `ilm_schema_errors`.

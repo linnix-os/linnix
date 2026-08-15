@@ -366,10 +366,6 @@ install_config() {
 # Disable external HTTP requests in isolated environments
 offline = true
 
-[telemetry]
-# Sampling interval for CPU/memory metrics (milliseconds)
-sample_interval_ms = 1000
-
 [probes]
 # Enable high-overhead page fault tracing (disable for production)
 enable_page_faults = false
