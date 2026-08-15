@@ -326,15 +326,19 @@ fn default_reasoner_enabled() -> bool {
 }
 
 fn default_reasoner_endpoint() -> String {
-    "http://127.0.0.1:8087/v1/chat/completions".to_string()
+    // Must match the bundled model server, since Config::load() falls back to
+    // Config::default() when the file is missing or malformed. Everything that
+    // ships — linnix.toml, the systemd unit, docker-compose, k8s/configmap.yaml,
+    // quickstart.sh — uses 8090; nothing listens on the 8087 this used to name.
+    "http://localhost:8090/v1/chat/completions".to_string()
 }
 
 fn default_reasoner_timeout() -> u64 {
-    // Milliseconds. This was `150`, which the field name says is 150ms — far below
-    // the multi-second latency of CPU inference, so the analyzer's reqwest client
-    // timed out on every call. 150s matches the order of the 120s budget the
-    // /insights handler uses for the same class of request.
-    150_000
+    // Milliseconds, and must match the documented default in
+    // docs/wiki/Configuration-Guide.md plus the shipped configs, which all say
+    // 30000. Was `150` — i.e. 150ms, far below CPU-inference latency — so any
+    // install without a config file timed out on every analyzer call.
+    30_000
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
