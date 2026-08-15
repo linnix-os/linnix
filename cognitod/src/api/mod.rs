@@ -31,12 +31,11 @@ use crate::ProcessEvent;
 use crate::ProcessEventWire;
 use crate::config::{OfflineGuard, ReasonerConfig};
 use crate::context::ContextStore;
-use cognitod::alerts::Alert;
-// use crate::handler::local_ilm::schema::insight_json_schema; // Removed (YAGNI cleanup)
 use crate::insights::{InsightRecord, InsightStore as InsightsStore};
 use crate::metrics::Metrics;
 use crate::types::ProcessAlert;
 use crate::types::SystemSnapshot;
+use cognitod::alerts::Alert;
 use cognitod::{Incident, IncidentStats, IncidentStore};
 use linnix_ai_ebpf_common::EventType;
 use sysinfo::{Pid, System};
@@ -284,13 +283,7 @@ struct StatusProbeState {
 struct ReasonerStatus {
     configured: bool,
     endpoint: Option<String>,
-    ilm_enabled: bool,
-    ilm_disabled_reason: Option<String>,
     timeout_ms: u64,
-    ilm_windows: u64,
-    ilm_timeouts: u64,
-    ilm_insights: u64,
-    ilm_schema_errors: u64,
 }
 
 async fn status_handler(State(app_state): State<Arc<AppState>>) -> Json<StatusResponse> {
@@ -350,13 +343,7 @@ async fn status_handler(State(app_state): State<Arc<AppState>>) -> Json<StatusRe
         } else {
             Some(reasoner_cfg.endpoint.clone())
         },
-        ilm_enabled: metrics.ilm_enabled(),
-        ilm_disabled_reason: metrics.ilm_disabled_reason(),
         timeout_ms: reasoner_cfg.timeout_ms,
-        ilm_windows: metrics.ilm_windows(),
-        ilm_timeouts: metrics.ilm_timeouts(),
-        ilm_insights: metrics.ilm_insights(),
-        ilm_schema_errors: metrics.ilm_schema_errors(),
     };
 
     let incidents_last_1h = if let Some(store) = &app_state.incident_store {
@@ -1386,12 +1373,6 @@ pub struct MetricsResponse {
     drops_by_type: Vec<DropBreakdown>,
     rss_probe_mode: String,
     kernel_btf_available: bool,
-    ilm_windows: u64,
-    ilm_timeouts: u64,
-    ilm_insights: u64,
-    ilm_schema_errors: u64,
-    pub ilm_enabled: bool,
-    pub ilm_disabled_reason: Option<String>,
     pub slack_sent: u64,
     pub slack_failed: u64,
     pub alerts_generated: u64,
@@ -1417,11 +1398,6 @@ pub async fn prometheus_metrics(State(app_state): State<Arc<AppState>>) -> Respo
     let queue_depth = app_state.context.queue_depth() as u64;
     let lineage_hits = metrics.lineage_hits();
     let lineage_misses = metrics.lineage_misses();
-    let ilm_windows = metrics.ilm_windows();
-    let ilm_timeouts = metrics.ilm_timeouts();
-    let ilm_insights = metrics.ilm_insights();
-    let ilm_schema_errors = metrics.ilm_schema_errors();
-    let ilm_enabled = metrics.ilm_enabled();
     let kernel_btf_available = if metrics.kernel_btf_available() { 1 } else { 0 };
     let rss_probe_mode = metrics.rss_probe_mode();
 
@@ -1559,45 +1535,6 @@ pub async fn prometheus_metrics(State(app_state): State<Arc<AppState>>) -> Respo
 
     let _ = writeln!(
         body,
-        "# HELP linnix_ilm_windows_total ILM evaluation windows processed."
-    );
-    let _ = writeln!(body, "# TYPE linnix_ilm_windows_total counter");
-    let _ = writeln!(body, "linnix_ilm_windows_total {}", ilm_windows);
-
-    let _ = writeln!(
-        body,
-        "# HELP linnix_ilm_timeouts_total ILM request timeouts."
-    );
-    let _ = writeln!(body, "# TYPE linnix_ilm_timeouts_total counter");
-    let _ = writeln!(body, "linnix_ilm_timeouts_total {}", ilm_timeouts);
-
-    let _ = writeln!(
-        body,
-        "# HELP linnix_ilm_insights_total Valid insights produced."
-    );
-    let _ = writeln!(body, "# TYPE linnix_ilm_insights_total counter");
-    let _ = writeln!(body, "linnix_ilm_insights_total {}", ilm_insights);
-
-    let _ = writeln!(
-        body,
-        "# HELP linnix_ilm_schema_errors_total Insight schema repair failures."
-    );
-    let _ = writeln!(body, "# TYPE linnix_ilm_schema_errors_total counter");
-    let _ = writeln!(body, "linnix_ilm_schema_errors_total {}", ilm_schema_errors);
-
-    let _ = writeln!(
-        body,
-        "# HELP linnix_ilm_enabled ILM handler state (1=enabled)."
-    );
-    let _ = writeln!(body, "# TYPE linnix_ilm_enabled gauge");
-    let _ = writeln!(
-        body,
-        "linnix_ilm_enabled {}",
-        if ilm_enabled { 1 } else { 0 }
-    );
-
-    let _ = writeln!(
-        body,
         "# HELP linnix_dropped_events_by_type_total Drops broken down by event type."
     );
     let _ = writeln!(body, "# TYPE linnix_dropped_events_by_type_total counter");
@@ -1655,12 +1592,6 @@ pub async fn metrics_handler(State(app_state): State<Arc<AppState>>) -> Json<Met
             .collect(),
         rss_probe_mode: probe_mode_label(metrics.rss_probe_mode()).to_string(),
         kernel_btf_available: metrics.kernel_btf_available(),
-        ilm_windows: metrics.ilm_windows(),
-        ilm_timeouts: metrics.ilm_timeouts(),
-        ilm_insights: metrics.ilm_insights(),
-        ilm_schema_errors: metrics.ilm_schema_errors(),
-        ilm_enabled: metrics.ilm_enabled(),
-        ilm_disabled_reason: metrics.ilm_disabled_reason(),
         slack_sent: metrics.slack_sent(),
         slack_failed: metrics.slack_failed(),
         alerts_generated: metrics.alerts_generated(),

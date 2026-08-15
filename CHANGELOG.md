@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Removed
+- **Dead ILM telemetry surface**: the `local_ilm` handler was deleted in `737b763` (v0.2.0 era), but its counters, exporters, and status fields survived it. Nothing has incremented them since, so they reported zero/false unconditionally.
+  - **Breaking (metrics)**: `linnix_ilm_windows_total`, `linnix_ilm_timeouts_total`, `linnix_ilm_insights_total`, `linnix_ilm_schema_errors_total`, and the `linnix_ilm_enabled` gauge are no longer exported. All were permanently `0`, so no dashboard could have been showing meaningful data; no shipped Grafana dashboard referenced them.
+  - **Breaking (API)**: `/status` no longer returns `reasoner.ilm_enabled`, `reasoner.ilm_disabled_reason`, `ilm_windows`, `ilm_timeouts`, `ilm_insights`, or `ilm_schema_errors`.
+  - Removed the `ilm-test` cargo feature (declared with zero `cfg` uses).
+
+### Fixed
+- **`linnix-cli doctor` reported "AI Analysis: Disabled" unconditionally**, including on a fully configured and working reasoner, because it read the never-set `ilm_enabled` flag. It now reads `reasoner.configured` and reports "Configured" / "Not configured".
+
 ## [0.3.0] - 2026-08-09
 
 ### Added

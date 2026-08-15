@@ -21,7 +21,8 @@ async fn doctor_command_checks_health() {
             when.method(GET).path("/status");
             then.status(200)
                 .header("content-type", "application/json")
-                .body(r#"{
+                .body(
+                    r#"{
                     "version": "0.2.0",
                     "uptime_s": 3600,
                     "offline": false,
@@ -33,13 +34,14 @@ async fn doctor_command_checks_health() {
                     "transport": "perf",
                     "active_rules": 5,
                     "probes": {"rss_probe": "enabled", "btf": true},
-                    "reasoner": {"configured": true, "endpoint": "http://localhost:8090", "ilm_enabled": false},
+                    "reasoner": {"configured": true, "endpoint": "http://localhost:8090"},
                     "incidents_last_1h": 2,
                     "feedback_entries": 10,
                     "slack_stats": {"sent": 5, "failed": 0, "approved": 3, "denied": 1},
                     "perf_poll_errors": 0,
                     "dropped_events_total": 0
-                }"#);
+                }"#,
+                );
         })
         .await;
 

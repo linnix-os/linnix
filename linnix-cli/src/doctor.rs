@@ -45,11 +45,9 @@ struct StatusProbeState {
 
 #[derive(Deserialize, Debug)]
 struct ReasonerStatus {
-    #[allow(dead_code)]
     configured: bool,
     #[allow(dead_code)]
     endpoint: Option<String>,
-    ilm_enabled: bool,
 }
 
 #[derive(Deserialize, Debug)]
@@ -201,12 +199,14 @@ pub async fn run_doctor(url: &str) -> Result<(), Box<dyn Error>> {
         println!("{}", "Idle / Not Configured".dimmed());
     }
 
-    // 12. Check ILM Status
+    // 12. Check AI analysis status. Reads `configured`, which reflects
+    // [reasoner].enabled; the old `ilm_enabled` flag was never set by anything
+    // and so reported "Disabled" even on a working reasoner.
     print!("• AI Analysis:        ");
-    if status.reasoner.ilm_enabled {
-        println!("{}", "Enabled".green());
+    if status.reasoner.configured {
+        println!("{}", "Configured".green());
     } else {
-        println!("{}", "Disabled".dimmed());
+        println!("{}", "Not configured".dimmed());
     }
 
     println!();

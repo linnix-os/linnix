@@ -1,4 +1,3 @@
-use std::sync::RwLock;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::SystemTime;
@@ -29,12 +28,6 @@ pub struct Metrics {
     active_rules: AtomicUsize,
     rss_probe_mode: AtomicU8,
     kernel_btf_available: AtomicBool,
-    ilm_windows: AtomicU64,
-    ilm_timeouts: AtomicU64,
-    ilm_insights: AtomicU64,
-    ilm_schema_errors: AtomicU64,
-    ilm_enabled: AtomicBool,
-    ilm_disabled_reason: RwLock<String>,
     // PSI (Pressure Stall Information) gauges - stored as f32 * 100 to use AtomicU32
     psi_cpu_some_avg10: AtomicU32, // CPU pressure (0-10000 = 0.00%-100.00%)
     psi_memory_some_avg10: AtomicU32, // Memory pressure
@@ -78,12 +71,6 @@ impl Metrics {
             active_rules: AtomicUsize::new(0),
             rss_probe_mode: AtomicU8::new(0),
             kernel_btf_available: AtomicBool::new(false),
-            ilm_windows: AtomicU64::new(0),
-            ilm_timeouts: AtomicU64::new(0),
-            ilm_insights: AtomicU64::new(0),
-            ilm_schema_errors: AtomicU64::new(0),
-            ilm_enabled: AtomicBool::new(false),
-            ilm_disabled_reason: RwLock::new(String::new()),
             psi_cpu_some_avg10: AtomicU32::new(0),
             psi_memory_some_avg10: AtomicU32::new(0),
             psi_memory_full_avg10: AtomicU32::new(0),
@@ -223,60 +210,6 @@ impl Metrics {
     fn event_index(event_type: u32) -> usize {
         let max = self::EVENT_TYPE_SLOTS as u32 - 1;
         std::cmp::min(event_type, max) as usize
-    }
-
-    pub fn inc_ilm_windows(&self) {
-        self.ilm_windows.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn ilm_windows(&self) -> u64 {
-        self.ilm_windows.load(Ordering::Relaxed)
-    }
-
-    pub fn inc_ilm_timeouts(&self) {
-        self.ilm_timeouts.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn ilm_timeouts(&self) -> u64 {
-        self.ilm_timeouts.load(Ordering::Relaxed)
-    }
-
-    pub fn inc_ilm_insights(&self) {
-        self.ilm_insights.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn ilm_insights(&self) -> u64 {
-        self.ilm_insights.load(Ordering::Relaxed)
-    }
-
-    pub fn inc_ilm_schema_errors(&self) {
-        self.ilm_schema_errors.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn ilm_schema_errors(&self) -> u64 {
-        self.ilm_schema_errors.load(Ordering::Relaxed)
-    }
-
-    pub fn set_ilm_enabled(&self, enabled: bool) {
-        self.ilm_enabled.store(enabled, Ordering::Relaxed);
-    }
-
-    pub fn ilm_enabled(&self) -> bool {
-        self.ilm_enabled.load(Ordering::Relaxed)
-    }
-
-    pub fn set_ilm_disabled_reason(&self, reason: Option<String>) {
-        let value = reason.unwrap_or_default();
-        if let Ok(mut slot) = self.ilm_disabled_reason.write() {
-            *slot = value;
-        }
-    }
-
-    pub fn ilm_disabled_reason(&self) -> Option<String> {
-        self.ilm_disabled_reason
-            .read()
-            .ok()
-            .and_then(|v| if v.is_empty() { None } else { Some(v.clone()) })
     }
 
     // PSI gauge setters/getters (stored as f32 * 100)
