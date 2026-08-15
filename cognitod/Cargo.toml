@@ -69,7 +69,6 @@ futures = "0.3"
 
 [features]
 default = []
-ilm-test = []
 
 # Metadata for cargo-deb and cargo-generate-rpm
 [package.metadata.deb]
