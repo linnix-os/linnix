@@ -14,6 +14,102 @@ pub fn resolve_config_path(explicit: Option<PathBuf>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH))
 }
 
+/// `[telemetry]` — sampling and retention.
+///
+/// These keys shipped in every config and were documented with defaults, but
+/// nothing ever read them: the values they name were hardcoded in main.rs, and
+/// the documented numbers disagreed with reality by 5x in both directions
+/// (sampling was 5s not 1s; retention 300s not 60s). The defaults here are the
+/// values the daemon actually used, so wiring the knobs changes no behaviour
+/// for anyone who does not set them.
+#[derive(Debug, Deserialize, Clone)]
+pub struct TelemetrySettings {
+    /// How often the system CPU/memory snapshot is refreshed.
+    #[serde(default = "default_sample_interval_ms")]
+    pub sample_interval_ms: u64,
+    /// How long process history is kept before pruning.
+    #[serde(default = "default_retention_seconds")]
+    pub retention_seconds: u64,
+    /// Events/sec below which snapshots are not forwarded to handlers.
+    /// Previously hardcoded as `eps >= 20` with a "YAGNI cleanup" note.
+    #[serde(default = "default_min_eps_to_enable")]
+    pub min_eps_to_enable: u64,
+    #[serde(flatten)]
+    pub unknown: std::collections::BTreeMap<String, toml::Value>,
+}
+
+/// Sampling faster than this burns CPU for no signal, and the project advertises
+/// <4% overhead; slower than the ceiling makes the dashboard useless.
+pub const SAMPLE_INTERVAL_MS_BOUNDS: (u64, u64) = (100, 60_000);
+/// Retention bounds memory on a per-node agent, so it is not unbounded.
+pub const RETENTION_SECONDS_BOUNDS: (u64, u64) = (10, 3_600);
+
+fn default_sample_interval_ms() -> u64 {
+    5_000 // what main.rs actually slept for
+}
+
+fn default_retention_seconds() -> u64 {
+    300 // what ContextStore was actually constructed with
+}
+
+fn default_min_eps_to_enable() -> u64 {
+    20 // what `is_active` actually compared against
+}
+
+impl Default for TelemetrySettings {
+    fn default() -> Self {
+        Self {
+            sample_interval_ms: default_sample_interval_ms(),
+            retention_seconds: default_retention_seconds(),
+            min_eps_to_enable: default_min_eps_to_enable(),
+            unknown: Default::default(),
+        }
+    }
+}
+
+impl TelemetrySettings {
+    pub fn sample_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.sample_interval_ms)
+    }
+
+    pub fn retention(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.retention_seconds)
+    }
+
+    /// Out-of-range values, described. Used by `--check-config`.
+    fn range_problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        let (lo, hi) = SAMPLE_INTERVAL_MS_BOUNDS;
+        if !(lo..=hi).contains(&self.sample_interval_ms) {
+            problems.push(format!(
+                "[telemetry] sample_interval_ms = {} is outside {lo}..={hi}",
+                self.sample_interval_ms
+            ));
+        }
+        let (lo, hi) = RETENTION_SECONDS_BOUNDS;
+        if !(lo..=hi).contains(&self.retention_seconds) {
+            problems.push(format!(
+                "[telemetry] retention_seconds = {} is outside {lo}..={hi}",
+                self.retention_seconds
+            ));
+        }
+        problems
+    }
+
+    /// Pull out-of-range values back into bounds, loudly. A too-small sampling
+    /// interval is a CPU-overhead footgun on every node, so it is corrected
+    /// rather than obeyed.
+    fn clamp_with_warning(&mut self) {
+        for problem in self.range_problems() {
+            log::warn!("[config] {problem}; clamping");
+        }
+        let (lo, hi) = SAMPLE_INTERVAL_MS_BOUNDS;
+        self.sample_interval_ms = self.sample_interval_ms.clamp(lo, hi);
+        let (lo, hi) = RETENTION_SECONDS_BOUNDS;
+        self.retention_seconds = self.retention_seconds.clamp(lo, hi);
+    }
+}
+
 /// API server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiConfig {
@@ -113,6 +209,8 @@ pub struct Config {
     pub privacy: PrivacyConfig,
     #[serde(default)]
     pub psi: PsiConfig,
+    #[serde(default)]
+    pub telemetry: TelemetrySettings,
     /// Top-level sections/keys no field matches. Captured so `--check-config`
     /// can name them; a typo'd `[reasner]` is otherwise indistinguishable from
     /// having configured nothing.
@@ -209,6 +307,7 @@ impl Config {
         })?;
 
         config.warn_unknown_keys();
+        config.telemetry.clamp_with_warning();
         config.apply_prometheus_compat();
         Ok(config)
     }
@@ -244,6 +343,12 @@ impl Config {
                 "unrecognised key `{key}` in [reasoner] (not read by the daemon)"
             ));
         }
+        for key in config.telemetry.unknown.keys() {
+            problems.push(format!(
+                "unrecognised key `{key}` in [telemetry] (not read by the daemon)"
+            ));
+        }
+        problems.extend(config.telemetry.range_problems());
         problems
     }
 
@@ -262,6 +367,14 @@ impl Config {
             log::warn!(
                 "[config] ignoring unrecognised top-level section(s)/key(s): {}. \
                  These are not read by the daemon and have no effect. \
+                 Run `cognitod --check-config` to validate.",
+                keys.join(", ")
+            );
+        }
+        if !self.telemetry.unknown.is_empty() {
+            let keys: Vec<&str> = self.telemetry.unknown.keys().map(String::as_str).collect();
+            log::warn!(
+                "[config] ignoring unrecognised key(s) in [telemetry]: {}. \
                  Run `cognitod --check-config` to validate.",
                 keys.join(", ")
             );
@@ -906,5 +1019,62 @@ timeout_ms = 30000
             let problems = Config::check(&path);
             assert!(problems.is_empty(), "{name} has problems: {problems:?}");
         }
+    }
+
+    #[test]
+    fn telemetry_defaults_match_the_values_that_were_hardcoded() {
+        // The point of wiring these: anyone who does not set them must get
+        // exactly the behaviour they had before.
+        let t = TelemetrySettings::default();
+        assert_eq!(t.sample_interval(), std::time::Duration::from_secs(5));
+        assert_eq!(t.retention(), std::time::Duration::from_secs(300));
+        assert_eq!(t.min_eps_to_enable, 20);
+    }
+
+    #[test]
+    fn telemetry_values_are_read_from_the_file() {
+        let cfg: Config = toml::from_str(
+            r#"
+[telemetry]
+sample_interval_ms = 2000
+retention_seconds = 120
+min_eps_to_enable = 5
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.telemetry.sample_interval(),
+            std::time::Duration::from_secs(2)
+        );
+        assert_eq!(
+            cfg.telemetry.retention(),
+            std::time::Duration::from_secs(120)
+        );
+        assert_eq!(cfg.telemetry.min_eps_to_enable, 5);
+    }
+
+    #[test]
+    fn an_absurd_sample_interval_is_clamped_not_obeyed() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "[telemetry]\nsample_interval_ms = 1").unwrap();
+        let cfg = Config::load_from(file.path()).unwrap();
+        assert_eq!(
+            cfg.telemetry.sample_interval_ms, SAMPLE_INTERVAL_MS_BOUNDS.0,
+            "a 1ms sample interval would burn CPU on every node"
+        );
+    }
+
+    #[test]
+    fn check_flags_out_of_range_telemetry_values() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[telemetry]\nsample_interval_ms = 1\nretention_seconds = 999999"
+        )
+        .unwrap();
+        let problems = Config::check(file.path());
+        assert_eq!(problems.len(), 2, "got: {problems:?}");
+        assert!(problems.iter().any(|p| p.contains("sample_interval_ms")));
+        assert!(problems.iter().any(|p| p.contains("retention_seconds")));
     }
 }

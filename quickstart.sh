@@ -206,6 +206,16 @@ setup_config() {
 offline = false
 [probes]
 enable_page_faults = false
+[telemetry]
+# How often the CPU/memory snapshot is refreshed (100..=60000)
+sample_interval_ms = 5000
+
+# How long process history is kept before pruning (10..=3600)
+retention_seconds = 300
+
+# Events/sec below which snapshots are not forwarded to handlers
+min_eps_to_enable = 20
+
 [reasoner]
 enabled = true
 endpoint = "http://llama-server:8090/v1/chat/completions"
