@@ -584,8 +584,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         info!("[cognitod] K8s context not available (missing env/tokens)");
     }
 
+    // Retention comes from [telemetry].retention_seconds, which defaults to the
+    // 300s this was hardcoded to. max_len stays fixed; only the age window was
+    // ever a documented knob.
     let context = Arc::new(context::ContextStore::new(
-        Duration::from_secs(300),
+        config.telemetry.retention(),
         1000,
         k8s_context.clone(),
     ));
@@ -922,12 +925,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let ctx_clone = Arc::clone(&context);
     let handlers_clone = Arc::clone(&handlers);
     let metrics_clone = Arc::clone(&metrics);
-    // let reasoner_cfg = config.reasoner.clone(); // Unused
+    let sample_interval = config.telemetry.sample_interval();
+    let min_eps_to_enable = config.telemetry.min_eps_to_enable;
     tokio::spawn(async move {
         loop {
-            // Only update when system is active (events/sec >= reasoner threshold)
+            // Only forward snapshots when the system is busy enough to be worth
+            // describing. Threshold and interval come from [telemetry]; both
+            // default to the values they were previously hardcoded to.
             let eps = metrics_clone.events_per_sec();
-            let is_active = eps >= 20; // Hardcoded default (YAGNI cleanup)
+            let is_active = eps >= min_eps_to_enable;
 
             // Always update system snapshot for dashboard
             ctx_clone.update_system_snapshot();
@@ -937,25 +943,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 handlers_clone.on_snapshot(&snap).await;
             }
 
-            sleep(Duration::from_secs(5)).await;
+            sleep(sample_interval).await;
         }
     });
 
     // 🔁 Periodically update process stats (conditional on activity)
     let ctx_clone = Arc::clone(&context);
     let metrics_clone = Arc::clone(&metrics);
-    // let reasoner_cfg = config.reasoner.clone(); // Unused
     tokio::spawn(async move {
         loop {
-            // Only update when system is active (events/sec >= reasoner threshold)
+            // Same [telemetry] knobs as the snapshot loop above; these two were
+            // hardcoded to the same pair of values.
             let eps = metrics_clone.events_per_sec();
-            let is_active = eps >= 20; // Hardcoded default (YAGNI cleanup)
+            let is_active = eps >= min_eps_to_enable;
 
             if is_active {
                 ctx_clone.update_process_stats();
             }
 
-            sleep(Duration::from_secs(5)).await;
+            sleep(sample_interval).await;
         }
     });
 

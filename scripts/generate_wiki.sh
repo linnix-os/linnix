@@ -245,6 +245,13 @@ cat >> "$WIKI_DIR/Configuration-Guide.md" << 'EOF'
 |-------|------|---------|-------------|
 | `offline` | bool | false | Disable all external HTTP egress |
 
+### [telemetry]
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `sample_interval_ms` | u64 | 5000 | CPU/memory sampling interval (clamped to 100..=60000) |
+| `retention_seconds` | u64 | 300 | Process history retention (clamped to 10..=3600) |
+| `min_eps_to_enable` | u64 | 20 | Events/sec below which snapshots are not forwarded |
+
 ### [reasoner]
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -699,7 +706,8 @@ cat > "$WIKI_DIR/Troubleshooting.md" << 'EOF'
 **Symptom**: cognitod using >5% CPU
 
 **Solutions**:
-1. Disable optional probes
+1. Increase `sample_interval_ms` in `[telemetry]`
+2. Disable optional probes
 3. Check for fork storms on host
 4. Review event rate: `curl localhost:3000/metrics | jq .events_per_second`
 

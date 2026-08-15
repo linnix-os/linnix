@@ -20,6 +20,16 @@ listen_addr = "127.0.0.1:3000"
 [runtime]
 offline = false
 
+[telemetry]
+# How often the CPU/memory snapshot is refreshed (100..=60000)
+sample_interval_ms = 5000
+
+# How long process history is kept before pruning (10..=3600)
+retention_seconds = 300
+
+# Events/sec below which snapshots are not forwarded to handlers
+min_eps_to_enable = 20
+
 [reasoner]
 # AI-powered incident detection
 enabled = true
@@ -58,6 +68,13 @@ enabled = true
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `offline` | bool | false | Disable all external HTTP egress |
+
+### [telemetry]
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `sample_interval_ms` | u64 | 5000 | CPU/memory sampling interval (clamped to 100..=60000) |
+| `retention_seconds` | u64 | 300 | Process history retention (clamped to 10..=3600) |
+| `min_eps_to_enable` | u64 | 20 | Events/sec below which snapshots are not forwarded |
 
 ### [reasoner]
 | Field | Type | Default | Description |
