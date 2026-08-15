@@ -163,6 +163,7 @@ impl Config {
         match fs::read_to_string(&path) {
             Ok(contents) => match toml::from_str::<Config>(&contents) {
                 Ok(mut config) => {
+                    config.warn_unknown_keys();
                     config.apply_prometheus_compat();
                     config
                 }
@@ -177,6 +178,27 @@ impl Config {
             },
             Err(_) => Config::default(),
         }
+    }
+
+    /// Names any `[reasoner]` key that no field matches.
+    ///
+    /// Deliberately a warning, not an error. `load()` falls back to
+    /// `Config::default()` on any parse failure, so `deny_unknown_fields` would
+    /// turn a single stray key into a silent, total reset — losing
+    /// `api.auth_token` and leaving the HTTP API unauthenticated. That is a
+    /// worse failure than the one it would prevent. Warning keeps the lenient
+    /// load that `apply_prometheus_compat` was also written to preserve, while
+    /// making the orphan visible at startup instead of never.
+    fn warn_unknown_keys(&self) {
+        if self.reasoner.unknown.is_empty() {
+            return;
+        }
+        let keys: Vec<&str> = self.reasoner.unknown.keys().map(String::as_str).collect();
+        log::warn!(
+            "[config] ignoring unrecognised key(s) in [reasoner]: {}. \
+             These are not read by the daemon and have no effect.",
+            keys.join(", ")
+        );
     }
 
     /// Honours the legacy `[prometheus] enabled` spelling.
@@ -311,6 +333,10 @@ pub struct ReasonerConfig {
     pub model: String,
     #[serde(default = "default_reasoner_timeout")]
     pub timeout_ms: u64,
+    /// Keys present in `[reasoner]` that no field matches. Captured rather than
+    /// discarded so `warn_unknown_keys` can name them at startup.
+    #[serde(flatten)]
+    pub unknown: std::collections::BTreeMap<String, toml::Value>,
 }
 
 impl Default for ReasonerConfig {
@@ -320,6 +346,7 @@ impl Default for ReasonerConfig {
             endpoint: default_reasoner_endpoint(),
             model: default_reasoner_model(),
             timeout_ms: default_reasoner_timeout(),
+            unknown: Default::default(),
         }
     }
 }
@@ -651,5 +678,74 @@ auth_token = "secret123"
         unsafe {
             std::env::remove_var(ENV_CONFIG_PATH);
         }
+    }
+
+    #[test]
+    fn an_unrecognised_reasoner_key_is_captured_not_discarded() {
+        let cfg: Config = toml::from_str(
+            r#"
+[reasoner]
+endpoint = "http://prod-llm:8090/v1/chat/completions"
+window_seconds = 10
+min_eps_to_enable = 10
+"#,
+        )
+        .expect("lenient parse still succeeds");
+
+        // The recognised key still lands where it should.
+        assert_eq!(
+            cfg.reasoner.endpoint,
+            "http://prod-llm:8090/v1/chat/completions"
+        );
+        // The orphans are visible rather than silently dropped.
+        let mut keys: Vec<&str> = cfg.reasoner.unknown.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["min_eps_to_enable", "window_seconds"]);
+    }
+
+    #[test]
+    fn an_unrecognised_key_does_not_discard_the_rest_of_the_config() {
+        // The regression `deny_unknown_fields` would have introduced: a parse
+        // error sends load() to Config::default(), losing auth_token and
+        // leaving the API unauthenticated. Capturing instead of denying keeps
+        // every other value intact.
+        let cfg: Config = toml::from_str(
+            r#"
+[api]
+listen_addr = "0.0.0.0:9999"
+auth_token = "super-secret"
+
+[reasoner]
+endpoint = "http://prod-llm:8090/v1/chat/completions"
+typo_key = 1
+"#,
+        )
+        .expect("a stray key must not fail the parse");
+
+        assert_eq!(cfg.api.listen_addr, "0.0.0.0:9999");
+        assert_eq!(cfg.api.auth_token.as_deref(), Some("super-secret"));
+        assert_eq!(
+            cfg.reasoner.endpoint,
+            "http://prod-llm:8090/v1/chat/completions"
+        );
+        assert!(cfg.reasoner.unknown.contains_key("typo_key"));
+    }
+
+    #[test]
+    fn a_clean_reasoner_section_captures_nothing() {
+        let cfg: Config = toml::from_str(
+            r#"
+[reasoner]
+enabled = true
+endpoint = "http://localhost:8090/v1/chat/completions"
+model = "linnix-3b-distilled"
+timeout_ms = 30000
+"#,
+        )
+        .unwrap();
+        assert!(
+            cfg.reasoner.unknown.is_empty(),
+            "shipped config must be clean"
+        );
     }
 }
