@@ -330,7 +330,11 @@ fn default_reasoner_endpoint() -> String {
 }
 
 fn default_reasoner_timeout() -> u64 {
-    150
+    // Milliseconds. This was `150`, which the field name says is 150ms — far below
+    // the multi-second latency of CPU inference, so the analyzer's reqwest client
+    // timed out on every call. 150s matches the order of the 120s budget the
+    // /insights handler uses for the same class of request.
+    150_000
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
