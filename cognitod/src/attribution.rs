@@ -23,6 +23,7 @@ use tokio::sync::broadcast;
 
 use crate::alerts::{Alert, Severity};
 use crate::collectors::psi::BlameAttribution;
+use crate::metrics::Metrics;
 
 /// Minimum stall attributed to a *single* offender before we emit a JSON event
 /// or an alert for it. Distinct from the threshold that decides whether the
@@ -440,12 +441,40 @@ fn escape_label(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
+/// The alert channel together with the process-wide counter that has to move
+/// with it.
+///
+/// These travel as one value on purpose: `linnix_alerts_emitted_total` counts
+/// every alert the daemon puts on the channel, so a caller that could hand over
+/// a sender without the counter would silently under-report alert volume — the
+/// exact bug this type exists to make unrepresentable.
+#[derive(Clone)]
+pub struct AlertOutput {
+    tx: broadcast::Sender<Alert>,
+    metrics: std::sync::Arc<Metrics>,
+}
+
+impl AlertOutput {
+    pub fn new(tx: broadcast::Sender<Alert>, metrics: std::sync::Arc<Metrics>) -> Self {
+        Self { tx, metrics }
+    }
+
+    /// Sends and counts. The count is unconditional, matching `RuleEngine`:
+    /// a send that fails for want of subscribers is still an alert the daemon
+    /// decided to emit, and the two paths must agree or the counter means
+    /// different things depending on which code produced the alert.
+    fn emit(&self, alert: Alert) {
+        let _ = self.tx.send(alert);
+        self.metrics.inc_alerts_emitted();
+    }
+}
+
 /// The single point where a completed attribution fans out to logs, alerts and
 /// metrics. Callers hand it the attributions for one stall event; it decides
 /// what crosses the reporting threshold.
 pub struct AttributionSink {
     metrics: std::sync::Arc<BlameMetrics>,
-    alerts: Option<broadcast::Sender<Alert>>,
+    alerts: Option<AlertOutput>,
     host: String,
     threshold_us: u64,
     cooldown: Duration,
@@ -457,7 +486,7 @@ pub struct AttributionSink {
 impl AttributionSink {
     pub fn new(
         metrics: std::sync::Arc<BlameMetrics>,
-        alerts: Option<broadcast::Sender<Alert>>,
+        alerts: Option<AlertOutput>,
         host: impl Into<String>,
     ) -> Self {
         Self {
@@ -484,6 +513,12 @@ impl AttributionSink {
 
     pub fn metrics(&self) -> &std::sync::Arc<BlameMetrics> {
         &self.metrics
+    }
+
+    /// How many offender/victim pairs are currently held in cooldown state.
+    /// Exposed so the bound on that map can be asserted rather than assumed.
+    pub fn cooldown_entries(&self) -> usize {
+        self.reported.lock().map(|m| m.len()).unwrap_or(0)
     }
 
     /// Whether this pair may be reported now, recording the report if so.
@@ -518,6 +553,23 @@ impl AttributionSink {
         if reported.len() >= DEFAULT_MAX_SERIES {
             let cooldown = self.cooldown;
             reported.retain(|_, last| now.duration_since(*last) < cooldown);
+
+            // Expiry frees nothing when every pair is still inside its
+            // cooldown — precisely the high-cardinality burst this cap exists
+            // for. Evict the oldest entry instead, so the map stays bounded.
+            // The victim is the pair closest to leaving cooldown anyway, so it
+            // is the one whose early re-report costs least. This is an O(n)
+            // scan, but only while at the cap, and only over 4096 entries.
+            while reported.len() >= DEFAULT_MAX_SERIES {
+                let Some(oldest) = reported
+                    .iter()
+                    .min_by_key(|(_, last)| **last)
+                    .map(|(k, _)| k.clone())
+                else {
+                    break;
+                };
+                reported.remove(&oldest);
+            }
         }
 
         reported.insert(key, now);
@@ -555,8 +607,8 @@ impl AttributionSink {
                 Err(e) => warn!("[attribution] failed to serialize attribution event: {}", e),
             }
 
-            if let Some(tx) = &self.alerts {
-                let _ = tx.send(Alert {
+            if let Some(alerts) = &self.alerts {
+                alerts.emit(Alert {
                     rule: "stall_attribution".to_string(),
                     severity: Severity::Medium,
                     message: event.alert_message(),
@@ -675,5 +727,25 @@ mod tests {
         assert_eq!(emitted[0].stall_ms, 250);
         // Both still contribute to the counters.
         assert_eq!(metrics.pair_series(), 2);
+    }
+
+    #[test]
+    fn cooldown_state_stays_bounded_when_nothing_has_expired() {
+        let metrics = std::sync::Arc::new(BlameMetrics::new("node-1"));
+        // An hour-long cooldown means expiry frees nothing during the test, so
+        // the cap can only hold if oldest-entry eviction is doing the work.
+        let sink =
+            AttributionSink::new(metrics, None, "node-1").with_cooldown(Duration::from_secs(3_600));
+
+        for i in 0..(DEFAULT_MAX_SERIES + 500) {
+            sink.emit(&[attribution(&format!("offender-{i}"), 250_000)]);
+        }
+
+        assert!(
+            sink.cooldown_entries() <= DEFAULT_MAX_SERIES,
+            "cooldown map grew to {} entries, past the {} cap",
+            sink.cooldown_entries(),
+            DEFAULT_MAX_SERIES
+        );
     }
 }
