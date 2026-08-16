@@ -1289,6 +1289,25 @@ fn default_window() -> i64 {
     5
 }
 
+/// Serialises one stored attribution with its dominant signal attached.
+///
+/// The reason is derived here rather than by each client because it has to
+/// name whichever term dominated the stored blame score, and that
+/// normalisation deliberately lives in exactly one place. A client that
+/// recomputed it would drift the moment either side of the score changed.
+fn with_blame_reason(attr: &cognitod::incidents::StallAttribution) -> serde_json::Value {
+    let reason = cognitod::attribution::BlameReason::classify(
+        attr.cpu_share,
+        attr.fork_count,
+        attr.short_job_count,
+    );
+    let mut value = serde_json::to_value(attr).unwrap_or_default();
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("reason".into(), reason.as_str().into());
+    }
+    value
+}
+
 async fn get_attributions(
     State(app_state): State<Arc<AppState>>,
     Query(query): Query<AttributionQuery>,
@@ -1299,6 +1318,9 @@ async fn get_attributions(
                 .query_attributions(&query.pod, &query.namespace, query.window * 60)
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+            let attributions: Vec<serde_json::Value> =
+                attributions.iter().map(with_blame_reason).collect();
 
             Ok(Json(serde_json::json!({
                 "victim": {
@@ -2142,6 +2164,45 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use tower::ServiceExt;
+
+    fn stored_attribution(
+        cpu_share: f64,
+        fork_count: u64,
+        short_job_count: u64,
+    ) -> cognitod::incidents::StallAttribution {
+        cognitod::incidents::StallAttribution {
+            offender_pod: "image-resizer".to_string(),
+            offender_namespace: "media".to_string(),
+            stall_us: 900_000,
+            attributed_stall_us: Some(600_000),
+            blame_score: 2.0,
+            timestamp: 1_700_000_000,
+            cpu_share,
+            fork_count,
+            short_job_count,
+        }
+    }
+
+    #[test]
+    fn attribution_rows_carry_the_dominant_signal() {
+        // The stored columns survive the round trip alongside the new field.
+        let value = with_blame_reason(&stored_attribution(0.8, 12, 3));
+        assert_eq!(value["offender_pod"], "image-resizer");
+        assert_eq!(value["attributed_stall_us"], 600_000);
+        assert_eq!(value["reason"], "high_cpu_contention");
+    }
+
+    #[test]
+    fn dominant_signal_follows_the_scores_own_normalisation() {
+        // 100 forks saturates the fork term, beating a 0.5 CPU share; 60 short
+        // jobs saturates its term while forks stay low. Both cases go through
+        // the same normalisation the blame score uses, so they cannot drift.
+        let forky = with_blame_reason(&stored_attribution(0.5, 100, 0));
+        assert_eq!(forky["reason"], "fork_storm");
+
+        let churny = with_blame_reason(&stored_attribution(0.1, 2, 60));
+        assert_eq!(churny["reason"], "short_job_churn");
+    }
 
     #[tokio::test]
     async fn heartbeats_emit_every_10s() {
