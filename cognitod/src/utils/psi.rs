@@ -25,7 +25,6 @@ fn get_psi_path(metric: &str) -> String {
 
 /// PSI metrics for the entire system
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 pub struct PsiMetrics {
     /// CPU pressure: % time at least one task stalled waiting for CPU (10s avg)
     pub cpu_some_avg10: f32,
@@ -43,7 +42,6 @@ pub struct PsiMetrics {
     pub io_full_avg10: f32,
 }
 
-#[allow(dead_code)]
 impl PsiMetrics {
     /// Read PSI metrics from /proc/pressure/*
     ///
