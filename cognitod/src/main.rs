@@ -1081,6 +1081,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                     .ok(),
                                                 llm_analysis: None,
                                                 llm_analyzed_at: None,
+                                                investigation: None,
                                                 recovery_time_ms: None,
                                                 psi_after: None,
                                             };
@@ -1099,10 +1100,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                         tokio::spawn(async move {
                                                             match analyzer.analyze(&incident).await
                                                             {
-                                                                Ok(analysis) => {
+                                                                Ok(outcome) => {
+                                                                    if let Some(err) =
+                                                                        &outcome.parse_error
+                                                                    {
+                                                                        warn!(
+                                                                            "[incident_analyzer] Incident #{} reply did not ground: {}",
+                                                                            id, err
+                                                                        );
+                                                                    }
                                                                     let _ = store_clone
                                                                         .add_llm_analysis(
-                                                                            id, analysis,
+                                                                            id, &outcome,
                                                                         )
                                                                         .await;
                                                                 }

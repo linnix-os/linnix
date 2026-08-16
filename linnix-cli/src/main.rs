@@ -10,6 +10,7 @@ mod blame;
 mod doctor;
 mod event;
 mod export;
+mod investigate;
 mod pretty;
 mod processes;
 mod sse;
@@ -54,6 +55,14 @@ enum Command {
         /// Output format
         #[clap(long, value_enum, default_value = "txt")]
         format: Format,
+    },
+    /// Investigate which workloads stalled a pod, and on what evidence
+    Investigate {
+        /// Victim pod as NAMESPACE/POD
+        pod: String,
+        /// Time window to investigate (e.g. 20m, 1h)
+        #[clap(long, default_value = "15m")]
+        since: String,
     },
     /// Blame a node for performance issues (requires kubectl)
     Blame {
@@ -107,6 +116,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     {
         let report = export_incident(&client, &args.url, &since, &rule, format).await?;
         println!("{report}");
+        return Ok(());
+    }
+
+    if let Some(Command::Investigate { pod, since }) = args.command.clone() {
+        investigate::run_investigate(&client, &args.url, &pod, &since, color).await?;
         return Ok(());
     }
 
