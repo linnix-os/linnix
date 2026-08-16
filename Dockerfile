@@ -23,7 +23,6 @@ WORKDIR /build
 
 # Copy Cargo files for dependency caching
 COPY Cargo.toml Cargo.lock ./
-COPY linnix-ai-ebpf/linnix-ai-ebpf/Cargo.toml ./linnix-ai-ebpf/linnix-ai-ebpf/
 COPY linnix-ai-ebpf/linnix-ai-ebpf-common/Cargo.toml ./linnix-ai-ebpf/linnix-ai-ebpf-common/
 COPY linnix-ai-ebpf/linnix-ai-ebpf-ebpf/Cargo.toml ./linnix-ai-ebpf/linnix-ai-ebpf-ebpf/
 COPY linnix-ai-ebpf/linnix-ai-ebpf-ebpf/rust-toolchain.toml ./linnix-ai-ebpf/linnix-ai-ebpf-ebpf/
@@ -49,7 +48,6 @@ WORKDIR /build
 
 # Copy Cargo files
 COPY Cargo.toml Cargo.lock ./
-COPY linnix-ai-ebpf/linnix-ai-ebpf/Cargo.toml ./linnix-ai-ebpf/linnix-ai-ebpf/
 COPY linnix-ai-ebpf/linnix-ai-ebpf-common/Cargo.toml ./linnix-ai-ebpf/linnix-ai-ebpf-common/
 COPY cognitod/Cargo.toml ./cognitod/
 COPY linnix-cli/Cargo.toml ./linnix-cli/
