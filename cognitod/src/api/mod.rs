@@ -1295,14 +1295,21 @@ fn default_window() -> i64 {
 /// name whichever term dominated the stored blame score, and that
 /// normalisation deliberately lives in exactly one place. A client that
 /// recomputed it would drift the moment either side of the score changed.
+/// Rows carrying no signal at all are left unclassified. A real attribution is
+/// only persisted when its blame score exceeds zero, which takes at least one
+/// non-zero signal, so all three at zero means the columns were never
+/// populated — migration 005 added them with zero defaults. Classifying that
+/// would report `high_cpu_contention`, the branch three zeros happen to fall
+/// into, as though it were a finding.
 fn with_blame_reason(attr: &cognitod::incidents::StallAttribution) -> serde_json::Value {
-    let reason = cognitod::attribution::BlameReason::classify(
-        attr.cpu_share,
-        attr.fork_count,
-        attr.short_job_count,
-    );
     let mut value = serde_json::to_value(attr).unwrap_or_default();
-    if let Some(obj) = value.as_object_mut() {
+    let has_signal = attr.cpu_share > 0.0 || attr.fork_count > 0 || attr.short_job_count > 0;
+    if has_signal && let Some(obj) = value.as_object_mut() {
+        let reason = cognitod::attribution::BlameReason::classify(
+            attr.cpu_share,
+            attr.fork_count,
+            attr.short_job_count,
+        );
         obj.insert("reason".into(), reason.as_str().into());
     }
     value
@@ -2202,6 +2209,15 @@ mod tests {
 
         let churny = with_blame_reason(&stored_attribution(0.1, 2, 60));
         assert_eq!(churny["reason"], "short_job_churn");
+    }
+
+    #[test]
+    fn a_row_with_no_signal_is_left_unclassified() {
+        // Only rows predating migration 005 read as all-zero: a live
+        // attribution needs a non-zero score to be stored at all. Classifying
+        // the defaults would report high CPU contention as a finding.
+        let value = with_blame_reason(&stored_attribution(0.0, 0, 0));
+        assert!(value.get("reason").is_none());
     }
 
     #[tokio::test]

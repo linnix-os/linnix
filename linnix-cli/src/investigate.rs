@@ -252,13 +252,27 @@ pub fn render(
     }
 
     out.push_str(&format!(
-        "{} {}/{} lost {} to stalls across {} detection window{}.\n\n",
+        "{} {}/{} lost {} to stalls across {} detection window{}.\n",
         heading("Victim:"),
         namespace,
         pod,
         format_stall(investigation.victim_stall_us),
         investigation.windows,
         if investigation.windows == 1 { "" } else { "s" }
+    ));
+
+    // Naming the denominator keeps the percentages below from reading as
+    // shares of the victim's whole stall. They are shares of the part that
+    // could be pinned on a neighbour, which is usually less.
+    let total_attributed: u64 = investigation
+        .offenders
+        .iter()
+        .map(|o| o.attributed_stall_us)
+        .sum();
+    out.push_str(&format!(
+        "  {} of that is attributed to neighbours; the percentages below split \
+         that figure.\n\n",
+        format_stall(total_attributed)
     ));
 
     let (primary, rest) = investigation.offenders.split_first().expect("non-empty");
@@ -504,6 +518,20 @@ mod tests {
         assert!(report.contains("media/resizer"));
         assert!(report.contains("70% of attributed stall"));
         assert!(report.contains("high CPU contention"));
+        // The victim lost 1.0s, all of which was attributable here.
+        assert!(report.contains("lost 1.0s to stalls"));
+        assert!(report.contains("1.0s of that is attributed to neighbours"));
+    }
+
+    #[test]
+    fn unattributed_stall_stays_visible() {
+        // Only 400ms of a 1s stall could be pinned on a neighbour. Reporting
+        // the offender at 100% without naming the denominator would read as
+        // "this pod caused the whole second".
+        let rows = vec![attr("resizer", 100, Some(400_000), 1_000_000)];
+        let report = render(&summarise(&rows), "payments", "api", "20m", false);
+        assert!(report.contains("lost 1.0s to stalls"));
+        assert!(report.contains("400ms of that is attributed to neighbours"));
     }
 
     #[test]

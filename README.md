@@ -141,6 +141,7 @@ linnix-cli investigate payments/payment-api --since 20m
 Investigation: payments/payment-api over the last 20m
 
 Victim: payments/payment-api lost 2.6s to stalls across 2 detection windows.
+  2.1s of that is attributed to neighbours; the percentages below split that figure.
 
 Likely offender: media/image-resizer — 76% of attributed stall
   Attributed stall: 1.6s across 2 windows
@@ -151,7 +152,7 @@ Also contributing:
   batch/etl-runner — 24% (500ms, fork storm)
 ```
 
-The command aggregates the attributions cognitod has already persisted, so it answers instantly and works after the fact — you do not have to be watching when the stall happens. Percentages are shares of *attributed* stall, computed only from windows where blame could be split.
+The command aggregates the attributions cognitod has already persisted, so it answers instantly and works after the fact — you do not have to be watching when the stall happens. Percentages are shares of the stall that could be pinned on a neighbour, which is usually less than the victim's total; both figures are printed so the gap stays visible.
 
 If nothing contended, it says so rather than naming a suspect. "No offender found" is a real result: it rules out the neighbours and points you at the pod's own limits and throttling instead.
 
