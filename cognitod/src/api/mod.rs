@@ -1629,10 +1629,14 @@ pub struct AppState {
     pub blame_metrics: Arc<cognitod::attribution::BlameMetrics>,
 }
 
-pub fn all_routes(app_state: Arc<AppState>) -> Router {
-    let prometheus_enabled = app_state.prometheus_enabled;
-    let auth_token = app_state.auth_token.clone();
-
+/// Every route the daemon serves, listed once.
+///
+/// Both listeners build from this. The difference between them is the auth
+/// layer, not the route set — and on an auth boundary that distinction has to
+/// be structural rather than clerical. Two hand-maintained lists meant a route
+/// added to one and forgotten in the other either vanished silently from the
+/// socket, or became reachable over TCP *without token auth*.
+fn base_router(prometheus_enabled: bool) -> Router<Arc<AppState>> {
     let mut router = Router::new()
         .route("/", get(crate::ui::dashboard_handler))
         .route("/dashboard", get(crate::ui::dashboard_handler))
@@ -1673,6 +1677,15 @@ pub fn all_routes(app_state: Arc<AppState>) -> Router {
         router = router.route("/metrics/prometheus", get(prometheus_metrics));
     }
 
+    router
+}
+
+/// Build routes for the TCP listener, which requires a bearer token when one
+/// is configured.
+pub fn all_routes(app_state: Arc<AppState>) -> Router {
+    let auth_token = app_state.auth_token.clone();
+    let mut router = base_router(app_state.prometheus_enabled);
+
     if auth_token.is_some() {
         router = router.layer(axum::middleware::from_fn_with_state(
             auth_token,
@@ -1685,53 +1698,11 @@ pub fn all_routes(app_state: Arc<AppState>) -> Router {
 
 /// Build routes for the Unix domain socket listener.
 ///
-/// UDS connections bypass token auth — local process identity is verified
-/// by socket credentials (`SO_PEERCRED`). The routes are identical to `all_routes`
-/// but never apply the auth middleware layer.
+/// Same routes as `all_routes` — guaranteed, not maintained — but no auth
+/// middleware: UDS connections are trusted because local process identity is
+/// verified by socket credentials (`SO_PEERCRED`).
 pub fn uds_routes(app_state: Arc<AppState>) -> Router {
-    let prometheus_enabled = app_state.prometheus_enabled;
-
-    let mut router = Router::new()
-        .route("/", get(crate::ui::dashboard_handler))
-        .route("/dashboard", get(crate::ui::dashboard_handler))
-        .route("/context", get(get_context_route))
-        .route("/processes", get(get_processes))
-        .route("/processes/live", get(stream_processes_live))
-        .route("/processes/{pid}", get(get_process_by_pid))
-        .route("/ppid/{ppid}", get(get_by_ppid))
-        .route("/graph/{pid}", get(get_graph))
-        .route("/events", get(stream_events))
-        .route("/stream", get(stream_events))
-        .route("/system", get(system_snapshot))
-        .route("/timeline", get(get_timeline))
-        .route("/metrics/system", get(get_system_metrics))
-        .route("/alerts", get(stream_alerts))
-        .route("/insights", get(get_insights))
-        .route("/insights/recent", get(get_recent_insights))
-        .route("/insights/{id}", get(get_insight_by_id))
-        .route("/insights/{id}/feedback", post(submit_feedback))
-        .route("/api/feedback", post(submit_feedback_api))
-        .route("/api/slack/interactions", post(handle_slack_interaction))
-        .route("/incidents", get(get_incidents))
-        .route("/incidents/summary", get(get_incident_summary))
-        .route("/incidents/stats", get(get_incident_stats))
-        .route("/incidents/{id}", get(get_incident_by_id))
-        .route("/attribution", get(get_attributions))
-        .route("/metrics", get(metrics_handler))
-        .route("/status", get(status_handler))
-        .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz))
-        .route("/actions", get(get_actions))
-        .route("/actions/{id}", get(get_action_by_id))
-        .route("/actions/{id}/approve", axum::routing::post(approve_action))
-        .route("/actions/{id}/reject", axum::routing::post(reject_action));
-
-    if prometheus_enabled {
-        router = router.route("/metrics/prometheus", get(prometheus_metrics));
-    }
-
-    // NOTE: No auth middleware — UDS connections are trusted (local process identity).
-    router.with_state(app_state)
+    base_router(app_state.prometheus_enabled).with_state(app_state)
 }
 
 const CARGO_LOCK: &str = include_str!("../../../Cargo.lock");
@@ -2653,5 +2624,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The one intended difference between the two listeners, pinned: same
+    /// route, same state, token required over TCP and not over the socket.
+    /// The route sets themselves no longer need a test — both listeners build
+    /// from `base_router`, so they cannot disagree.
+    #[tokio::test]
+    async fn the_socket_skips_the_auth_the_tcp_listener_enforces() {
+        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10, None));
+        let metrics = Arc::new(Metrics::new());
+        let app_state = Arc::new(AppState {
+            context: Arc::clone(&ctx),
+            metrics: Arc::clone(&metrics),
+            alerts: None,
+            insights: Arc::new(InsightStore::new(16, None)),
+            offline: Arc::new(OfflineGuard::new(false)),
+            transport: "perf",
+            probe_state: ProbeState::disabled(),
+            require_kernel_instrumentation: true,
+            enforcement: None,
+            reasoner: ReasonerConfig::default(),
+            prometheus_enabled: false,
+            alert_history: Arc::new(AlertHistory::new(16)),
+            incident_store: None,
+            auth_token: Some("secret123".to_string()),
+            k8s: None,
+            blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+        });
+
+        let unauthenticated = || {
+            Request::builder()
+                .uri("/processes")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let over_tcp = super::all_routes(Arc::clone(&app_state))
+            .oneshot(unauthenticated())
+            .await
+            .unwrap();
+        assert_eq!(
+            over_tcp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a configured token must be enforced on the TCP listener"
+        );
+
+        let over_socket = super::uds_routes(app_state)
+            .oneshot(unauthenticated())
+            .await
+            .unwrap();
+        assert_eq!(
+            over_socket.status(),
+            StatusCode::OK,
+            "the socket is authenticated by SO_PEERCRED, not by the token"
+        );
     }
 }
