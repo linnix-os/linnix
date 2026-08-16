@@ -1,33 +1,74 @@
-//! LLM-based incident analysis
+//! LLM-based incident analysis.
 //!
-//! Provides asynchronous post-incident analysis using the local LLM to:
-//! - Determine root cause of circuit breaker triggers
-//! - Classify incident severity
-//! - Suggest preventive measures
-//! - Detect patterns across multiple incidents
+//! The daemon assembles what it observed into a numbered list of facts, and
+//! the model's job is to propose hypotheses that *cite* those facts rather
+//! than restate them. See [`super::investigation`] for why the citation is the
+//! whole point: it is what keeps a fluent answer from passing as a grounded
+//! one.
 
 use super::Incident;
-use serde::{Deserialize, Serialize};
+use super::investigation::{Fact, IncidentInvestigation, parse_and_ground};
 use serde_json::json;
 use std::time::Duration;
 use tracing::{debug, error, info};
 
-/// Analysis result from LLM
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IncidentAnalysis {
-    pub reason_code: String, // "fork_storm", "cpu_spin", etc.
-    pub summary: String,
-    pub confidence: f32,
-    pub suggested_next_step: String,
-    pub top_pods: Vec<PodContribution>,
+/// What one analysis attempt produced.
+///
+/// The raw reply is kept whatever happens. When grounding fails there is
+/// nothing structured to store, and the only way to tell a broken endpoint
+/// from a model that answers badly is to still have what it said.
+#[derive(Debug, Clone)]
+pub struct AnalysisOutcome {
+    pub raw_response: String,
+    pub investigation: Option<IncidentInvestigation>,
+    /// Why the reply did not yield a grounded investigation, if it did not.
+    pub parse_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PodContribution {
-    pub namespace: String,
-    pub pod: String,
-    pub cpu_usage: f32,
-    pub psi_contribution: f32,
+/// Turns an incident into the facts the model is allowed to reason from.
+///
+/// Only values the daemon actually measured become facts. Anything absent is
+/// omitted rather than defaulted, because a fact reading "PID 0" invites a
+/// hypothesis about PID 0.
+pub fn facts_from_incident(incident: &Incident) -> Vec<Fact> {
+    let mut facts = vec![
+        Fact::new("f1", format!("CPU usage was {:.1}%", incident.cpu_percent)),
+        Fact::new(
+            "f2",
+            format!(
+                "CPU pressure stall was {:.1}% — tasks were blocked, not merely busy",
+                incident.psi_cpu
+            ),
+        ),
+        Fact::new(
+            "f3",
+            format!(
+                "Memory pressure stall (full) was {:.1}%",
+                incident.psi_memory
+            ),
+        ),
+        Fact::new("f4", format!("Load average was {}", incident.load_avg)),
+        Fact::new(
+            "f5",
+            format!(
+                "The circuit breaker fired for event type '{}' and took action '{}'",
+                incident.event_type, incident.action
+            ),
+        ),
+    ];
+
+    if let Some(name) = &incident.target_name {
+        let pid = incident
+            .target_pid
+            .map(|p| format!(" (PID {p})"))
+            .unwrap_or_default();
+        facts.push(Fact::new(
+            "f6",
+            format!("The action targeted process '{name}'{pid}"),
+        ));
+    }
+
+    facts
 }
 
 /// Incident analyzer using local LLM
@@ -49,19 +90,28 @@ impl IncidentAnalyzer {
         })
     }
 
-    /// Analyze an incident using the LLM
+    /// Investigates an incident, returning hypotheses grounded in the facts
+    /// the daemon supplied.
+    ///
+    /// A transport failure is an error. A reply that arrives but does not
+    /// ground is not: that is a result about the model, and the caller stores
+    /// it rather than retrying into the same wall.
     pub async fn analyze(
         &self,
         incident: &Incident,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let prompt = self.build_analysis_prompt(incident);
+    ) -> Result<AnalysisOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        let facts = facts_from_incident(incident);
+        let prompt = Self::build_analysis_prompt(&facts);
 
         let request_body = json!({
             "model": self.model,
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are Linnix AI, an expert system performance analyst. Analyze circuit breaker incidents and provide concise root cause analysis, severity assessment, and actionable recommendations."
+                    "content": "You are Linnix AI, a Linux performance analyst. You reason only from \
+                                the numbered facts you are given. You cite facts by id; you never \
+                                restate their contents, and you never introduce measurements that \
+                                are not among them. Reply with JSON only."
                 },
                 {
                     "role": "user",
@@ -69,7 +119,7 @@ impl IncidentAnalyzer {
                 }
             ],
             "temperature": 0.1,
-            "max_tokens": 500
+            "max_tokens": 800
         });
 
         debug!("[incident_analyzer] Requesting LLM analysis for incident");
@@ -95,114 +145,87 @@ impl IncidentAnalyzer {
 
         let response_json: serde_json::Value = response.json().await?;
 
-        // Extract LLM response
-        let analysis = response_json["choices"][0]["message"]["content"]
+        let raw_response = response_json["choices"][0]["message"]["content"]
             .as_str()
-            .unwrap_or("Analysis unavailable")
+            .unwrap_or_default()
             .to_string();
 
         debug!(
             "[incident_analyzer] Received analysis ({} chars)",
-            analysis.len()
+            raw_response.len()
         );
 
-        info!(target: "audit", "LLM analysis completed successfully. Response length: {} chars", analysis.len());
-
-        Ok(analysis)
-    }
-
-    /// Build the analysis prompt from incident data
-    fn build_analysis_prompt(&self, incident: &Incident) -> String {
-        let timestamp = chrono::DateTime::from_timestamp(incident.timestamp, 0)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        format!(
-            r#"INCIDENT REPORT
-
-Timestamp: {}
-Event Type: {}
-
-ACTION TAKEN BY CIRCUIT BREAKER:
-{} - Target Process: {} (PID: {})
-
-SYSTEM METRICS AT INCIDENT TIME:
-- CPU Usage: {:.1}%
-- CPU PSI (Pressure Stall): {:.1}%
-- Memory PSI (Full): {:.1}%
-- Load Average: {}
-
-CIRCUIT BREAKER TRIGGER REASON:
-{}
-
-ANALYSIS TASK:
-You are analyzing a circuit breaker incident where an automated action was taken to protect system stability.
-
-Provide a concise analysis covering:
-1. REASON_CODE: One of [fork_storm, short_job_flood, runaway_tree, cpu_spin, io_saturation, oom_risk, normal]
-2. SUMMARY: A concise explanation of what happened and why (1-2 sentences)
-3. CONFIDENCE: Your confidence level (0.0-1.0)
-4. SUGGESTED_NEXT_STEP: What should the operator do next? (1 sentence)
-5. TOP_PODS: JSON array of pods contributing to the issue (if applicable)
-
-Format your response as a JSON object:
-{{
-  "reason_code": "fork_storm",
-  "summary": "Process foo spawned 200 children...",
-  "confidence": 0.95,
-  "suggested_next_step": "Check deployment config for replicas",
-  "top_pods": [
-    {{"namespace": "default", "pod": "foo-123", "cpu_usage": 80.5, "psi_contribution": 10.2}}
-  ]
-}}
-"#,
-            timestamp,
-            incident.event_type,
-            incident.action,
-            incident.target_name.as_deref().unwrap_or("unknown"),
-            incident.target_pid.unwrap_or(0),
-            incident.cpu_percent,
-            incident.psi_cpu,
-            incident.psi_memory,
-            incident.load_avg,
-            self.explain_event_type(&incident.event_type, incident.psi_cpu, incident.cpu_percent)
-        )
-    }
-
-    /// Explain why the circuit breaker triggered
-    fn explain_event_type(&self, event_type: &str, psi_cpu: f32, cpu_percent: f32) -> String {
-        match event_type {
-            "circuit_breaker_cpu" => {
-                format!(
-                    "Dual-signal CPU thrashing detected: CPU usage at {:.1}% AND PSI at {:.1}%. \
-                     This indicates processes were stalled {:.1}% of the time - not just busy, but blocked. \
-                     High PSI means context switching overhead dominated actual work.",
-                    cpu_percent, psi_cpu, psi_cpu
-                )
+        match parse_and_ground(&raw_response, facts) {
+            Ok(investigation) => {
+                info!(
+                    target: "audit",
+                    "LLM analysis grounded: {} hypotheses kept, {} discarded for citing unsupplied evidence",
+                    investigation.hypotheses.len(),
+                    investigation.discarded.len()
+                );
+                Ok(AnalysisOutcome {
+                    raw_response,
+                    investigation: Some(investigation),
+                    parse_error: None,
+                })
             }
-            "circuit_breaker_memory" => {
-                "Memory thrashing detected: System was spending excessive time managing memory pressure \
-                 rather than doing useful work. Processes were blocked waiting for memory."
-                    .to_string()
-            }
-            _ => format!("Circuit breaker triggered for event type: {}", event_type),
-        }
-    }
-
-    /// Parse structured analysis from LLM response
-    pub fn parse_analysis(text: &str) -> Option<IncidentAnalysis> {
-        // Find the first '{' and last '}' to extract JSON
-        let start = text.find('{')?;
-        let end = text.rfind('}')?;
-        let json_str = &text[start..=end];
-
-        match serde_json::from_str::<IncidentAnalysis>(json_str) {
-            Ok(analysis) => Some(analysis),
             Err(e) => {
-                debug!("[incident_analyzer] Failed to parse LLM JSON: {}", e);
-                None
+                error!(target: "audit", "LLM reply could not be grounded: {}", e);
+                Ok(AnalysisOutcome {
+                    raw_response,
+                    investigation: None,
+                    parse_error: Some(e),
+                })
             }
         }
+    }
+
+    /// Builds the prompt: the facts, then the shape of the reply.
+    ///
+    /// The facts are numbered because the ids are the only handle the model
+    /// gets on them. Asking for citations rather than restatements is what
+    /// makes an ungrounded answer detectable instead of merely unlikely.
+    fn build_analysis_prompt(facts: &[Fact]) -> String {
+        let mut prompt = String::from("OBSERVED FACTS\n\n");
+        for fact in facts {
+            prompt.push_str(&format!("{}: {}\n", fact.id, fact.statement));
+        }
+
+        prompt.push_str(
+            r#"
+TASK
+
+Propose up to three hypotheses for what caused this incident, most likely
+first. Each hypothesis must cite the facts above by id.
+
+Rules:
+- Cite only ids from the list. Do not invent facts, measurements, pod names
+  or process names that do not appear above.
+- A hypothesis with no supporting citation will be discarded.
+- If a fact argues against your hypothesis, cite it under
+  contradicting_fact_ids. Saying so is worth more than omitting it.
+- reason_code must be one of: fork_storm, short_job_flood, runaway_tree,
+  cpu_spin, io_saturation, oom_risk, normal.
+- confidence is your own estimate, 0.0 to 1.0.
+
+Reply with JSON only, in exactly this shape:
+
+{
+  "hypotheses": [
+    {
+      "reason_code": "cpu_spin",
+      "statement": "A single process held the CPU in a tight loop",
+      "supporting_fact_ids": ["f1", "f2"],
+      "contradicting_fact_ids": [],
+      "confidence": 0.7,
+      "proposed_action": "Inspect the targeted process before restarting it"
+    }
+  ]
+}
+"#,
+        );
+
+        prompt
     }
 }
 
@@ -210,28 +233,8 @@ Format your response as a JSON object:
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_parse_analysis() {
-        let response = r#"
-Here is the analysis:
-{
-  "reason_code": "fork_storm",
-  "summary": "Process fork bomb created 200 competing processes",
-  "confidence": 0.95,
-  "suggested_next_step": "Implement process limits",
-  "top_pods": []
-}
-"#;
-
-        let analysis = IncidentAnalyzer::parse_analysis(response).unwrap();
-        assert_eq!(analysis.reason_code, "fork_storm");
-        assert_eq!(analysis.confidence, 0.95);
-        assert!(analysis.summary.contains("fork bomb"));
-    }
-
-    #[test]
-    fn test_build_prompt() {
-        let incident = Incident {
+    fn incident() -> Incident {
+        Incident {
             id: Some(1),
             timestamp: 1732242135,
             event_type: "circuit_breaker_cpu".to_string(),
@@ -245,21 +248,84 @@ Here is the analysis:
             system_snapshot: None,
             llm_analysis: None,
             llm_analyzed_at: None,
+            investigation: None,
             recovery_time_ms: None,
             psi_after: None,
-        };
+        }
+    }
 
-        let analyzer = IncidentAnalyzer::new(
-            "http://localhost:8090/v1/chat/completions".to_string(),
-            "linnix-3b-distilled".to_string(),
-            Duration::from_secs(30),
-        )
-        .unwrap();
+    #[test]
+    fn facts_carry_the_measurements_the_daemon_took() {
+        let facts = facts_from_incident(&incident());
+        let joined = facts
+            .iter()
+            .map(|f| f.statement.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
 
-        let prompt = analyzer.build_analysis_prompt(&incident);
+        assert!(joined.contains("96.3%"));
+        assert!(joined.contains("75.2%")); // .1 precision
+        assert!(joined.contains("aggressive-stress.sh"));
+        assert!(joined.contains("472693"));
 
-        assert!(prompt.contains("75.2%")); // .1 precision
-        assert!(prompt.contains("aggressive-stress.sh"));
-        assert!(prompt.contains("Dual-signal CPU thrashing"));
+        // Ids have to be unique, since they are the model's only handle on a
+        // fact and a duplicate would make a citation ambiguous.
+        let mut ids: Vec<&str> = facts.iter().map(|f| f.id.as_str()).collect();
+        ids.sort_unstable();
+        let count = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), count);
+    }
+
+    #[test]
+    fn an_absent_target_yields_no_fact_about_it() {
+        // A fact reading "process 'unknown' (PID 0)" would invite a hypothesis
+        // about a process that was never identified.
+        let mut incident = incident();
+        incident.target_name = None;
+        incident.target_pid = None;
+
+        let facts = facts_from_incident(&incident);
+        assert!(facts.iter().all(|f| !f.statement.contains("unknown")));
+        assert!(facts.iter().all(|f| !f.statement.contains("PID 0")));
+    }
+
+    #[test]
+    fn the_prompt_lists_every_fact_by_id() {
+        let facts = facts_from_incident(&incident());
+        let prompt = IncidentAnalyzer::build_analysis_prompt(&facts);
+
+        for fact in &facts {
+            assert!(prompt.contains(&fact.id));
+            assert!(prompt.contains(&fact.statement));
+        }
+        assert!(prompt.contains("Cite only ids from the list"));
+    }
+
+    #[test]
+    fn a_reply_citing_supplied_facts_grounds() {
+        let facts = facts_from_incident(&incident());
+        let reply = r#"{"hypotheses":[{"reason_code":"cpu_spin",
+            "statement":"A tight loop held the CPU","supporting_fact_ids":["f1","f2"],
+            "confidence":0.7}]}"#;
+
+        let out = parse_and_ground(reply, facts).expect("well-formed reply grounds");
+        assert_eq!(out.hypotheses.len(), 1);
+        assert!(out.discarded.is_empty());
+    }
+
+    #[test]
+    fn a_reply_inventing_a_pod_is_discarded() {
+        // The realistic failure: fluent, plausible, and citing evidence that
+        // was never supplied.
+        let facts = facts_from_incident(&incident());
+        let reply = r#"{"hypotheses":[{"reason_code":"fork_storm",
+            "statement":"The checkout pod spawned 400 workers",
+            "supporting_fact_ids":["f11"]}]}"#;
+
+        let out = parse_and_ground(reply, facts).expect("parses");
+        assert!(out.hypotheses.is_empty());
+        assert_eq!(out.discarded.len(), 1);
+        assert!(!out.render().contains("checkout"));
     }
 }

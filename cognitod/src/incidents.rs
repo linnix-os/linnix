@@ -4,8 +4,10 @@
 //! system events, and LLM analysis. Uses SQLite for simplicity and reliability.
 
 mod analyzer;
+pub mod investigation;
 
-pub use analyzer::{IncidentAnalysis, IncidentAnalyzer};
+pub use analyzer::{AnalysisOutcome, IncidentAnalyzer};
+pub use investigation::{Fact, IncidentInvestigation};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -36,8 +38,16 @@ pub struct Incident {
     pub system_snapshot: Option<String>,
 
     // LLM analysis (added asynchronously)
+    /// The model's reply verbatim, kept even when it failed to ground so a
+    /// broken endpoint can be told apart from a model that answers badly.
     pub llm_analysis: Option<String>,
     pub llm_analyzed_at: Option<i64>,
+
+    /// The grounded [`IncidentInvestigation`] as JSON. `None` when no analysis
+    /// ran, and also when one ran and nothing it claimed could be checked
+    /// against the facts the daemon supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub investigation: Option<String>,
 
     // Outcome
     pub recovery_time_ms: Option<i64>,
@@ -97,7 +107,8 @@ impl IncidentStore {
                 llm_analysis TEXT,
                 llm_analyzed_at INTEGER,
                 recovery_time_ms INTEGER,
-                psi_after REAL
+                psi_after REAL,
+                investigation TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_timestamp ON incidents(timestamp);
             CREATE INDEX IF NOT EXISTS idx_event_type ON incidents(event_type);
@@ -155,6 +166,13 @@ impl IncidentStore {
             sqlx::query("ALTER TABLE stall_attributions ADD COLUMN attributed_stall_us INTEGER")
                 .execute(&pool)
                 .await;
+
+        // The grounded investigation lives beside the raw reply rather than
+        // replacing it: `llm_analysis` keeps meaning exactly what it always
+        // did, so no reader has to tell prose and JSON apart by inspection.
+        let _ = sqlx::query("ALTER TABLE incidents ADD COLUMN investigation TEXT")
+            .execute(&pool)
+            .await;
 
         // Rows written before the column existed stored only the victim's
         // total stall, repeated against every offender. The share each was
@@ -241,19 +259,53 @@ impl IncidentStore {
         Ok(id)
     }
 
-    /// Add LLM analysis to an existing incident
-    pub async fn add_llm_analysis(&self, id: i64, analysis: String) -> Result<(), sqlx::Error> {
+    /// Records what an analysis attempt produced.
+    ///
+    /// The raw reply is stored whether or not it grounded. A reply that
+    /// claimed things the daemon never observed leaves `investigation` NULL
+    /// with the text intact, which is the only way to tell that case apart
+    /// from an analysis that never ran.
+    pub async fn add_llm_analysis(
+        &self,
+        id: i64,
+        outcome: &AnalysisOutcome,
+    ) -> Result<(), sqlx::Error> {
         let now = Utc::now().timestamp();
+        let investigation = outcome
+            .investigation
+            .as_ref()
+            .and_then(|i| serde_json::to_string(i).ok());
 
-        sqlx::query("UPDATE incidents SET llm_analysis = ?, llm_analyzed_at = ? WHERE id = ?")
-            .bind(analysis)
-            .bind(now)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE incidents SET llm_analysis = ?, llm_analyzed_at = ?, investigation = ? WHERE id = ?",
+        )
+        .bind(&outcome.raw_response)
+        .bind(now)
+        .bind(investigation)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
 
         debug!("Added LLM analysis to incident #{}", id);
         Ok(())
+    }
+
+    /// Reads back the grounded investigation for an incident.
+    ///
+    /// `Ok(None)` covers both "no analysis ran" and "the reply did not
+    /// ground"; the raw text on the incident distinguishes them.
+    pub async fn get_investigation(
+        &self,
+        id: i64,
+    ) -> Result<Option<IncidentInvestigation>, sqlx::Error> {
+        let row = sqlx::query("SELECT investigation FROM incidents WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(row
+            .and_then(|r| r.get::<Option<String>, _>(0))
+            .and_then(|json| serde_json::from_str(&json).ok()))
     }
 
     /// Insert user feedback for an insight
@@ -385,7 +437,8 @@ impl IncidentStore {
             r#"
             SELECT id, timestamp, event_type, psi_cpu, psi_memory, cpu_percent, load_avg,
                    action, target_pid, target_name, system_snapshot,
-                   llm_analysis, llm_analyzed_at, recovery_time_ms, psi_after
+                   llm_analysis, llm_analyzed_at, recovery_time_ms, psi_after,
+                   investigation
             FROM incidents WHERE id = ?
             "#,
         )
@@ -409,6 +462,7 @@ impl IncidentStore {
             llm_analyzed_at: r.get(12),
             recovery_time_ms: r.get(13),
             psi_after: r.get(14),
+            investigation: r.get(15),
         }))
     }
 
@@ -418,7 +472,8 @@ impl IncidentStore {
             r#"
             SELECT id, timestamp, event_type, psi_cpu, psi_memory, cpu_percent, load_avg,
                    action, target_pid, target_name, system_snapshot,
-                   llm_analysis, llm_analyzed_at, recovery_time_ms, psi_after
+                   llm_analysis, llm_analyzed_at, recovery_time_ms, psi_after,
+                   investigation
             FROM incidents
             ORDER BY timestamp DESC
             LIMIT ?
@@ -446,6 +501,7 @@ impl IncidentStore {
                 llm_analyzed_at: r.get(12),
                 recovery_time_ms: r.get(13),
                 psi_after: r.get(14),
+                investigation: r.get(15),
             })
             .collect())
     }
@@ -461,7 +517,8 @@ impl IncidentStore {
                 r#"
                 SELECT id, timestamp, event_type, psi_cpu, psi_memory, cpu_percent, load_avg,
                        action, target_pid, target_name, system_snapshot,
-                       llm_analysis, llm_analyzed_at, recovery_time_ms, psi_after
+                       llm_analysis, llm_analyzed_at, recovery_time_ms, psi_after,
+                   investigation
                 FROM incidents
                 WHERE timestamp >= ? AND event_type = ?
                 ORDER BY timestamp DESC
@@ -476,7 +533,8 @@ impl IncidentStore {
                 r#"
                 SELECT id, timestamp, event_type, psi_cpu, psi_memory, cpu_percent, load_avg,
                        action, target_pid, target_name, system_snapshot,
-                       llm_analysis, llm_analyzed_at, recovery_time_ms, psi_after
+                       llm_analysis, llm_analyzed_at, recovery_time_ms, psi_after,
+                   investigation
                 FROM incidents
                 WHERE timestamp >= ?
                 ORDER BY timestamp DESC
@@ -505,6 +563,7 @@ impl IncidentStore {
                 llm_analyzed_at: r.get(12),
                 recovery_time_ms: r.get(13),
                 psi_after: r.get(14),
+                investigation: r.get(15),
             })
             .collect())
     }
