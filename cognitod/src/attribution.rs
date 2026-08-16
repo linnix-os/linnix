@@ -54,9 +54,13 @@ pub enum BlameReason {
 impl BlameReason {
     /// Picks the dominant factor using the same normalisation the blame score
     /// itself uses, so the reason always names the term that contributed most.
+    ///
+    /// "The same normalisation" is enforced rather than asserted: both terms
+    /// come from the functions `calculate_blame_attributions` sums, so there is
+    /// no second copy of the arithmetic to drift out of step with the score.
     pub fn classify(cpu_share: f64, fork_count: u64, short_job_count: u64) -> Self {
-        let fork_score = (fork_count as f64 / 100.0).min(1.0);
-        let short_job_score = (short_job_count as f64 / 50.0).min(1.0);
+        let fork_score = crate::collectors::psi::fork_score(fork_count);
+        let short_job_score = crate::collectors::psi::short_job_score(short_job_count);
 
         if cpu_share >= fork_score && cpu_share >= short_job_score {
             BlameReason::HighCpuContention
@@ -654,6 +658,36 @@ mod tests {
             BlameReason::classify(0.1, 0, 100),
             BlameReason::ShortJobChurn
         );
+    }
+
+    #[test]
+    fn the_reason_names_the_largest_term_of_the_score_itself() {
+        // Checked against the very functions `calculate_blame_attributions`
+        // sums, so this fails if the reason and the score ever stop agreeing —
+        // the failure a copied normalisation constant used to allow, where an
+        // alert would name a cause the score did not actually rank first.
+        for (cpu_share, forks, short_jobs) in [
+            (0.9_f64, 10_u64, 5_u64),
+            (0.1, 200, 5),
+            (0.1, 0, 100),
+            (0.4, 50, 30),
+            (0.0, 0, 0),
+            (0.5, 50, 25),
+        ] {
+            let fork = crate::collectors::psi::fork_score(forks);
+            let short = crate::collectors::psi::short_job_score(short_jobs);
+
+            let named = match BlameReason::classify(cpu_share, forks, short_jobs) {
+                BlameReason::HighCpuContention => cpu_share,
+                BlameReason::ForkStorm => fork,
+                BlameReason::ShortJobChurn => short,
+            };
+
+            assert!(
+                named >= cpu_share && named >= fork && named >= short,
+                "cpu={cpu_share} fork={fork} short={short}: reason named the {named} term, which is not the largest"
+            );
+        }
     }
 
     #[test]

@@ -124,6 +124,30 @@ fn extract_container_id(cgroup_path: &Path) -> Option<String> {
 const HISTORY_SIZE: usize = 10;
 const STALL_THRESHOLD_US: u64 = 100_000; // 100ms threshold for significant stall
 
+/// Fork count over a detection window at which an offender is considered to be
+/// forking as hard as the score can express. Beyond this the term saturates, so
+/// a fork bomb and a very busy fork bomb rank the same on this factor alone.
+const FORK_SATURATION: f64 = 100.0;
+
+/// Same idea for short-lived jobs: churn at or above this rate contributes the
+/// full weight of the term.
+const SHORT_JOB_SATURATION: f64 = 50.0;
+
+/// The fork term of the blame score, normalised to 0.0..=1.0.
+///
+/// This lives here, next to the score it feeds, and `BlameReason::classify`
+/// calls it rather than repeating the arithmetic: the reported *reason* must
+/// name whichever term actually dominated the reported *score*, and a copied
+/// literal cannot hold that invariant across a change to either side.
+pub fn fork_score(fork_count: u64) -> f64 {
+    (fork_count as f64 / FORK_SATURATION).min(1.0)
+}
+
+/// The short-job-churn term of the blame score, normalised to 0.0..=1.0.
+pub fn short_job_score(short_job_count: u64) -> f64 {
+    (short_job_count as f64 / SHORT_JOB_SATURATION).min(1.0)
+}
+
 pub struct PsiMonitor {
     k8s_ctx: Arc<K8sContext>,
     context: Arc<ContextStore>,
@@ -414,18 +438,9 @@ pub fn calculate_blame_attributions(event: &StallEvent) -> Vec<BlameAttribution>
             let short_job_count = *event.short_job_counts.get(&key).unwrap_or(&0);
 
             // Blame Score Calculation
-            // Weighted sum of normalized factors.
-            // CPU is primary, but forks/short-jobs indicate "bad behavior"
-            // Heuristic:
-            // - CPU share is 0.0-1.0
-            // - Forks: >100/15s is high. Normalize by 100?
-            // - Short Jobs: >50/15s is high. Normalize by 50?
-
-            let fork_score = (fork_count as f64 / 100.0).min(1.0);
-            let short_job_score = (short_job_count as f64 / 50.0).min(1.0);
-
-            // Composite score
-            let raw_score = cpu_share + fork_score + short_job_score;
+            // Weighted sum of normalized factors, each 0.0-1.0.
+            // CPU is primary, but forks/short-jobs indicate "bad behavior".
+            let raw_score = cpu_share + fork_score(fork_count) + short_job_score(short_job_count);
 
             // Weight by stall magnitude (in seconds)
             let blame_score = raw_score * (event.stall_delta_us as f64 / 1_000_000.0);
