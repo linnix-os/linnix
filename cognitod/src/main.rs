@@ -850,7 +850,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let sink = Arc::new(
             cognitod::attribution::AttributionSink::new(
                 blame_metrics.clone(),
-                alert_tx.clone(),
+                alert_tx
+                    .clone()
+                    .map(|tx| cognitod::attribution::AlertOutput::new(tx, Arc::clone(&metrics))),
                 ctx.node_name.clone(),
             )
             .with_threshold_us(config.psi.attribution_threshold_ms.saturating_mul(1_000))

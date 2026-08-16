@@ -14,8 +14,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cognitod::attribution::{AttributionSink, BlameMetrics, BlameReason};
+use cognitod::attribution::{AlertOutput, AttributionSink, BlameMetrics, BlameReason};
 use cognitod::collectors::psi::{CpuConsumer, StallEvent, calculate_blame_attributions};
+use cognitod::metrics::Metrics;
 
 /// What an offender is expected to look like in the emitted output.
 struct ExpectedOffender {
@@ -186,7 +187,12 @@ fn scenarios_produce_the_expected_events_alerts_and_metrics() {
     for scenario in SCENARIOS {
         let metrics = Arc::new(BlameMetrics::new("node-1"));
         let (alert_tx, mut alert_rx) = tokio::sync::broadcast::channel(64);
-        let sink = AttributionSink::new(metrics.clone(), Some(alert_tx), "node-1");
+        let daemon_metrics = Arc::new(Metrics::new());
+        let sink = AttributionSink::new(
+            metrics.clone(),
+            Some(AlertOutput::new(alert_tx, daemon_metrics.clone())),
+            "node-1",
+        );
 
         let event = build_stall_event(scenario);
         let attributions = calculate_blame_attributions(&event);
@@ -252,6 +258,15 @@ fn scenarios_produce_the_expected_events_alerts_and_metrics() {
             alerts.len(),
             scenario.expect_reported.len(),
             "[{}] alert count did not match reported offenders",
+            scenario.name
+        );
+        // ...and each of those alerts is counted, so alert-volume monitoring
+        // built on /metrics sees attribution alerts rather than silently
+        // missing them.
+        assert_eq!(
+            daemon_metrics.alerts_emitted(),
+            alerts.len() as u64,
+            "[{}] linnix_alerts_emitted_total did not count the attribution alerts",
             scenario.name
         );
         for (alert, expected) in alerts.iter().zip(scenario.expect_reported.iter()) {
@@ -382,8 +397,13 @@ fn a_flood_of_distinct_offenders_stays_bounded() {
 fn sustained_pressure_reports_once_then_goes_quiet() {
     let metrics = Arc::new(BlameMetrics::new("node-1"));
     let (alert_tx, mut alert_rx) = tokio::sync::broadcast::channel(64);
-    let sink = AttributionSink::new(metrics.clone(), Some(alert_tx), "node-1")
-        .with_cooldown(Duration::from_secs(300));
+    let daemon_metrics = Arc::new(Metrics::new());
+    let sink = AttributionSink::new(
+        metrics.clone(),
+        Some(AlertOutput::new(alert_tx, daemon_metrics.clone())),
+        "node-1",
+    )
+    .with_cooldown(Duration::from_secs(300));
 
     let attributions = calculate_blame_attributions(&build_stall_event(&SCENARIOS[0]));
 
@@ -400,6 +420,11 @@ fn sustained_pressure_reports_once_then_goes_quiet() {
         alerts += 1;
     }
     assert_eq!(alerts, 1, "one incident should page once");
+    assert_eq!(
+        daemon_metrics.alerts_emitted(),
+        1,
+        "the suppressed repeats must not be counted either"
+    );
 
     // The counters are the continuous signal and must keep climbing while
     // reporting is suppressed, otherwise the dashboard would show the problem
@@ -414,8 +439,12 @@ fn sustained_pressure_reports_once_then_goes_quiet() {
 fn a_second_offender_is_not_silenced_by_the_first() {
     let metrics = Arc::new(BlameMetrics::new("node-1"));
     let (alert_tx, mut alert_rx) = tokio::sync::broadcast::channel(64);
-    let sink = AttributionSink::new(metrics, Some(alert_tx), "node-1")
-        .with_cooldown(Duration::from_secs(300));
+    let sink = AttributionSink::new(
+        metrics,
+        Some(AlertOutput::new(alert_tx, Arc::new(Metrics::new()))),
+        "node-1",
+    )
+    .with_cooldown(Duration::from_secs(300));
 
     // The image resizer is already being reported on.
     sink.emit(&calculate_blame_attributions(&build_stall_event(
