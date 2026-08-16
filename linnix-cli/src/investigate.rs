@@ -82,16 +82,25 @@ pub struct Investigation {
 
 /// Collapses per-window rows into one ranked entry per offender.
 pub fn summarise(attributions: &[Attribution]) -> Investigation {
-    // One window reports the same victim total on each of its offender rows;
-    // de-duplicating by timestamp is what keeps the victim's stall honest.
-    let mut victim_windows: HashMap<u64, u64> = HashMap::new();
+    // One window reports the same victim total on each of its offender rows,
+    // so the rows of an event have to collapse to one figure.
+    //
+    // The key is (timestamp, stall_us), not the timestamp alone. Timestamps
+    // have one-second resolution and a victim's containers are scanned
+    // separately, so one pod can produce two distinct events within a second.
+    // Keying on time alone drops one of them, and the attributed total then
+    // exceeds the victim total it is meant to be a share of. `stall_us` is a
+    // microsecond delta, so it separates them — the same key the store's own
+    // backfill groups on. Two events identical in both fields still collapse;
+    // telling those apart needs an event id the daemon does not yet emit.
+    let mut victim_windows: HashSet<(u64, u64)> = HashSet::new();
     for attr in attributions {
-        victim_windows.insert(attr.timestamp, attr.stall_us);
+        victim_windows.insert((attr.timestamp, attr.stall_us));
     }
-    let victim_stall_us: u64 = victim_windows.values().sum();
+    let victim_stall_us: u64 = victim_windows.iter().map(|(_, stall)| stall).sum();
 
     let mut by_offender: HashMap<(String, String), OffenderSummary> = HashMap::new();
-    let mut seen_windows: HashMap<(String, String), HashSet<u64>> = HashMap::new();
+    let mut seen_windows: HashMap<(String, String), HashSet<(u64, u64)>> = HashMap::new();
     // Tracks which window currently justifies each offender's reported reason,
     // so the reason shown is the one from its worst window rather than
     // whichever row happened to sort last.
@@ -134,7 +143,10 @@ pub fn summarise(attributions: &[Attribution]) -> Investigation {
             entry.reason = attr.reason.clone();
         }
 
-        seen_windows.entry(key).or_default().insert(attr.timestamp);
+        seen_windows
+            .entry(key)
+            .or_default()
+            .insert((attr.timestamp, attr.stall_us));
     }
 
     for (key, windows) in seen_windows {
@@ -428,6 +440,31 @@ mod tests {
         let out = summarise(&rows);
         assert_eq!(out.victim_stall_us, 1_000_000);
         assert_eq!(out.windows, 1);
+    }
+
+    #[test]
+    fn two_events_in_one_second_are_not_collapsed() {
+        // Attribution timestamps have one-second resolution and a victim's
+        // containers are scanned separately, so one pod can produce two events
+        // within a second. Keying the victim's stall on the timestamp alone
+        // drops one of them, and the attributed total then exceeds the victim
+        // total it is supposed to be a share of. The store's own backfill
+        // separates these events on (timestamp, stall_us) for this reason.
+        let rows = vec![
+            attr("resizer", 100, Some(500_000), 500_000),
+            attr("etl", 100, Some(900_000), 900_000),
+        ];
+        let out = summarise(&rows);
+
+        assert_eq!(out.victim_stall_us, 1_400_000);
+        assert_eq!(out.windows, 2);
+
+        let attributed: u64 = out.offenders.iter().map(|o| o.attributed_stall_us).sum();
+        assert!(
+            attributed <= out.victim_stall_us,
+            "attributed {attributed} exceeds the victim's {} total",
+            out.victim_stall_us
+        );
     }
 
     #[test]

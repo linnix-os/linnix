@@ -130,6 +130,45 @@ impl IncidentInvestigation {
         self.hypotheses.is_empty()
     }
 
+    /// One line naming what was discarded and why, or `None` if nothing was.
+    ///
+    /// The two discard reasons are different failures and are counted apart. A
+    /// hypothesis citing nothing is an unsupported assertion; one citing a fact
+    /// that was never supplied invented its evidence, which says considerably
+    /// more about the rest of the reply. A single catch-all wording would
+    /// misreport whichever case it did not describe.
+    fn discard_summary(&self) -> Option<String> {
+        if self.discarded.is_empty() {
+            return None;
+        }
+
+        let fabricated = self
+            .discarded
+            .iter()
+            .filter(|d| matches!(d.reason, DiscardReason::UnknownFactIds { .. }))
+            .count();
+        let unsupported = self.discarded.len() - fabricated;
+
+        let mut causes = Vec::new();
+        if fabricated > 0 {
+            causes.push(format!("{fabricated} cited evidence that was not supplied"));
+        }
+        if unsupported > 0 {
+            causes.push(format!("{unsupported} cited no evidence at all"));
+        }
+
+        Some(format!(
+            "{} {} discarded: {}.\n",
+            self.discarded.len(),
+            if self.discarded.len() == 1 {
+                "hypothesis"
+            } else {
+                "hypotheses"
+            },
+            causes.join(", ")
+        ))
+    }
+
     /// Renders the investigation for a human, resolving every citation through
     /// the daemon's own text rather than anything the model wrote.
     pub fn render(&self) -> String {
@@ -137,16 +176,8 @@ impl IncidentInvestigation {
 
         if self.hypotheses.is_empty() {
             out.push_str("No grounded hypothesis for this incident.\n");
-            if !self.discarded.is_empty() {
-                out.push_str(&format!(
-                    "{} proposed hypothes{} discarded for citing evidence that was not supplied.\n",
-                    self.discarded.len(),
-                    if self.discarded.len() == 1 {
-                        "is was"
-                    } else {
-                        "es were"
-                    }
-                ));
+            if let Some(summary) = self.discard_summary() {
+                out.push_str(&summary);
             }
             return out;
         }
@@ -180,16 +211,8 @@ impl IncidentInvestigation {
             out.push('\n');
         }
 
-        if !self.discarded.is_empty() {
-            out.push_str(&format!(
-                "{} hypothes{} discarded: cited evidence that was not supplied.\n",
-                self.discarded.len(),
-                if self.discarded.len() == 1 {
-                    "is"
-                } else {
-                    "es"
-                }
-            ));
+        if let Some(summary) = self.discard_summary() {
+            out.push_str(&summary);
         }
 
         out
@@ -416,6 +439,42 @@ mod tests {
         let report = out.render();
         assert!(report.contains("No grounded hypothesis"));
         assert!(!report.contains("Invented"));
+    }
+
+    #[test]
+    fn the_report_names_the_discard_reason_it_actually_recorded() {
+        // A hypothesis that cited nothing did not invent evidence, and saying
+        // it did misdescribes both the model's failure and its severity.
+        let out = ground(
+            proposed(
+                r#"{"hypotheses":[{"reason_code":"oom_risk","statement":"Probably memory",
+                   "supporting_fact_ids":[]}]}"#,
+            ),
+            facts(),
+        );
+
+        let report = out.render();
+        assert!(report.contains("cited no evidence at all"));
+        assert!(!report.contains("not supplied"));
+    }
+
+    #[test]
+    fn mixed_discard_reasons_are_counted_apart() {
+        let out = ground(
+            proposed(
+                r#"{"hypotheses":[
+                   {"reason_code":"cpu_spin","statement":"Sound","supporting_fact_ids":["f1"]},
+                   {"reason_code":"fork_storm","statement":"Invented","supporting_fact_ids":["f7"]},
+                   {"reason_code":"oom_risk","statement":"Bare assertion","supporting_fact_ids":[]}]}"#,
+            ),
+            facts(),
+        );
+
+        assert_eq!(out.hypotheses.len(), 1);
+        let report = out.render();
+        assert!(report.contains("2 hypotheses discarded"));
+        assert!(report.contains("1 cited evidence that was not supplied"));
+        assert!(report.contains("1 cited no evidence at all"));
     }
 
     #[test]
