@@ -13,7 +13,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
 use std::path::Path;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Represents a circuit breaker incident or system event
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,7 +293,10 @@ impl IncidentStore {
     /// Reads back the grounded investigation for an incident.
     ///
     /// `Ok(None)` covers both "no analysis ran" and "the reply did not
-    /// ground"; the raw text on the incident distinguishes them.
+    /// ground"; the raw text on the incident distinguishes them. A stored
+    /// value that cannot be read back is a third case and warns rather than
+    /// passing silently as either — it cannot happen today, and will the first
+    /// time [`investigation::SCHEMA_VERSION`] moves.
     pub async fn get_investigation(
         &self,
         id: i64,
@@ -303,9 +306,26 @@ impl IncidentStore {
             .fetch_optional(&self.pool)
             .await?;
 
-        Ok(row
-            .and_then(|r| r.get::<Option<String>, _>(0))
-            .and_then(|json| serde_json::from_str(&json).ok()))
+        let Some(json) = row.and_then(|r| r.get::<Option<String>, _>(0)) else {
+            return Ok(None);
+        };
+
+        match serde_json::from_str::<IncidentInvestigation>(&json) {
+            Ok(found) if found.schema_version > investigation::SCHEMA_VERSION => {
+                warn!(
+                    "Incident #{} holds a v{} investigation; this build reads v{}",
+                    id,
+                    found.schema_version,
+                    investigation::SCHEMA_VERSION
+                );
+                Ok(None)
+            }
+            Ok(found) => Ok(Some(found)),
+            Err(e) => {
+                warn!("Incident #{} holds an unreadable investigation: {}", id, e);
+                Ok(None)
+            }
+        }
     }
 
     /// Insert user feedback for an insight

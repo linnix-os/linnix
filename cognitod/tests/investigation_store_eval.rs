@@ -193,6 +193,39 @@ async fn an_old_database_gains_the_column_and_keeps_its_rows_readable() {
 }
 
 #[tokio::test]
+async fn an_unreadable_stored_investigation_does_not_pass_as_absent() {
+    // Reachable the first time the stored shape changes. Returning it as a
+    // plain "no investigation" would read as an analysis that never ran, with
+    // the raw reply sitting right there looking like an ungrounded one.
+    let (_dir, store) = store().await;
+    let id = store.insert(&incident()).await.unwrap();
+
+    let outcome = AnalysisOutcome {
+        raw_response: "{}".to_string(),
+        investigation: None,
+        parse_error: None,
+    };
+    store.add_llm_analysis(id, &outcome).await.unwrap();
+
+    let pool = SqlitePoolOptions::new()
+        .connect(&format!(
+            "sqlite://{}",
+            _dir.path().join("incidents.db").display()
+        ))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE incidents SET investigation = ? WHERE id = ?")
+        .bind(r#"{"schema_version":99,"facts":[],"hypotheses":[],"discarded":[]}"#)
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    assert!(store.get_investigation(id).await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn an_unanalysed_incident_has_no_investigation() {
     let (_dir, store) = store().await;
     let id = store.insert(&incident()).await.unwrap();

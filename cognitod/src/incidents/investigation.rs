@@ -59,9 +59,14 @@ pub struct ProposedHypothesis {
 
 /// The model's raw reply. Only ever an intermediate: [`ground`] turns it into
 /// an [`IncidentInvestigation`], and nothing else should consume it.
+///
+/// `hypotheses` is deliberately required. Defaulting it would make every JSON
+/// object a valid reply — `{"error": "..."}`, or a model still answering in
+/// the old summary format — and each would ground into an empty investigation
+/// that reads as "hypotheses were proposed and none held up" rather than "the
+/// question was never answered".
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProposedInvestigation {
-    #[serde(default)]
     pub hypotheses: Vec<ProposedHypothesis>,
 }
 
@@ -428,6 +433,29 @@ mod tests {
         // endpoint as a quiet all-clear.
         assert!(parse_and_ground("the model was unavailable", facts()).is_err());
         assert!(parse_and_ground("{ not json }", facts()).is_err());
+
+        // Well-formed JSON that never answers the question. A refusal, and a
+        // model still replying in the pre-grounding summary format — the
+        // likeliest regression of the two, since a stale endpoint produces it
+        // on every incident.
+        assert!(parse_and_ground(r#"{"error":"I cannot help with that"}"#, facts()).is_err());
+        assert!(
+            parse_and_ground(
+                r#"{"reason_code":"fork_storm","summary":"high CPU","confidence":0.9}"#,
+                facts(),
+            )
+            .is_err()
+        );
+        assert!(parse_and_ground("{}", facts()).is_err());
+    }
+
+    #[test]
+    fn an_explicitly_empty_hypothesis_list_is_a_valid_answer() {
+        // Distinct from the cases above: the model addressed the schema and
+        // had nothing to propose. That is a result, not a failure to reply.
+        let out = parse_and_ground(r#"{"hypotheses":[]}"#, facts()).expect("valid reply");
+        assert!(out.is_empty());
+        assert!(out.discarded.is_empty());
     }
 
     #[test]
