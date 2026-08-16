@@ -6,7 +6,6 @@ edition = "2024"
 description = "eBPF-powered Linux observability platform with AI incident detection"
 
 [dependencies]
-bindgen = "0.71.1"
 reqwest = { version = "0.12.15", features = ["json"] }
 # ✅ Axum and dependencies
 axum = {version = "0.8.3", features =["macros"]}
