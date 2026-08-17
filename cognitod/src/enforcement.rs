@@ -40,14 +40,15 @@ pub struct EnforcementAction {
     pub status: ActionStatus,
     pub created_at: u64,
     pub expires_at: u64,
-    /// When the executor actually carried the action out.
+    /// When the executor actually carried the action out, in epoch
+    /// milliseconds.
     ///
     /// Recovery has to be timed from the kill, not from whenever the watcher
     /// got around to noticing it: the insert and the polling gap in between
     /// would otherwise be silently dropped, and pressure that had already
     /// fallen would be stored as a 0ms recovery.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub executed_at: Option<u64>,
+    pub executed_at_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approved_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -55,6 +56,8 @@ pub struct EnforcementAction {
 }
 
 pub struct EnforcementQueue {
+    /// Count of actions that have actually executed, for detecting overlap.
+    executions: AtomicU64,
     next_id: AtomicU64,
     actions: RwLock<HashMap<String, EnforcementAction>>,
     ttl_secs: u64,
@@ -63,6 +66,7 @@ pub struct EnforcementQueue {
 impl EnforcementQueue {
     pub fn new(ttl_secs: u64) -> Self {
         Self {
+            executions: AtomicU64::new(0),
             next_id: AtomicU64::new(1),
             actions: RwLock::new(HashMap::new()),
             ttl_secs,
@@ -133,7 +137,7 @@ impl EnforcementQueue {
             status,
             created_at: now,
             expires_at: now + self.ttl_secs,
-            executed_at: None,
+            executed_at_ms: None,
             approved_by: approved_by.clone(),
             approved_at,
         };
@@ -205,7 +209,12 @@ impl EnforcementQueue {
         }
 
         action.status = ActionStatus::Executed;
-        action.executed_at = Some(current_epoch_secs());
+        action.executed_at_ms = Some(current_epoch_millis());
+        // Every execution bumps this. A recovery watch samples system-wide
+        // pressure, so a *later* kill landing mid-watch invalidates the
+        // measurement in progress — the earlier action would otherwise be
+        // credited with a fall the second kill caused.
+        self.executions.fetch_add(1, Ordering::SeqCst);
         log::info!("[enforcement] completed {id}");
         Ok(())
     }
@@ -227,6 +236,12 @@ impl EnforcementQueue {
         action.status = ActionStatus::Failed;
         log::warn!("[enforcement] {id} failed: {why}");
         Ok(())
+    }
+
+    /// How many actions have executed so far. A change during a recovery
+    /// watch means another intervention overlapped it.
+    pub fn execution_count(&self) -> u64 {
+        self.executions.load(Ordering::SeqCst)
     }
 
     pub async fn get_pending(&self) -> Vec<EnforcementAction> {
@@ -253,6 +268,13 @@ impl EnforcementQueue {
     pub async fn get_all(&self) -> Vec<EnforcementAction> {
         self.actions.read().await.values().cloned().collect()
     }
+}
+
+fn current_epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn current_epoch_secs() -> u64 {

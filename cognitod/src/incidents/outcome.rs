@@ -17,8 +17,6 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use tokio::sync::Semaphore;
-
 use crate::enforcement::{ActionStatus, EnforcementQueue};
 
 /// How long to watch, and what counts as recovered.
@@ -77,9 +75,14 @@ pub struct RecoveryOutcome {
 /// `sample` is called rather than reading `/proc` directly so the caller
 /// chooses what pressure means for this incident — and so this is testable
 /// without a stalling machine.
-pub async fn observe_recovery<S>(mut sample: S, watch: RecoveryWatch) -> RecoveryOutcome
+pub async fn observe_recovery<S, I>(
+    mut sample: S,
+    mut invalidated: I,
+    watch: RecoveryWatch,
+) -> RecoveryOutcome
 where
     S: FnMut() -> Option<f32>,
+    I: FnMut() -> bool,
 {
     let started = Instant::now();
     let mut last = sample();
@@ -95,6 +98,18 @@ where
 
     loop {
         tokio::time::sleep(watch.poll_interval).await;
+
+        // Another intervention landed while this one was being measured. Both
+        // watches read the same system-wide pressure, so whatever happens next
+        // cannot be attributed to this action — and crediting it anyway is how
+        // a second kill's success gets recorded against the first.
+        if invalidated() {
+            return RecoveryOutcome {
+                psi_after: None,
+                recovery_time_ms: None,
+            };
+        }
+
         // A failed read leaves the previous reading standing rather than
         // overwriting it with an absence: the last thing actually observed is
         // better evidence than nothing, and a transient unreadable /proc must
@@ -154,7 +169,9 @@ pub async fn await_execution(
         let action = queue.get_by_id(action_id).await?;
 
         match action.status {
-            ActionStatus::Executed => return Some(action.executed_at.unwrap_or_else(epoch_secs)),
+            ActionStatus::Executed => {
+                return Some(action.executed_at_ms.unwrap_or_else(epoch_millis));
+            }
             ActionStatus::Rejected | ActionStatus::Expired | ActionStatus::Failed => return None,
             ActionStatus::Pending => {
                 // While pending, the action's own approval lifetime is the
@@ -207,10 +224,10 @@ pub async fn await_execution(
 /// waiting forever.
 const EXECUTION_GRACE: Duration = Duration::from_secs(60);
 
-fn epoch_secs() -> u64 {
+fn epoch_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 
@@ -227,37 +244,50 @@ fn epoch_secs() -> u64 {
 pub async fn verify_action_outcome<S>(
     queue: &Arc<EnforcementQueue>,
     action_id: &str,
-    slot: &Arc<Semaphore>,
     sample: S,
     watch: RecoveryWatch,
 ) -> Option<RecoveryOutcome>
 where
     S: FnMut() -> Option<f32>,
 {
-    let executed_at = await_execution(queue, action_id, watch.poll_interval).await?;
+    let executed_at_ms = await_execution(queue, action_id, watch.poll_interval).await?;
 
-    // Only one action is verified at a time. The sampler reads *system-wide*
-    // pressure, so two overlapping watches would both credit themselves with
-    // the same fall — and a second kill during a sustained incident is exactly
-    // when that happens. A verification that cannot be attributed to one
-    // action is worth less than no verification, so the loser records nothing.
-    let Ok(_slot) = slot.try_acquire() else {
+    // Measured *before* observing, not after. Computing it afterwards folds
+    // the watch's own duration into the delay and then adds the watch again —
+    // a three-second recovery reported as six.
+    let pre_watch_delay = Duration::from_millis(epoch_millis().saturating_sub(executed_at_ms));
+
+    // The window is 120 seconds after the *kill*, so whatever the insert and
+    // the polling already consumed comes out of it. Otherwise a fall three
+    // minutes after the action could still be recorded as its recovery.
+    let remaining = watch.max_wait.checked_sub(pre_watch_delay)?;
+    if remaining.is_zero() {
         return None;
-    };
+    }
 
-    let outcome = observe_recovery(sample, watch).await;
+    // Any execution after this one invalidates the measurement: two watches
+    // reading system-wide pressure cannot both own the same fall.
+    let executions_at_start = queue.execution_count();
+    let queue_for_check = Arc::clone(queue);
+
+    let outcome = observe_recovery(
+        sample,
+        move || queue_for_check.execution_count() != executions_at_start,
+        RecoveryWatch {
+            max_wait: remaining,
+            ..watch
+        },
+    )
+    .await;
+
     if !outcome.is_measured() {
         return None;
     }
 
-    // Timed from the kill, not from when this watch started: the insert and
-    // the polling gap in between are real delay, and dropping them stores an
-    // already-recovered system as a 0ms recovery.
-    let since_execution_ms = epoch_secs().saturating_sub(executed_at) * 1_000;
     Some(RecoveryOutcome {
         recovery_time_ms: outcome
             .recovery_time_ms
-            .map(|ms| ms + since_execution_ms as i64),
+            .map(|ms| ms + pre_watch_delay.as_millis() as i64),
         ..outcome
     })
 }
@@ -289,6 +319,7 @@ mod tests {
         // Still bad for two polls, recovered on the third.
         let outcome = observe_recovery(
             readings(&[Some(80.0), Some(70.0), Some(60.0), Some(5.0)]),
+            || false,
             RecoveryWatch {
                 poll_interval: Duration::from_secs(1),
                 max_wait: Duration::from_secs(60),
@@ -305,6 +336,7 @@ mod tests {
     async fn pressure_that_never_falls_records_the_reading_and_no_recovery() {
         let outcome = observe_recovery(
             readings(&[Some(80.0)]),
+            || false,
             RecoveryWatch {
                 poll_interval: Duration::from_secs(1),
                 max_wait: Duration::from_secs(5),
@@ -324,6 +356,7 @@ mod tests {
     async fn an_immediate_recovery_is_not_rounded_up_to_a_poll() {
         let outcome = observe_recovery(
             readings(&[Some(2.0)]),
+            || false,
             RecoveryWatch {
                 poll_interval: Duration::from_secs(30),
                 max_wait: Duration::from_secs(120),
@@ -343,6 +376,7 @@ mod tests {
         // never happened — the most flattering possible lie.
         let outcome = observe_recovery(
             readings(&[None]),
+            || false,
             RecoveryWatch {
                 poll_interval: Duration::from_secs(1),
                 max_wait: Duration::from_secs(5),
@@ -365,6 +399,7 @@ mod tests {
         // discard what was already observed.
         let outcome = observe_recovery(
             readings(&[Some(80.0), None, Some(70.0), Some(4.0)]),
+            || false,
             RecoveryWatch {
                 poll_interval: Duration::from_secs(1),
                 max_wait: Duration::from_secs(60),
@@ -460,7 +495,6 @@ mod tests {
         let outcome = verify_action_outcome(
             &queue,
             &id,
-            &Arc::new(Semaphore::new(1)),
             || Some(0.0),
             RecoveryWatch {
                 poll_interval: Duration::from_secs(1),
@@ -615,7 +649,6 @@ mod tests {
         let outcome = verify_action_outcome(
             &queue,
             &id,
-            &Arc::new(Semaphore::new(1)),
             || Some(1.0),
             RecoveryWatch {
                 poll_interval: Duration::from_secs(1),
@@ -632,15 +665,36 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_second_overlapping_verification_records_nothing() {
+    async fn an_overlapping_execution_invalidates_the_measurement() {
         use crate::enforcement::{ActionType, EnforcementQueue};
 
         let queue = Arc::new(EnforcementQueue::new(60));
-        let slot = Arc::new(Semaphore::new(1));
+        let propose = |queue: Arc<EnforcementQueue>| async move {
+            queue
+                .propose_auto(
+                    ActionType::KillProcess {
+                        pid: UNUSED_PID,
+                        signal: 9,
+                    },
+                    "test".to_string(),
+                    "circuit_breaker".to_string(),
+                    None,
+                    true,
+                )
+                .await
+                .unwrap()
+        };
 
-        let mut ids = Vec::new();
-        for _ in 0..2 {
-            let id = queue
+        let first = propose(Arc::clone(&queue)).await;
+        queue.complete(&first).await.unwrap();
+
+        // A second kill lands while the first is still being watched. Both
+        // read the same system-wide pressure, so the fall that follows cannot
+        // be attributed to the first action.
+        let interferer = Arc::clone(&queue);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let second = interferer
                 .propose_auto(
                     ActionType::KillProcess {
                         pid: UNUSED_PID,
@@ -653,34 +707,35 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            queue.complete(&id).await.unwrap();
-            ids.push(id);
-        }
+            interferer.complete(&second).await.unwrap();
+        });
 
-        let watch = RecoveryWatch {
-            poll_interval: Duration::from_secs(1),
-            max_wait: Duration::from_secs(10),
-            recovered_below: 10.0,
-        };
-
-        // Both kills happened; both watches would see the same system-wide
-        // pressure fall and each claim it. Only one may record an outcome.
-        let (first, second) = tokio::join!(
-            verify_action_outcome(&queue, &ids[0], &slot, || Some(50.0), watch),
-            verify_action_outcome(&queue, &ids[1], &slot, || Some(50.0), watch),
-        );
+        let outcome = verify_action_outcome(
+            &queue,
+            &first,
+            || Some(50.0), // never recovers on its own
+            RecoveryWatch {
+                poll_interval: Duration::from_secs(1),
+                max_wait: Duration::from_secs(30),
+                recovered_below: 10.0,
+            },
+        )
+        .await;
 
         assert!(
-            first.is_some() ^ second.is_some(),
-            "exactly one overlapping verification may record an outcome"
+            outcome.is_none(),
+            "a measurement overlapped by another kill must record nothing"
         );
     }
 
-    /// Real time on purpose: `executed_at` is a wall-clock stamp, so a paused
-    /// clock would advance the sleeps and not the stamp, and the test would
-    /// pass for the wrong reason. Kept to one second for that reason.
+    /// Real time on purpose: `executed_at_ms` is a wall-clock stamp, so a
+    /// paused clock would advance the sleeps and not the stamp, and the test
+    /// would pass without testing anything. Kept to ~1.6s for that reason.
+    ///
+    /// The watch itself must take measurable time here: with an instant
+    /// recovery, counting the observation twice adds nothing and the bug hides.
     #[tokio::test]
-    async fn recovery_is_timed_from_the_kill_not_from_the_watch() {
+    async fn recovery_is_timed_from_the_kill_and_counted_once() {
         use crate::enforcement::{ActionType, EnforcementQueue};
 
         let queue = Arc::new(EnforcementQueue::new(60));
@@ -699,30 +754,41 @@ mod tests {
             .unwrap();
         queue.complete(&id).await.unwrap();
 
-        // Time passes between the kill and the watch — the incident insert,
-        // the executor poll. Pressure is already fine by the time we look.
-        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        // The incident insert and the executor poll: real delay before anyone
+        // starts watching.
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
 
+        // Still stalling for two polls, then recovered: the watch spans ~600ms.
+        let mut polls = 0;
         let outcome = verify_action_outcome(
             &queue,
             &id,
-            &Arc::new(Semaphore::new(1)),
-            || Some(1.0),
+            move || {
+                polls += 1;
+                Some(if polls > 2 { 1.0 } else { 90.0 })
+            },
             RecoveryWatch {
-                poll_interval: Duration::from_secs(1),
-                max_wait: Duration::from_secs(10),
+                poll_interval: Duration::from_millis(300),
+                max_wait: Duration::from_secs(30),
                 recovered_below: 10.0,
             },
         )
         .await
         .expect("an executed action with readable pressure is measured");
 
-        // Storing 0ms would claim the kill worked instantly, when in truth
-        // nobody looked for half a minute.
+        let reported = outcome.recovery_time_ms.unwrap();
+
+        // ~1000ms of pre-watch delay plus ~600ms of watching.
         assert!(
-            outcome.recovery_time_ms.unwrap() >= 1_000,
-            "recovery must be timed from the kill, got {:?}",
-            outcome.recovery_time_ms
+            reported >= 1_500,
+            "recovery must be timed from the kill, got {reported}ms"
+        );
+
+        // The half that catches double counting: measuring the delay *after*
+        // observing folds the watch in twice, which lands near 2200ms.
+        assert!(
+            reported < 2_000,
+            "the observation interval must not be counted twice, got {reported}ms"
         );
     }
 
@@ -749,7 +815,6 @@ mod tests {
         let outcome = verify_action_outcome(
             &queue,
             &id,
-            &Arc::new(Semaphore::new(1)),
             || Some(2.0),
             RecoveryWatch {
                 poll_interval: Duration::from_secs(1),
@@ -788,7 +853,6 @@ mod tests {
             verify_action_outcome(
                 &queue,
                 &id,
-                &Arc::new(Semaphore::new(1)),
                 || None,
                 RecoveryWatch {
                     poll_interval: Duration::from_secs(1),
@@ -835,6 +899,7 @@ mod tests {
         // on it is no longer breaching.
         let outcome = observe_recovery(
             readings(&[Some(80.0), Some(10.0)]),
+            || false,
             RecoveryWatch {
                 poll_interval: Duration::from_secs(1),
                 max_wait: Duration::from_secs(60),

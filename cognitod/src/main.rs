@@ -975,11 +975,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let queue_clone = Arc::clone(queue);
         let incident_store_clone = incident_store.clone();
         let incident_analyzer_clone = incident_analyzer.clone();
-        // One verification at a time. The watcher reads system-wide pressure,
-        // so overlapping watches would each credit themselves with the same
-        // fall — and a second kill during a sustained incident is exactly when
-        // that happens.
-        let verification_slot = Arc::new(tokio::sync::Semaphore::new(1));
 
         tokio::spawn(async move {
             if !cb_cfg.enabled {
@@ -1095,7 +1090,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                             let analyzer_clone = incident_analyzer_clone.clone();
                                             let psi_threshold = cb_cfg.cpu_psi_threshold;
                                             let watch_queue = Arc::clone(&queue_clone);
-                                            let watch_slot = Arc::clone(&verification_slot);
                                             let watch_action_id = action_id.clone();
                                             tokio::spawn(async move {
                                                 if let Ok(id) = store_clone.insert(&incident).await
@@ -1111,7 +1105,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                     // whether or not a model is configured.
                                                     let outcome_store = Arc::clone(&store_clone);
                                                     let outcome_queue = Arc::clone(&watch_queue);
-                                                    let outcome_slot = Arc::clone(&watch_slot);
                                                     tokio::spawn(async move {
                                                         // Ordering — wait for execution, then
                                                         // measure — lives in one tested function
@@ -1119,7 +1112,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                         let Some(outcome) = cognitod::incidents::outcome::verify_action_outcome(
                                                             &outcome_queue,
                                                             &watch_action_id,
-                                                            &outcome_slot,
                                                             || {
                                                                 // Not `PsiMetrics::read`: that
                                                                 // degrades to zeros when
