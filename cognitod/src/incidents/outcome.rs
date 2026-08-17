@@ -158,6 +158,33 @@ pub async fn await_execution(
     }
 }
 
+/// The whole verification, in the order it has to happen: wait for the action
+/// to run, then measure.
+///
+/// Exists as one function so the ordering is testable. Split across the call
+/// site it is just a convention, and a convention that "measure only after the
+/// action executed" is exactly the kind that silently stops holding.
+///
+/// `None` means there is nothing to record: either the action never ran, or
+/// pressure could never be read. Both are honestly represented by leaving the
+/// incident's outcome columns NULL.
+pub async fn verify_action_outcome<S>(
+    queue: &Arc<EnforcementQueue>,
+    action_id: &str,
+    sample: S,
+    watch: RecoveryWatch,
+) -> Option<RecoveryOutcome>
+where
+    S: FnMut() -> Option<f32>,
+{
+    if !await_execution(queue, action_id, watch.max_wait, watch.poll_interval).await {
+        return None;
+    }
+
+    let outcome = observe_recovery(sample, watch).await;
+    outcome.is_measured().then_some(outcome)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,6 +350,120 @@ mod tests {
             )
             .await,
             "a rejected action is a decision, not something to keep waiting on"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_action_is_never_measured_however_calm_the_machine_gets() {
+        use crate::enforcement::{ActionType, EnforcementQueue};
+
+        let queue = Arc::new(EnforcementQueue::new(3_600));
+        let id = queue
+            .propose_auto(
+                ActionType::KillProcess {
+                    pid: 1234,
+                    signal: 9,
+                },
+                "test".to_string(),
+                "circuit_breaker".to_string(),
+                None,
+                false, // the default: awaiting a human
+            )
+            .await
+            .unwrap();
+
+        // Pressure is perfect throughout. Measuring here would credit the
+        // pending kill with a recovery that happened on its own — the failure
+        // the ordering exists to prevent.
+        let outcome = verify_action_outcome(
+            &queue,
+            &id,
+            || Some(0.0),
+            RecoveryWatch {
+                poll_interval: Duration::from_secs(1),
+                max_wait: Duration::from_secs(5),
+                recovered_below: 10.0,
+            },
+        )
+        .await;
+
+        assert!(
+            outcome.is_none(),
+            "an action that never ran must produce no verification at all"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_executed_action_is_measured() {
+        use crate::enforcement::{ActionType, EnforcementQueue};
+
+        let queue = Arc::new(EnforcementQueue::new(3_600));
+        let id = queue
+            .propose_auto(
+                ActionType::KillProcess {
+                    pid: 1234,
+                    signal: 9,
+                },
+                "test".to_string(),
+                "circuit_breaker".to_string(),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        queue.complete(&id).await.unwrap();
+
+        let outcome = verify_action_outcome(
+            &queue,
+            &id,
+            || Some(2.0),
+            RecoveryWatch {
+                poll_interval: Duration::from_secs(1),
+                max_wait: Duration::from_secs(5),
+                recovered_below: 10.0,
+            },
+        )
+        .await
+        .expect("an executed action is measured");
+
+        assert_eq!(outcome.recovery_time_ms, Some(0));
+        assert_eq!(outcome.psi_after, Some(2.0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_executed_action_with_unreadable_pressure_records_nothing() {
+        use crate::enforcement::{ActionType, EnforcementQueue};
+
+        let queue = Arc::new(EnforcementQueue::new(3_600));
+        let id = queue
+            .propose_auto(
+                ActionType::KillProcess {
+                    pid: 1234,
+                    signal: 9,
+                },
+                "test".to_string(),
+                "circuit_breaker".to_string(),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        queue.complete(&id).await.unwrap();
+
+        assert!(
+            verify_action_outcome(
+                &queue,
+                &id,
+                || None,
+                RecoveryWatch {
+                    poll_interval: Duration::from_secs(1),
+                    max_wait: Duration::from_secs(3),
+                    recovered_below: 10.0,
+                },
+            )
+            .await
+            .is_none(),
+            "nothing observed means nothing to write"
         );
     }
 

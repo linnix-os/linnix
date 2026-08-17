@@ -1106,29 +1106,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                     let outcome_store = Arc::clone(&store_clone);
                                                     let outcome_queue = Arc::clone(&watch_queue);
                                                     tokio::spawn(async move {
-                                                        // Nothing to verify until the action has
-                                                        // actually run. In monitor mode, and
-                                                        // whenever human approval is required —
-                                                        // both defaults — the proposal sits
-                                                        // pending, and timing a recovery against
-                                                        // it would credit the kill for pressure
-                                                        // that fell on its own.
-                                                        if !cognitod::incidents::outcome::await_execution(
+                                                        // Ordering — wait for execution, then
+                                                        // measure — lives in one tested function
+                                                        // rather than being a convention here.
+                                                        let Some(outcome) = cognitod::incidents::outcome::verify_action_outcome(
                                                             &outcome_queue,
                                                             &watch_action_id,
-                                                            cognitod::incidents::outcome::RecoveryWatch::DEFAULT_MAX_WAIT,
-                                                            cognitod::incidents::outcome::RecoveryWatch::DEFAULT_POLL,
-                                                        )
-                                                        .await
-                                                        {
-                                                            info!(
-                                                                "[circuit_breaker] Incident #{} action never executed; outcome left unmeasured",
-                                                                id
-                                                            );
-                                                            return;
-                                                        }
-
-                                                        let outcome = cognitod::incidents::outcome::observe_recovery(
                                                             || {
                                                                 // A failed read is not a low
                                                                 // reading: PsiMetrics yields zeros
@@ -1143,15 +1126,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                                 psi_threshold,
                                                             ),
                                                         )
-                                                        .await;
-
-                                                        if !outcome.is_measured() {
-                                                            warn!(
-                                                                "[circuit_breaker] Incident #{} outcome left unmeasured: pressure could not be read",
+                                                        .await
+                                                        else {
+                                                            info!(
+                                                                "[circuit_breaker] Incident #{} left unverified: the action did not run, or pressure could not be read",
                                                                 id
                                                             );
                                                             return;
-                                                        }
+                                                        };
 
                                                         match (
                                                             outcome.recovery_time_ms,
