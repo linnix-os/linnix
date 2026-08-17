@@ -20,6 +20,13 @@ pub enum ActionStatus {
     Rejected,
     Expired,
     Executed,
+    /// The executor tried and the syscall failed — the process was already
+    /// gone, or the signal was refused.
+    ///
+    /// Distinct from `Rejected`, which is an operator's decision, and terminal
+    /// so the executor does not retry: a pid that has exited can be reused,
+    /// and retrying would eventually kill an unrelated process.
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -194,6 +201,24 @@ impl EnforcementQueue {
     }
 
     #[allow(dead_code)]
+    /// Marks an action the executor could not carry out.
+    ///
+    /// Valid from `Approved`, which is the state an action is in while the
+    /// executor is working on it — `reject` is the operator's path and only
+    /// applies to pending proposals.
+    pub async fn fail(&self, id: &str, why: String) -> Result<(), String> {
+        let mut actions = self.actions.write().await;
+        let action = actions.get_mut(id).ok_or("action not found")?;
+
+        if action.status != ActionStatus::Approved {
+            return Err(format!("not approved: {:?}", action.status));
+        }
+
+        action.status = ActionStatus::Failed;
+        log::warn!("[enforcement] {id} failed: {why}");
+        Ok(())
+    }
+
     pub async fn get_pending(&self) -> Vec<EnforcementAction> {
         let now = current_epoch_secs();
         let mut actions = self.actions.write().await;

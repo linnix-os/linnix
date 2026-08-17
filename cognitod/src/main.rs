@@ -1266,8 +1266,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         "[enforcement] kill pid={} signal={} failed: {}",
                                         pid, signal, err
                                     );
+                                    // `reject` is the operator's path and only
+                                    // applies to pending proposals; this action
+                                    // is Approved, so rejecting it fails and
+                                    // leaves it to be retried every second
+                                    // against a pid that may be reused.
                                     let _ = queue_clone
-                                        .reject(&action.id, "executor: kill failed".to_string())
+                                        .fail(&action.id, format!("kill failed: {err}"))
                                         .await;
                                 }
                             }

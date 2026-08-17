@@ -141,6 +141,13 @@ pub async fn await_execution(
     action_id: &str,
     poll_interval: Duration,
 ) -> bool {
+    // Deadlines live on the same clock as the sleeps below. Comparing a wall
+    // clock against virtual sleeps is not merely untestable — under paused
+    // time the sleeps advance and the wall clock does not, so the loop spins
+    // for the TTL in *real* seconds.
+    let mut pending_deadline: Option<Instant> = None;
+    let mut approved_deadline: Option<Instant> = None;
+
     loop {
         let Some(action) = queue.get_by_id(action_id).await else {
             return false;
@@ -148,29 +155,57 @@ pub async fn await_execution(
 
         match action.status {
             ActionStatus::Executed => return true,
-            ActionStatus::Rejected | ActionStatus::Expired => return false,
-            _ => {}
-        }
+            ActionStatus::Rejected | ActionStatus::Expired | ActionStatus::Failed => return false,
+            ActionStatus::Pending => {
+                // While pending, the action's own approval lifetime is the
+                // deadline: the queue holds proposals for 300s while the
+                // recovery watch runs for 120s, and borrowing the shorter
+                // number would abandon an incident an operator could still
+                // validly approve.
+                let deadline = *pending_deadline.get_or_insert_with(|| {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    // One poll of slack, and strictly after: `approve` accepts
+                    // an approval at exactly `expires_at`, so giving up *at*
+                    // the boundary would abandon an action an operator is
+                    // still allowed to approve — and which would then really
+                    // execute, with its incident permanently unverifiable.
+                    Instant::now()
+                        + Duration::from_secs(action.expires_at.saturating_sub(now))
+                        + poll_interval
+                });
 
-        // The deadline is the action's own approval lifetime, not the recovery
-        // window. The queue holds proposals for 300s while the recovery watch
-        // runs for 120s, so borrowing the shorter number would abandon an
-        // incident at two minutes and leave it permanently without an outcome
-        // even though an operator could still validly approve it at four.
-        if current_epoch_secs() >= action.expires_at {
-            return false;
+                if Instant::now() > deadline {
+                    return false;
+                }
+            }
+            ActionStatus::Approved => {
+                // Approval stops the expiry clock. `approve` allows approval
+                // at the boundary and the executor only scans once a second,
+                // so exiting on the proposal's expiry here would abandon an
+                // action that is about to really run — and the kill would then
+                // happen with the incident permanently unverifiable.
+                let deadline =
+                    *approved_deadline.get_or_insert_with(|| Instant::now() + EXECUTION_GRACE);
+
+                if Instant::now() >= deadline {
+                    return false;
+                }
+            }
         }
 
         tokio::time::sleep(poll_interval).await;
     }
 }
 
-fn current_epoch_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+/// How long an approved action may sit before the executor is presumed dead.
+///
+/// The executor scans every second, so this is generous by two orders of
+/// magnitude; it exists only so a stalled executor cannot leave the watch
+/// waiting forever.
+const EXECUTION_GRACE: Duration = Duration::from_secs(60);
 
 /// The whole verification, in the order it has to happen: wait for the action
 /// to run, then measure.
@@ -405,6 +440,101 @@ mod tests {
         assert!(
             outcome.is_none(),
             "an action that never ran must produce no verification at all"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn approval_at_the_expiry_boundary_still_gets_measured() {
+        use crate::enforcement::{ActionType, EnforcementQueue};
+
+        // `approve` permits approval at `now == expires_at`, and the executor
+        // only scans once a second. Exiting on the proposal's expiry would
+        // abandon an action that is about to really run, leaving a real kill
+        // permanently unverifiable.
+        let queue = Arc::new(EnforcementQueue::new(2));
+        let id = queue
+            .propose_auto(
+                ActionType::KillProcess {
+                    pid: UNUSED_PID,
+                    signal: 9,
+                },
+                "test".to_string(),
+                "circuit_breaker".to_string(),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let late = Arc::clone(&queue);
+        let late_id = id.clone();
+        tokio::spawn(async move {
+            // Approved right at the boundary, executed a scan later.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let _ = late.approve(&late_id, "operator".to_string()).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = late.complete(&late_id).await;
+        });
+
+        assert!(
+            await_execution(&queue, &id, Duration::from_millis(200)).await,
+            "an action approved at the boundary and then executed must be seen"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_kill_that_failed_is_never_treated_as_executed() {
+        use crate::enforcement::{ActionType, EnforcementQueue};
+
+        let queue = Arc::new(EnforcementQueue::new(60));
+        let id = queue
+            .propose_auto(
+                ActionType::KillProcess {
+                    pid: UNUSED_PID,
+                    signal: 9,
+                },
+                "test".to_string(),
+                "circuit_breaker".to_string(),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // What the executor now does when libc::kill returns an error.
+        queue
+            .fail(&id, "kill failed: No such process".to_string())
+            .await
+            .expect("failing an approved action is a valid transition");
+
+        assert!(
+            !await_execution(&queue, &id, Duration::from_millis(200)).await,
+            "a failed kill must not start a recovery watch"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_approved_action_the_executor_never_runs_does_not_wait_forever() {
+        use crate::enforcement::{ActionType, EnforcementQueue};
+
+        let queue = Arc::new(EnforcementQueue::new(3_600));
+        let id = queue
+            .propose_auto(
+                ActionType::KillProcess {
+                    pid: UNUSED_PID,
+                    signal: 9,
+                },
+                "test".to_string(),
+                "circuit_breaker".to_string(),
+                None,
+                true, // approved, but nothing ever executes it
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !await_execution(&queue, &id, Duration::from_secs(1)).await,
+            "a stalled executor must not hold the watch open indefinitely"
         );
     }
 
