@@ -421,8 +421,9 @@ impl IncidentStore {
             .unwrap()
             .as_secs() as i64;
 
-        self.query_attributions_between(victim_pod, victim_namespace, to - window_seconds, to)
+        self.query_attributions_between(victim_pod, victim_namespace, to - window_seconds, to, None)
             .await
+            .map(|(rows, _watermark)| rows)
     }
 
     /// Attributions for a victim between two absolute unix timestamps.
@@ -436,19 +437,45 @@ impl IncidentStore {
     /// timestamps returns the same rows next week, which a `now`-relative
     /// window cannot promise for the length of a paragraph, let alone an
     /// incident review.
+    ///
+    /// Timestamps alone are not enough for that promise, though. They have
+    /// one-second resolution and the PSI collector writes on the same clock,
+    /// so a row stamped in the current second can land *after* a query has
+    /// answered and still fall inside its inclusive upper bound — absent from
+    /// the response, present when the link is reopened. `max_row_id` closes
+    /// that: rows are only considered up to a watermark taken before the
+    /// select, and the returned watermark is what the caller puts in the link.
+    /// Passing it back reproduces the original answer exactly, including
+    /// against rows backfilled later with older timestamps, which no
+    /// time-based boundary can exclude.
+    ///
+    /// Returns the rows and the watermark they were read at.
     pub async fn query_attributions_between(
         &self,
         victim_pod: &str,
         victim_namespace: &str,
         from: i64,
         to: i64,
-    ) -> Result<Vec<StallAttribution>, sqlx::Error> {
+        max_row_id: Option<i64>,
+    ) -> Result<(Vec<StallAttribution>, i64), sqlx::Error> {
+        // Taken before the select, never after: a watermark read afterwards
+        // could include a row the select had already missed, which is the race
+        // this exists to remove.
+        let watermark = match max_row_id {
+            Some(id) => id,
+            None => sqlx::query("SELECT COALESCE(MAX(id), 0) AS watermark FROM stall_attributions")
+                .fetch_one(&self.pool)
+                .await?
+                .get::<i64, _>("watermark"),
+        };
+
         let rows = sqlx::query(
             r#"
             SELECT offender_pod, offender_namespace, stall_us, blame_score, timestamp,
                    cpu_share, fork_count, short_job_count, attributed_stall_us
             FROM stall_attributions
             WHERE victim_pod = ? AND victim_namespace = ? AND timestamp >= ? AND timestamp <= ?
+                  AND id <= ?
             ORDER BY blame_score DESC
             "#,
         )
@@ -456,10 +483,11 @@ impl IncidentStore {
         .bind(victim_namespace)
         .bind(from)
         .bind(to)
+        .bind(watermark)
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows
+        let rows = rows
             .into_iter()
             // Columns are read by name: positional access silently shifts
             // every field after any column added to the SELECT above.
@@ -476,7 +504,9 @@ impl IncidentStore {
                     .get::<Option<i64>, _>("attributed_stall_us")
                     .map(|v| v as u64),
             })
-            .collect())
+            .collect();
+
+        Ok((rows, watermark))
     }
 
     /// Get incident by ID

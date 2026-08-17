@@ -1288,6 +1288,13 @@ struct AttributionQuery {
     /// "lately" and means something different every time it is asked.
     from: Option<i64>,
     to: Option<i64>,
+    /// Highest attribution row id the answer may include.
+    ///
+    /// Timestamps are not sufficient on their own: they have one-second
+    /// resolution, so a row written later in the same second as `to` falls
+    /// inside the bounds but was not in the original answer. The watermark
+    /// pins the answer to the rows that existed when it was given.
+    max_id: Option<i64>,
 }
 
 fn default_window() -> i64 {
@@ -1331,8 +1338,8 @@ async fn get_attributions(
             // not quite the one just answered.
             let (from, to) = query.resolve_bounds();
 
-            let attributions = store
-                .query_attributions_between(&query.pod, &query.namespace, from, to)
+            let (attributions, watermark) = store
+                .query_attributions_between(&query.pod, &query.namespace, from, to, query.max_id)
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -1344,13 +1351,17 @@ async fn get_attributions(
                     "pod": query.pod,
                     "namespace": query.namespace
                 },
-                "window_minutes": query.window,
+                // Derived from the bounds rather than echoed from `window`.
+                // A permalink carries `from`/`to` and no `window`, so echoing
+                // the input would report the 5-minute default beside bounds
+                // spanning any duration at all.
+                "window_minutes": (to - from) / 60,
                 // The bounds actually queried, always absolute — a caller that
                 // asked for "the last 15 minutes" can cite what that turned
                 // out to mean instead of re-asking and getting a later answer.
                 "from": from,
                 "to": to,
-                "permalink": query.permalink(from, to),
+                "permalink": query.permalink(from, to, watermark),
                 "attributions": attributions
             })))
         }
@@ -1379,13 +1390,19 @@ impl AttributionQuery {
     }
 
     /// A query string that returns these exact rows whenever it is opened.
-    fn permalink(&self, from: i64, to: i64) -> String {
+    ///
+    /// Carries the row-id watermark as well as the time bounds, so a row
+    /// written later in the same second as `to` — or backfilled afterwards
+    /// with an older timestamp — cannot appear in evidence that has already
+    /// been cited.
+    fn permalink(&self, from: i64, to: i64, max_id: i64) -> String {
         format!(
-            "/attribution?pod={}&namespace={}&from={}&to={}",
+            "/attribution?pod={}&namespace={}&from={}&to={}&max_id={}",
             urlencode(&self.pod),
             urlencode(&self.namespace),
             from,
-            to
+            to,
+            max_id
         )
     }
 }
@@ -2982,14 +2999,15 @@ mod tests {
             window: 5,
             from: Some(1_700_000_000),
             to: Some(1_700_000_900),
+            max_id: Some(4_096),
         };
 
         // The whole point: the same request tomorrow returns the same rows, so
         // `window` must not quietly re-enter the calculation.
         assert_eq!(query.resolve_bounds(), (1_700_000_000, 1_700_000_900));
         assert_eq!(
-            query.permalink(1_700_000_000, 1_700_000_900),
-            "/attribution?pod=payment-api&namespace=payments&from=1700000000&to=1700000900"
+            query.permalink(1_700_000_000, 1_700_000_900, 4_096),
+            "/attribution?pod=payment-api&namespace=payments&from=1700000000&to=1700000900&max_id=4096"
         );
     }
 
@@ -3001,6 +3019,7 @@ mod tests {
             window: 15,
             from: None,
             to: None,
+            max_id: None,
         };
 
         let (from, to) = query.resolve_bounds();
@@ -3008,7 +3027,7 @@ mod tests {
 
         // A caller who asked for "the last 15 minutes" gets back the fixed
         // range that turned out to be, which is the thing they can cite.
-        let link = query.permalink(from, to);
+        let link = query.permalink(from, to, 77);
         assert!(link.contains(&format!("from={from}")), "{link}");
         assert!(link.contains(&format!("to={to}")), "{link}");
         assert!(
@@ -3025,6 +3044,7 @@ mod tests {
             window: 5,
             from: Some(1_700_000_000),
             to: None,
+            max_id: None,
         };
         let (from, to) = since.resolve_bounds();
         assert_eq!(from, 1_700_000_000, "an explicit start must be honoured");
@@ -3036,6 +3056,7 @@ mod tests {
             window: 5,
             from: None,
             to: Some(1_700_000_900),
+            max_id: None,
         };
         assert_eq!(until.resolve_bounds(), (1_700_000_900 - 300, 1_700_000_900));
     }
@@ -3048,9 +3069,10 @@ mod tests {
             window: 5,
             from: None,
             to: None,
+            max_id: None,
         };
 
-        let link = query.permalink(1, 2);
+        let link = query.permalink(1, 2, 3);
         assert!(
             !link.contains("&evil=1") && !link.contains(' '),
             "a name must not be able to inject query parameters: {link}"

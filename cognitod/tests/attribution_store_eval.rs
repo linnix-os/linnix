@@ -303,8 +303,8 @@ async fn absolute_bounds_return_the_same_rows_however_much_later_they_are_asked(
 
     let bounds = (at as i64 - 3_660, at as i64 - 3_540);
 
-    let first = store
-        .query_attributions_between("payment-api", "prod", bounds.0, bounds.1)
+    let (first, watermark) = store
+        .query_attributions_between("payment-api", "prod", bounds.0, bounds.1, None)
         .await
         .unwrap();
     assert_eq!(first.len(), 1, "the row should be inside the fixed bounds");
@@ -316,8 +316,8 @@ async fn absolute_bounds_return_the_same_rows_however_much_later_they_are_asked(
         .await
         .unwrap();
 
-    let second = store
-        .query_attributions_between("payment-api", "prod", bounds.0, bounds.1)
+    let (second, _) = store
+        .query_attributions_between("payment-api", "prod", bounds.0, bounds.1, Some(watermark))
         .await
         .unwrap();
     assert_eq!(
@@ -344,8 +344,8 @@ async fn a_row_written_on_the_upper_bound_is_included() {
     row.timestamp = at;
     store.insert_stall_attribution(&row).await.unwrap();
 
-    let rows = store
-        .query_attributions_between("payment-api", "prod", at as i64 - 60, at as i64)
+    let (rows, _) = store
+        .query_attributions_between("payment-api", "prod", at as i64 - 60, at as i64, None)
         .await
         .unwrap();
 
@@ -353,5 +353,97 @@ async fn a_row_written_on_the_upper_bound_is_included() {
         rows.len(),
         1,
         "the instant named as the end of the window is part of it"
+    );
+}
+
+/// The race Codex found on #76: timestamps have one-second resolution, so a
+/// row written *after* a query answers can still fall inside its inclusive
+/// upper bound and appear when the cited link is reopened.
+///
+/// The watermark is what closes it. Without one, this test fails: the second
+/// read sees a row that was never in the answer being cited.
+#[tokio::test]
+async fn a_row_landing_in_the_same_second_cannot_join_cited_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = IncidentStore::new(dir.path().join("incidents.db"))
+        .await
+        .expect("fresh database should initialise");
+
+    let at = now_secs();
+    let mut first_row = attribution("image-resize-worker", 2.0, 600_000);
+    first_row.timestamp = at;
+    store.insert_stall_attribution(&first_row).await.unwrap();
+
+    // The answer someone shares.
+    let (cited, watermark) = store
+        .query_attributions_between("payment-api", "prod", at as i64 - 60, at as i64, None)
+        .await
+        .unwrap();
+    assert_eq!(cited.len(), 1);
+
+    // A second attribution lands in the very same second — inside the shared
+    // link's time bounds, but after the answer was given.
+    let mut late_row = attribution("batch-etl", 1.0, 300_000);
+    late_row.timestamp = at;
+    store.insert_stall_attribution(&late_row).await.unwrap();
+
+    let (reopened, _) = store
+        .query_attributions_between(
+            "payment-api",
+            "prod",
+            at as i64 - 60,
+            at as i64,
+            Some(watermark),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        reopened.len(),
+        1,
+        "evidence already cited must not grow rows that were written after it"
+    );
+    assert_eq!(reopened[0].offender_pod, "image-resize-worker");
+}
+
+/// A backfilled row — inserted later but stamped earlier — is the case no
+/// time-based boundary can exclude, which is why the watermark is a row id
+/// rather than a tighter timestamp.
+#[tokio::test]
+async fn a_backfilled_row_with_an_older_timestamp_stays_out_of_cited_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = IncidentStore::new(dir.path().join("incidents.db"))
+        .await
+        .expect("fresh database should initialise");
+
+    let at = now_secs();
+    let mut original = attribution("image-resize-worker", 2.0, 600_000);
+    original.timestamp = at - 30;
+    store.insert_stall_attribution(&original).await.unwrap();
+
+    let (_, watermark) = store
+        .query_attributions_between("payment-api", "prod", at as i64 - 60, at as i64, None)
+        .await
+        .unwrap();
+
+    let mut backfilled = attribution("batch-etl", 1.0, 300_000);
+    backfilled.timestamp = at - 45; // older than the row already cited
+    store.insert_stall_attribution(&backfilled).await.unwrap();
+
+    let (reopened, _) = store
+        .query_attributions_between(
+            "payment-api",
+            "prod",
+            at as i64 - 60,
+            at as i64,
+            Some(watermark),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        reopened.len(),
+        1,
+        "a row inserted after the citation must stay out of it, whatever its timestamp claims"
     );
 }
