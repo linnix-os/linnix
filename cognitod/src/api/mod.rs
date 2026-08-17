@@ -3080,6 +3080,117 @@ mod tests {
         assert!(!link.contains("ns/../etc"), "{link}");
     }
 
+    /// End to end, through the endpoint rather than the store: an answer is
+    /// given, a row lands in the same second, and the link that was handed out
+    /// must still return exactly what it returned the first time.
+    ///
+    /// This is the scenario the review raised. Asserting it at the store layer
+    /// leaves the question of whether the *handler* threads the watermark
+    /// through, which is where it could still be lost.
+    #[tokio::test]
+    async fn a_permalink_reproduces_its_answer_after_a_same_second_row_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            cognitod::IncidentStore::new(dir.path().join("incidents.db"))
+                .await
+                .unwrap(),
+        );
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let row = |offender: &str, blame: f64| cognitod::collectors::psi::BlameAttribution {
+            victim_pod: "payment-api".to_string(),
+            victim_namespace: "payments".to_string(),
+            offender_pod: offender.to_string(),
+            offender_namespace: "media".to_string(),
+            blame_score: blame,
+            stall_us: 900_000,
+            attributed_stall_us: 600_000,
+            timestamp: now,
+            cpu_share: 0.7,
+            fork_count: 10,
+            short_job_count: 2,
+        };
+        store
+            .insert_stall_attribution(&row("image-resizer", 2.0))
+            .await
+            .unwrap();
+
+        let app_state = Arc::new(AppState {
+            context: Arc::new(ContextStore::new(Duration::from_secs(60), 10, None)),
+            metrics: Arc::new(Metrics::new()),
+            alerts: None,
+            insights: Arc::new(InsightStore::new(16, None)),
+            offline: Arc::new(OfflineGuard::new(false)),
+            transport: "perf",
+            probe_state: ProbeState::disabled(),
+            require_kernel_instrumentation: true,
+            enforcement: None,
+            reasoner: ReasonerConfig::default(),
+            prometheus_enabled: false,
+            alert_history: Arc::new(AlertHistory::new(16)),
+            auth_token: None,
+            incident_store: Some(Arc::clone(&store)),
+            k8s: None,
+            blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+        });
+
+        let get = |uri: String, state: Arc<AppState>| async move {
+            let response = super::all_routes(state)
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        };
+
+        let first = get(
+            "/attribution?pod=payment-api&namespace=payments&window=5".to_string(),
+            Arc::clone(&app_state),
+        )
+        .await;
+        assert_eq!(first["attributions"].as_array().unwrap().len(), 1);
+        let link = first["permalink"].as_str().unwrap().to_string();
+        assert!(
+            link.contains("max_id="),
+            "link must carry a watermark: {link}"
+        );
+
+        // A second offender is attributed in the very same second, after the
+        // answer above was handed out.
+        store
+            .insert_stall_attribution(&row("batch-etl", 1.0))
+            .await
+            .unwrap();
+
+        let live = get(
+            "/attribution?pod=payment-api&namespace=payments&window=5".to_string(),
+            Arc::clone(&app_state),
+        )
+        .await;
+        assert_eq!(
+            live["attributions"].as_array().unwrap().len(),
+            2,
+            "a fresh query must see the new row"
+        );
+
+        let reopened = get(link.clone(), Arc::clone(&app_state)).await;
+        assert_eq!(
+            reopened["attributions"].as_array().unwrap().len(),
+            1,
+            "the shared link must still show the evidence it was cited for: {link}"
+        );
+        assert_eq!(reopened["attributions"][0]["offender_pod"], "image-resizer");
+
+        // And the metadata must not contradict the bounds it was opened with.
+        assert_eq!(reopened["window_minutes"], first["window_minutes"]);
+    }
+
     /// The one intended difference between the two listeners, pinned: same
     /// route, same state, token required over TCP and not over the socket.
     /// The route sets themselves no longer need a test — both listeners build
