@@ -1343,7 +1343,14 @@ async fn get_attributions(
             let (from, to) = query.resolve_bounds();
 
             let (attributions, watermark) = store
-                .query_attributions_between(&query.pod, &query.namespace, from, to, query.max_id)
+                .query_attributions_filtered(
+                    &query.pod,
+                    &query.namespace,
+                    from,
+                    to,
+                    query.max_id,
+                    query.event.as_deref(),
+                )
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -3207,6 +3214,116 @@ mod tests {
 
         // And the metadata must not contradict the bounds it was opened with.
         assert_eq!(reopened["window_minutes"], first["window_minutes"]);
+    }
+
+    /// An event-specific link must stay event-specific when reopened.
+    ///
+    /// The store-level tests proved the SQL filters; nothing proved the
+    /// *handler* passed the parameter to it, which is exactly how it shipped
+    /// accepting `?event=` and ignoring it.
+    #[tokio::test]
+    async fn an_event_link_returns_only_that_event_through_the_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            cognitod::IncidentStore::new(dir.path().join("incidents.db"))
+                .await
+                .unwrap(),
+        );
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Two stall events in the same second, so only the id separates them.
+        for (event, offender) in [("evt-a", "image-resizer"), ("evt-b", "batch-etl")] {
+            store
+                .insert_stall_attribution(&cognitod::collectors::psi::BlameAttribution {
+                    event_id: event.to_string(),
+                    victim_pod: "payment-api".to_string(),
+                    victim_namespace: "payments".to_string(),
+                    offender_pod: offender.to_string(),
+                    offender_namespace: "media".to_string(),
+                    blame_score: 2.0,
+                    stall_us: 900_000,
+                    attributed_stall_us: 600_000,
+                    timestamp: now,
+                    cpu_share: 0.7,
+                    fork_count: 10,
+                    short_job_count: 2,
+                })
+                .await
+                .unwrap();
+        }
+
+        let app_state = Arc::new(AppState {
+            context: Arc::new(ContextStore::new(Duration::from_secs(60), 10, None)),
+            metrics: Arc::new(Metrics::new()),
+            alerts: None,
+            insights: Arc::new(InsightStore::new(16, None)),
+            offline: Arc::new(OfflineGuard::new(false)),
+            transport: "perf",
+            probe_state: ProbeState::disabled(),
+            require_kernel_instrumentation: true,
+            enforcement: None,
+            reasoner: ReasonerConfig::default(),
+            prometheus_enabled: false,
+            alert_history: Arc::new(AlertHistory::new(16)),
+            auth_token: None,
+            incident_store: Some(Arc::clone(&store)),
+            k8s: None,
+            blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+        });
+
+        let get = |uri: String, state: Arc<AppState>| async move {
+            let response = super::all_routes(state)
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        };
+
+        let whole_window = get(
+            "/attribution?pod=payment-api&namespace=payments&window=5".to_string(),
+            Arc::clone(&app_state),
+        )
+        .await;
+        assert_eq!(
+            whole_window["attributions"].as_array().unwrap().len(),
+            2,
+            "an unfiltered query sees both events"
+        );
+
+        let one_event = get(
+            "/attribution?pod=payment-api&namespace=payments&window=5&event=evt-a".to_string(),
+            Arc::clone(&app_state),
+        )
+        .await;
+        assert_eq!(
+            one_event["attributions"].as_array().unwrap().len(),
+            1,
+            "the handler must apply the event filter, not merely echo it"
+        );
+        assert_eq!(
+            one_event["attributions"][0]["offender_pod"],
+            "image-resizer"
+        );
+
+        // And reopening the link it handed back must not widen the answer.
+        let link = one_event["permalink"].as_str().unwrap().to_string();
+        assert!(
+            link.contains("event=evt-a"),
+            "link must carry the event: {link}"
+        );
+        let reopened = get(link.clone(), Arc::clone(&app_state)).await;
+        assert_eq!(
+            reopened["attributions"].as_array().unwrap().len(),
+            1,
+            "an event link must stay event-specific when reopened: {link}"
+        );
     }
 
     /// The one intended difference between the two listeners, pinned: same
