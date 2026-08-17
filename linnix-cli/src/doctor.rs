@@ -1,5 +1,5 @@
 use colored::*;
-use reqwest::Client;
+
 use serde::Deserialize;
 use std::error::Error;
 
@@ -63,7 +63,7 @@ pub async fn run_doctor(url: &str) -> Result<(), Box<dyn Error>> {
     println!("{}", "Checking system health...".dimmed());
     println!();
 
-    let client = Client::new();
+    let client = crate::http::client();
     let mut all_good = true;
 
     // 1. Check Connectivity & Health

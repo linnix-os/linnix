@@ -54,11 +54,20 @@ kubectl port-forward daemonset/linnix-agent 3000:3000
 
 ## Quickstart (Docker)
 
-Try it on your local machine in 30 seconds.
+Try it on your local machine in 30 seconds. This pulls the published image; if
+that is unavailable it falls back to building locally, which takes a few minutes.
 
 ```bash
 git clone https://github.com/linnix-os/linnix.git && cd linnix
 ./quickstart.sh
+```
+
+The AI insight model is optional and off by default — contention attribution
+does not need it. To also run the local LLM server (downloads a 2.1GB model on
+first run):
+
+```bash
+./quickstart.sh --with-ai
 ```
 
 ---

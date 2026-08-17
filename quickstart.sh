@@ -14,6 +14,8 @@ NC='\033[0m' # No Color
 # --- Globals ---
 COMPOSE_CMD=""
 ACTION="start"
+# The LLM is optional: attribution works without it. Opt in with --with-ai.
+WITH_AI=false
 
 # --- Functions ---
 
@@ -36,10 +38,16 @@ parse_args() {
             stop|down)
                 ACTION="stop"
                 ;;
+            --with-ai)
+                WITH_AI=true
+                ;;
             --help|-h)
-                echo "Usage: $0 [start|stop|--help|-h]"
+                echo "Usage: $0 [start|stop] [--with-ai] [--help|-h]"
                 echo "  start (default):    Start services with automatic demo scenarios."
                 echo "  stop:               Stop all running Linnix services."
+                echo "  --with-ai:          Also start the local LLM server. This downloads a"
+                echo "                      2.1GB model on first run. Contention attribution"
+                echo "                      does not need it; it only adds AI insight text."
                 echo ""
                 echo "Demo scenarios (run automatically on startup):"
                 echo "  1. Fork storm       - Rapid process spawning detection"
@@ -76,6 +84,13 @@ detect_compose() {
             echo "   Note: eBPF will monitor Docker VM processes only, not macOS processes."
             echo ""
         fi
+    fi
+
+    # The llama-server service sits behind the "ai" compose profile. Selecting
+    # the profile is what makes it start; teardown always selects it so a stop
+    # removes the LLM container even when this run did not start it.
+    if [ "$WITH_AI" = true ] || [ "$ACTION" = "stop" ]; then
+        COMPOSE_CMD="$COMPOSE_CMD --profile ai"
     fi
 }
 
@@ -123,7 +138,14 @@ check_model() {
     echo -e "\n${BLUE}[2/5]${NC} Checking for demo model..."
     local model_path="./models/linnix-3b-distilled-q5_k_m.gguf"
     local model_url="https://huggingface.co/parth21shah/linnix-3b-distilled/resolve/main/linnix-3b-distilled-q5_k_m.gguf"
-    
+
+    if [ "$WITH_AI" != true ]; then
+        echo -e "${GREEN}✅ Skipped (AI is optional).${NC}"
+        echo "   Contention attribution runs without a model. Re-run with --with-ai"
+        echo "   to download it (2.1GB) and start the local LLM server."
+        return
+    fi
+
     if [ -f "$model_path" ]; then
         echo -e "${GREEN}✅ Model already downloaded.${NC}"
     else
@@ -160,7 +182,8 @@ check_model() {
 check_ports() {
     echo -e "\n${BLUE}[3/5]${NC} Checking port availability..."
     local ports_in_use=()
-    local required_ports=(3000 8090)
+    local required_ports=(3000)
+    [ "$WITH_AI" = true ] && required_ports+=(8090)
     
     for port in "${required_ports[@]}"; do
         if command -v lsof &> /dev/null; then
@@ -244,8 +267,19 @@ EOF
 # Start all Docker containers
 start_services() {
     echo -e "\n${BLUE}[5/5]${NC} Starting Docker containers..."
-    echo "   This will pull required images and start all services."
-    if ! $COMPOSE_CMD up -d; then
+
+    # Prefer the published image: compose would otherwise build from the local
+    # Dockerfile whenever the image is absent, which is a full eBPF toolchain
+    # build. Fall back to that build only if the pull is genuinely unavailable.
+    local up_args="--no-build"
+    echo "   Pulling published images..."
+    if ! $COMPOSE_CMD pull --quiet 2>/dev/null; then
+        echo -e "${YELLOW}⚠️  Could not pull a published image. Building locally instead.${NC}"
+        echo "   The first build takes several minutes."
+        up_args="--build"
+    fi
+
+    if ! $COMPOSE_CMD up -d $up_args; then
         echo -e "${RED}❌ Docker Compose failed to start.${NC}"
         echo "   Please check the logs for errors:"
         $COMPOSE_CMD logs --tail=50
@@ -268,6 +302,10 @@ wait_for_health() {
             exit 1
         fi
     done
+
+    if [ "$WITH_AI" != true ]; then
+        return
+    fi
 
     echo -n "   LLM Server: "
     for i in {1..180}; do # Increased timeout for model download
@@ -294,7 +332,9 @@ show_summary() {
     echo ""
     echo -e "${GREEN}Services:${NC}"
     echo "   • Dashboard & API:          http://localhost:3000"
-    echo "   • LLM Server:               http://localhost:8090"
+    if [ "$WITH_AI" = true ]; then
+        echo "   • LLM Server:               http://localhost:8090"
+    fi
     echo "   • Prometheus Metrics:       http://localhost:3000/metrics/prometheus"
     echo ""
     echo -e "${GREEN}Quick Commands:${NC}"
@@ -322,12 +362,10 @@ stop_services() {
 main() {
     parse_args "$@"
     
-    # Determine compose command early for stop action
-    if docker compose version &> /dev/null; then
-        COMPOSE_CMD="docker compose"
-    else
-        COMPOSE_CMD="docker-compose"
-    fi
+    # Determine compose command early for stop action. detect_compose rebuilds
+    # COMPOSE_CMD from scratch, so the later call in check_prerequisites is a
+    # no-op rather than a second round of appended flags.
+    detect_compose
 
     if [ "$ACTION" = "stop" ]; then
         stop_services

@@ -68,4 +68,21 @@ linnix-cli metrics
 ```
 
 ---
+
+## Authentication
+
+When cognitod is started with an API token configured, every TCP route requires
+a bearer token. Set `LINNIX_API_TOKEN` and the CLI attaches it to all requests:
+
+```bash
+export LINNIX_API_TOKEN=your-token-here
+linnix-cli investigate default/checkout-api --since 20m
+```
+
+Leave the variable unset for local, unauthenticated runs.
+
+> The built-in web dashboard has no token-entry flow yet, so a token-protected
+> deployment is currently reachable via the CLI and the API, not the browser UI.
+
+---
 *Source: `linnix-cli/src/main.rs`*
