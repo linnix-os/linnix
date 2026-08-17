@@ -1088,6 +1088,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                                             let store_clone = Arc::clone(store);
                                             let analyzer_clone = incident_analyzer_clone.clone();
+                                            let psi_threshold = cb_cfg.cpu_psi_threshold;
                                             tokio::spawn(async move {
                                                 if let Ok(id) = store_clone.insert(&incident).await
                                                 {
@@ -1095,6 +1096,46 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                         "[circuit_breaker] Incident #{} recorded",
                                                         id
                                                     );
+
+                                                    // Watch what the action actually achieved.
+                                                    // Spawned separately from the analyzer: the
+                                                    // measurement is the part that must happen
+                                                    // whether or not a model is configured.
+                                                    let outcome_store = Arc::clone(&store_clone);
+                                                    tokio::spawn(async move {
+                                                        let outcome = cognitod::incidents::outcome::observe_recovery(
+                                                            || {
+                                                                cognitod::utils::psi::PsiMetrics::read()
+                                                                    .map(|m| m.cpu_some_avg10)
+                                                                    .unwrap_or(0.0)
+                                                            },
+                                                            cognitod::incidents::outcome::RecoveryWatch::with_threshold(
+                                                                psi_threshold,
+                                                            ),
+                                                        )
+                                                        .await;
+
+                                                        match outcome.recovery_time_ms {
+                                                            Some(ms) => info!(
+                                                                "[circuit_breaker] Incident #{} recovered after {}ms (PSI {:.1}%)",
+                                                                id, ms, outcome.psi_after
+                                                            ),
+                                                            None => warn!(
+                                                                "[circuit_breaker] Incident #{} did not recover: PSI still {:.1}% after the watch window",
+                                                                id, outcome.psi_after
+                                                            ),
+                                                        }
+
+                                                        if let Err(e) = outcome_store
+                                                            .record_outcome(id, &outcome)
+                                                            .await
+                                                        {
+                                                            warn!(
+                                                                "[circuit_breaker] Incident #{} outcome not recorded: {}",
+                                                                id, e
+                                                            );
+                                                        }
+                                                    });
 
                                                     if let Some(analyzer) = analyzer_clone {
                                                         tokio::spawn(async move {
