@@ -2703,6 +2703,167 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// The exposed `/metrics/prometheus` text, byte for byte, for a known
+    /// state.
+    ///
+    /// This is a contract test, not a unit test. The metric names, labels,
+    /// `# TYPE` lines and ordering here are what the shipped Grafana dashboard
+    /// (`k8s/grafana/linnix-noisy-neighbor.json`) queries by name; renaming a
+    /// metric or dropping a label is a breaking change that no other test in
+    /// this repo would notice, and that surfaces as blank panels in someone
+    /// else's cluster rather than as a red build.
+    ///
+    /// Three values are volatile by nature — uptime and this process's own CPU
+    /// and RSS — so they are scrubbed to `<volatile>` before comparison. The
+    /// *lines* still have to be present and correctly named; only the numbers
+    /// are free to move.
+    ///
+    /// If this fails and the change was deliberate, re-record with:
+    /// `UPDATE_METRICS_FIXTURE=1 cargo test -p cognitod --bin cognitod metrics_prometheus`
+    #[tokio::test]
+    async fn metrics_prometheus_matches_the_recorded_contract() {
+        let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10, None));
+
+        let metrics = Arc::new(Metrics::new());
+        metrics.events_total.fetch_add(4_242, Ordering::Relaxed);
+        metrics
+            .dropped_events_total
+            .fetch_add(17, Ordering::Relaxed);
+        metrics.subscribers.fetch_add(3, Ordering::Relaxed);
+        metrics.alerts_active.fetch_add(2, Ordering::Relaxed);
+        metrics.inc_alerts_emitted();
+        metrics.inc_rb_overflow();
+        metrics.inc_lineage_hit();
+        metrics.inc_lineage_miss();
+        metrics.inc_perf_poll_error();
+        metrics.set_kernel_btf_available(true);
+        metrics.set_psi_cpu(75.2);
+        metrics.set_psi_memory_some(3.1);
+
+        // One victim and one offender pair, deliberately: these render out of
+        // `HashMap`s, so several series would order differently run to run and
+        // the fixture would flap for reasons that have nothing to do with the
+        // contract.
+        let blame = Arc::new(cognitod::attribution::BlameMetrics::new("test-node"));
+        blame.record_victim_pressure("payments", "payment-api", "container-1", 900_000);
+        blame.record_attribution(&cognitod::collectors::psi::BlameAttribution {
+            victim_pod: "payment-api".to_string(),
+            victim_namespace: "payments".to_string(),
+            offender_pod: "image-resizer".to_string(),
+            offender_namespace: "media".to_string(),
+            blame_score: 1.5,
+            stall_us: 900_000,
+            attributed_stall_us: 684_000,
+            timestamp: 1_700_000_000,
+            cpu_share: 0.71,
+            fork_count: 186,
+            short_job_count: 42,
+        });
+
+        let app_state = Arc::new(AppState {
+            context: Arc::clone(&ctx),
+            metrics: Arc::clone(&metrics),
+            alerts: None,
+            insights: Arc::new(InsightStore::new(16, None)),
+            offline: Arc::new(OfflineGuard::new(false)),
+            transport: "perf",
+            probe_state: ProbeState::disabled(),
+            require_kernel_instrumentation: true,
+            enforcement: None,
+            reasoner: ReasonerConfig::default(),
+            prometheus_enabled: true,
+            alert_history: Arc::new(AlertHistory::new(16)),
+            auth_token: None,
+            incident_store: None,
+            k8s: None,
+            blame_metrics: Arc::clone(&blame),
+        });
+
+        let response = super::all_routes(app_state)
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let scrubbed = scrub_volatile(std::str::from_utf8(&body).unwrap());
+
+        let fixture_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/metrics_prometheus.txt"
+        );
+
+        if std::env::var("UPDATE_METRICS_FIXTURE").is_ok() {
+            std::fs::write(fixture_path, &scrubbed).unwrap();
+            return;
+        }
+
+        let expected = std::fs::read_to_string(fixture_path).unwrap();
+        if scrubbed != expected {
+            // Deliberately not `assert_eq!`: on a 73-line body that prints two
+            // full copies of the text and leaves the reader to spot the
+            // difference. What a person needs here is the lines that moved.
+            panic!(
+                "the exposed metric text changed.\n\n{}\n\nIf this was deliberate, re-record with \
+                 UPDATE_METRICS_FIXTURE=1 and review the fixture diff as a change to a public \
+                 contract — the shipped Grafana dashboard queries these names.",
+                line_diff(&expected, &scrubbed)
+            );
+        }
+    }
+
+    /// The differing lines between two metric bodies, as `-expected/+actual`.
+    fn line_diff(expected: &str, actual: &str) -> String {
+        let expected_lines: Vec<&str> = expected.lines().collect();
+        let actual_lines: Vec<&str> = actual.lines().collect();
+
+        let mut out = Vec::new();
+        for idx in 0..expected_lines.len().max(actual_lines.len()) {
+            let e = expected_lines.get(idx).copied();
+            let a = actual_lines.get(idx).copied();
+            if e != a {
+                if let Some(e) = e {
+                    out.push(format!("  line {}: -{e}", idx + 1));
+                }
+                if let Some(a) = a {
+                    out.push(format!("  line {}: +{a}", idx + 1));
+                }
+            }
+        }
+        out.join("\n")
+    }
+
+    /// Replaces the value of every metric whose number cannot be held fixed,
+    /// leaving the name and the rest of the line intact.
+    fn scrub_volatile(body: &str) -> String {
+        const VOLATILE: [&str; 3] = [
+            "linnix_uptime_seconds",
+            "linnix_process_cpu_percent",
+            "linnix_process_rss_bytes",
+        ];
+
+        body.lines()
+            .map(|line| {
+                match VOLATILE
+                    .iter()
+                    .find(|name| line.starts_with(*name) && line.contains(' '))
+                {
+                    Some(name) => format!("{name} <volatile>"),
+                    None => line.to_string(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    }
+
     /// The one intended difference between the two listeners, pinned: same
     /// route, same state, token required over TCP and not over the socket.
     /// The route sets themselves no longer need a test — both listeners build
