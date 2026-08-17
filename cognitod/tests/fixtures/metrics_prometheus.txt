@@ -1,0 +1,73 @@
+# HELP linnix_kernel_instrumentation_active 1 if the eBPF probes are attached, 0 if running userspace-only.
+# TYPE linnix_kernel_instrumentation_active gauge
+linnix_kernel_instrumentation_active 1
+# HELP linnix_events_total Total process events received.
+# TYPE linnix_events_total counter
+linnix_events_total 4242
+# HELP linnix_events_per_second Approximate events per second over the last second.
+# TYPE linnix_events_per_second gauge
+linnix_events_per_second 0
+# HELP linnix_alerts_active Current active alerts.
+# TYPE linnix_alerts_active gauge
+linnix_alerts_active 2
+# HELP linnix_alerts_emitted_total Total alerts emitted.
+# TYPE linnix_alerts_emitted_total counter
+linnix_alerts_emitted_total 1
+# HELP linnix_dropped_events_total Total events dropped (sampling/backpressure).
+# TYPE linnix_dropped_events_total counter
+linnix_dropped_events_total 17
+# HELP linnix_ringbuf_overflows_total Total ring buffer overflows observed.
+# TYPE linnix_ringbuf_overflows_total counter
+linnix_ringbuf_overflows_total 1
+# HELP linnix_rate_limited_total Events skipped due to configured rate caps.
+# TYPE linnix_rate_limited_total counter
+linnix_rate_limited_total 0
+# HELP linnix_perf_poll_errors_total Perf buffer polling errors.
+# TYPE linnix_perf_poll_errors_total counter
+linnix_perf_poll_errors_total 1
+# HELP linnix_lineage_hits_total Lineage cache hits.
+# TYPE linnix_lineage_hits_total counter
+linnix_lineage_hits_total 1
+# HELP linnix_lineage_misses_total Lineage cache misses.
+# TYPE linnix_lineage_misses_total counter
+linnix_lineage_misses_total 1
+# HELP linnix_context_queue_depth Current context queue backlog.
+# TYPE linnix_context_queue_depth gauge
+linnix_context_queue_depth 0
+# HELP linnix_subscribers Number of SSE subscribers.
+# TYPE linnix_subscribers gauge
+linnix_subscribers 3
+# HELP linnix_uptime_seconds Cognitod uptime in seconds.
+# TYPE linnix_uptime_seconds gauge
+linnix_uptime_seconds <volatile>
+# HELP linnix_kernel_btf_available Kernel BTF availability (1=yes).
+# TYPE linnix_kernel_btf_available gauge
+linnix_kernel_btf_available 1
+# HELP linnix_rss_probe_mode RSS probe operating mode (numeric enum).
+# TYPE linnix_rss_probe_mode gauge
+linnix_rss_probe_mode 0
+# HELP linnix_process_cpu_percent Cognitod process CPU usage percentage.
+# TYPE linnix_process_cpu_percent gauge
+linnix_process_cpu_percent <volatile>
+# HELP linnix_process_rss_bytes Cognitod process RSS in bytes.
+# TYPE linnix_process_rss_bytes gauge
+linnix_process_rss_bytes <volatile>
+# HELP linnix_dropped_events_by_type_total Drops broken down by event type.
+# TYPE linnix_dropped_events_by_type_total counter
+linnix_dropped_events_by_type_total{event_type="0"} 0
+linnix_dropped_events_by_type_total{event_type="1"} 0
+linnix_dropped_events_by_type_total{event_type="2"} 0
+linnix_dropped_events_by_type_total{event_type="3"} 0
+linnix_dropped_events_by_type_total{event_type="4"} 0
+linnix_dropped_events_by_type_total{event_type="5"} 0
+linnix_dropped_events_by_type_total{event_type="6"} 0
+linnix_dropped_events_by_type_total{event_type="7"} 0
+# HELP linnix_pod_psi_pressure_total Cumulative CPU pressure stall time per pod, in microseconds.
+# TYPE linnix_pod_psi_pressure_total counter
+linnix_pod_psi_pressure_total{victim_namespace="payments",victim_pod="payment-api",node="test-node"} 900000
+# HELP linnix_stall_induced_seconds_total Stall time attributed to an offending pod, in seconds.
+# TYPE linnix_stall_induced_seconds_total counter
+linnix_stall_induced_seconds_total{offender_pod="image-resizer",offender_namespace="media",victim_pod="payment-api",victim_namespace="payments"} 0.684000
+# HELP linnix_blame_series_evicted_total Blame series dropped because the series cap was reached.
+# TYPE linnix_blame_series_evicted_total counter
+linnix_blame_series_evicted_total 0
