@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use sysinfo::System;
 
+mod snapshot;
+use snapshot::SystemSnapshot;
+
 #[derive(Parser)]
 struct Args {
     /// Print a one-line summary from the LLM
@@ -48,14 +51,6 @@ struct Args {
     /// Disable colored output
     #[arg(long)]
     no_color: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct SystemSnapshot {
-    timestamp: u64,
-    cpu_percent: f32,
-    mem_percent: f32,
-    load_avg: [f32; 3],
 }
 
 #[derive(Debug, Deserialize)]
@@ -428,14 +423,16 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Prepare prompt with process information
+    let system_context = snapshot.render_for_prompt();
+
     let prompt = if args.short {
         format!(
-            "Given this Linux system snapshot: {snapshot:#?}{process_context}\n\
+            "{system_context}\n{process_context}\n\
             Provide a one-sentence summary mentioning the key processes from the table above."
         )
     } else {
         format!(
-            "Given this Linux system snapshot: {snapshot:#?}{process_context}\n\
+            "{system_context}\n{process_context}\n\
             IMPORTANT: Start your response by copying the process table exactly as shown above (including the box drawing characters).\n\
             Then provide analysis: What is happening in the OS? Which specific processes (mention PIDs and full paths from the table) are consuming resources? \
             Any anomalies or risks? Suggest cleanup if needed."
@@ -487,6 +484,7 @@ async fn main() -> anyhow::Result<()> {
         println!("{pretty}");
     } else {
         let answer = &chat_resp.choices[0].message.content;
+        let (worst_resource, worst_pressure) = snapshot.peak_pressure();
         println!(
             "{}\n  Timestamp: {}\n  CPU: {:.1}%\n  Mem: {:.1}%\n  Load: [{:.2}, {:.2}, {:.2}]",
             "System Snapshot".bold().cyan(),
@@ -497,6 +495,15 @@ async fn main() -> anyhow::Result<()> {
             snapshot.load_avg[1],
             snapshot.load_avg[2]
         );
+        // Shown next to usage rather than buried in the analysis: the two
+        // disagreeing is the case worth noticing, and a reader cannot see that
+        // from usage alone.
+        if worst_pressure > 0.0 {
+            println!(
+                "  Stalled: {:.1}% of the last 10s waiting on {}",
+                worst_pressure, worst_resource
+            );
+        }
         println!("\n{}\n{}", "LLM Analysis:".bold().yellow(), answer);
     }
 
