@@ -1054,7 +1054,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     )
                                     .await
                                 {
-                                    Ok(_) => {
+                                    Ok(action_id) => {
                                         warn!(
                                             "[circuit_breaker] AUTO-KILLED {}({}): {}",
                                             proc.comm, proc.pid, reason
@@ -1089,6 +1089,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                             let store_clone = Arc::clone(store);
                                             let analyzer_clone = incident_analyzer_clone.clone();
                                             let psi_threshold = cb_cfg.cpu_psi_threshold;
+                                            let watch_queue = Arc::clone(&queue_clone);
+                                            let watch_action_id = action_id.clone();
                                             tokio::spawn(async move {
                                                 if let Ok(id) = store_clone.insert(&incident).await
                                                 {
@@ -1102,12 +1104,40 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                     // measurement is the part that must happen
                                                     // whether or not a model is configured.
                                                     let outcome_store = Arc::clone(&store_clone);
+                                                    let outcome_queue = Arc::clone(&watch_queue);
                                                     tokio::spawn(async move {
+                                                        // Nothing to verify until the action has
+                                                        // actually run. In monitor mode, and
+                                                        // whenever human approval is required —
+                                                        // both defaults — the proposal sits
+                                                        // pending, and timing a recovery against
+                                                        // it would credit the kill for pressure
+                                                        // that fell on its own.
+                                                        if !cognitod::incidents::outcome::await_execution(
+                                                            &outcome_queue,
+                                                            &watch_action_id,
+                                                            cognitod::incidents::outcome::RecoveryWatch::DEFAULT_MAX_WAIT,
+                                                            cognitod::incidents::outcome::RecoveryWatch::DEFAULT_POLL,
+                                                        )
+                                                        .await
+                                                        {
+                                                            info!(
+                                                                "[circuit_breaker] Incident #{} action never executed; outcome left unmeasured",
+                                                                id
+                                                            );
+                                                            return;
+                                                        }
+
                                                         let outcome = cognitod::incidents::outcome::observe_recovery(
                                                             || {
+                                                                // A failed read is not a low
+                                                                // reading: PsiMetrics yields zeros
+                                                                // when /proc/pressure is missing,
+                                                                // and zero would score as an
+                                                                // instant recovery.
                                                                 cognitod::utils::psi::PsiMetrics::read()
+                                                                    .ok()
                                                                     .map(|m| m.cpu_some_avg10)
-                                                                    .unwrap_or(0.0)
                                                             },
                                                             cognitod::incidents::outcome::RecoveryWatch::with_threshold(
                                                                 psi_threshold,
@@ -1115,14 +1145,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                         )
                                                         .await;
 
-                                                        match outcome.recovery_time_ms {
-                                                            Some(ms) => info!(
-                                                                "[circuit_breaker] Incident #{} recovered after {}ms (PSI {:.1}%)",
-                                                                id, ms, outcome.psi_after
+                                                        if !outcome.is_measured() {
+                                                            warn!(
+                                                                "[circuit_breaker] Incident #{} outcome left unmeasured: pressure could not be read",
+                                                                id
+                                                            );
+                                                            return;
+                                                        }
+
+                                                        match (
+                                                            outcome.recovery_time_ms,
+                                                            outcome.psi_after,
+                                                        ) {
+                                                            (Some(ms), psi) => info!(
+                                                                "[circuit_breaker] Incident #{} recovered after {}ms (PSI {:?})",
+                                                                id, ms, psi
                                                             ),
-                                                            None => warn!(
-                                                                "[circuit_breaker] Incident #{} did not recover: PSI still {:.1}% after the watch window",
-                                                                id, outcome.psi_after
+                                                            (None, psi) => warn!(
+                                                                "[circuit_breaker] Incident #{} did not recover: PSI still {:?} after the watch window",
+                                                                id, psi
                                                             ),
                                                         }
 

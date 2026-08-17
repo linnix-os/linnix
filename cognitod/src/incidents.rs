@@ -580,7 +580,7 @@ impl IncidentStore {
             .await?;
 
         debug!(
-            "Recorded outcome for incident #{}: psi_after={:.1} recovery={:?}",
+            "Recorded outcome for incident #{}: psi_after={:?} recovery={:?}",
             id, outcome.psi_after, outcome.recovery_time_ms
         );
         Ok(())

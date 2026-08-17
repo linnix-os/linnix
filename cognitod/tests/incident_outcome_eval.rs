@@ -53,7 +53,7 @@ async fn an_outcome_reaches_the_row_the_api_reads_back() {
         .record_outcome(
             id,
             &RecoveryOutcome {
-                psi_after: 4.5,
+                psi_after: Some(4.5),
                 recovery_time_ms: Some(3_000),
             },
         )
@@ -82,7 +82,7 @@ async fn watched_but_not_recovered_is_distinguishable_from_never_measured() {
         .record_outcome(
             measured,
             &RecoveryOutcome {
-                psi_after: 71.0,
+                psi_after: Some(71.0),
                 recovery_time_ms: None,
             },
         )
@@ -115,7 +115,7 @@ async fn the_stats_average_counts_only_incidents_that_recovered() {
         .record_outcome(
             fast,
             &RecoveryOutcome {
-                psi_after: 3.0,
+                psi_after: Some(3.0),
                 recovery_time_ms: Some(1_000),
             },
         )
@@ -125,7 +125,7 @@ async fn the_stats_average_counts_only_incidents_that_recovered() {
         .record_outcome(
             slow,
             &RecoveryOutcome {
-                psi_after: 6.0,
+                psi_after: Some(6.0),
                 recovery_time_ms: Some(3_000),
             },
         )
@@ -135,7 +135,7 @@ async fn the_stats_average_counts_only_incidents_that_recovered() {
         .record_outcome(
             never,
             &RecoveryOutcome {
-                psi_after: 80.0,
+                psi_after: Some(80.0),
                 recovery_time_ms: None,
             },
         )
@@ -164,7 +164,7 @@ async fn the_average_stays_absent_until_something_recovers() {
         .record_outcome(
             id,
             &RecoveryOutcome {
-                psi_after: 90.0,
+                psi_after: Some(90.0),
                 recovery_time_ms: None,
             },
         )
