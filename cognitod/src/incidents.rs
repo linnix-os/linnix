@@ -404,34 +404,90 @@ impl IncidentStore {
     }
 
     /// Query stall attributions for a victim pod within a time window
+    /// Attributions for a victim over a window ending now.
+    ///
+    /// Convenience over [`query_attributions_between`] for "what is happening
+    /// lately". The bounds it resolves to move with every call, so a caller
+    /// that needs a stable answer — anything shareable — must resolve them once
+    /// and pass them explicitly.
     pub async fn query_attributions(
         &self,
         victim_pod: &str,
         victim_namespace: &str,
         window_seconds: i64,
     ) -> Result<Vec<StallAttribution>, sqlx::Error> {
-        let now = std::time::SystemTime::now()
+        let to = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        let start_time = now - window_seconds;
+
+        self.query_attributions_between(victim_pod, victim_namespace, to - window_seconds, to, None)
+            .await
+            .map(|(rows, _watermark)| rows)
+    }
+
+    /// Attributions for a victim between two absolute unix timestamps.
+    ///
+    /// Both bounds are inclusive. Timestamps here have one-second resolution,
+    /// so an exclusive upper bound would drop any attribution recorded during
+    /// the current second — invisible in testing and wrong exactly when a
+    /// stall is being written as it is being read.
+    ///
+    /// Fixed bounds are what makes an answer citable: the same pair of
+    /// timestamps returns the same rows next week, which a `now`-relative
+    /// window cannot promise for the length of a paragraph, let alone an
+    /// incident review.
+    ///
+    /// Timestamps alone are not enough for that promise, though. They have
+    /// one-second resolution and the PSI collector writes on the same clock,
+    /// so a row stamped in the current second can land *after* a query has
+    /// answered and still fall inside its inclusive upper bound — absent from
+    /// the response, present when the link is reopened. `max_row_id` closes
+    /// that: rows are only considered up to a watermark taken before the
+    /// select, and the returned watermark is what the caller puts in the link.
+    /// Passing it back reproduces the original answer exactly, including
+    /// against rows backfilled later with older timestamps, which no
+    /// time-based boundary can exclude.
+    ///
+    /// Returns the rows and the watermark they were read at.
+    pub async fn query_attributions_between(
+        &self,
+        victim_pod: &str,
+        victim_namespace: &str,
+        from: i64,
+        to: i64,
+        max_row_id: Option<i64>,
+    ) -> Result<(Vec<StallAttribution>, i64), sqlx::Error> {
+        // Taken before the select, never after: a watermark read afterwards
+        // could include a row the select had already missed, which is the race
+        // this exists to remove.
+        let watermark = match max_row_id {
+            Some(id) => id,
+            None => sqlx::query("SELECT COALESCE(MAX(id), 0) AS watermark FROM stall_attributions")
+                .fetch_one(&self.pool)
+                .await?
+                .get::<i64, _>("watermark"),
+        };
 
         let rows = sqlx::query(
             r#"
             SELECT offender_pod, offender_namespace, stall_us, blame_score, timestamp,
                    cpu_share, fork_count, short_job_count, attributed_stall_us
             FROM stall_attributions
-            WHERE victim_pod = ? AND victim_namespace = ? AND timestamp >= ?
+            WHERE victim_pod = ? AND victim_namespace = ? AND timestamp >= ? AND timestamp <= ?
+                  AND id <= ?
             ORDER BY blame_score DESC
             "#,
         )
         .bind(victim_pod)
         .bind(victim_namespace)
-        .bind(start_time)
+        .bind(from)
+        .bind(to)
+        .bind(watermark)
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows
+        let rows = rows
             .into_iter()
             // Columns are read by name: positional access silently shifts
             // every field after any column added to the SELECT above.
@@ -448,7 +504,9 @@ impl IncidentStore {
                     .get::<Option<i64>, _>("attributed_stall_us")
                     .map(|v| v as u64),
             })
-            .collect())
+            .collect();
+
+        Ok((rows, watermark))
     }
 
     /// Get incident by ID
