@@ -156,6 +156,7 @@ const VICTIM_NS: &str = "prod";
 
 fn build_stall_event(scenario: &Scenario) -> StallEvent {
     StallEvent {
+        event_id: uuid::Uuid::new_v4().to_string(),
         victim_pod: VICTIM_POD.to_string(),
         victim_namespace: VICTIM_NS.to_string(),
         stall_delta_us: scenario.victim_stall_us,
@@ -366,6 +367,7 @@ fn a_flood_of_distinct_offenders_stays_bounded() {
             .collect();
 
         let event = StallEvent {
+            event_id: uuid::Uuid::new_v4().to_string(),
             victim_pod: format!("victim-{}", batch),
             victim_namespace: VICTIM_NS.to_string(),
             stall_delta_us: 500_000,
@@ -456,6 +458,7 @@ fn a_second_offender_is_not_silenced_by_the_first() {
     // information: suppressing it because an unrelated pair is in cooldown
     // would hide the second half of a spreading incident.
     let second = StallEvent {
+        event_id: uuid::Uuid::new_v4().to_string(),
         victim_pod: VICTIM_POD.to_string(),
         victim_namespace: VICTIM_NS.to_string(),
         stall_delta_us: 800_000,

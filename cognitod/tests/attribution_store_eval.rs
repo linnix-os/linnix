@@ -12,6 +12,7 @@ use sqlx::sqlite::SqlitePoolOptions;
 
 fn attribution(offender: &str, blame: f64, attributed_us: u64) -> BlameAttribution {
     BlameAttribution {
+        event_id: format!("evt-{offender}"),
         victim_pod: "payment-api".to_string(),
         victim_namespace: "prod".to_string(),
         offender_pod: offender.to_string(),
@@ -445,5 +446,102 @@ async fn a_backfilled_row_with_an_older_timestamp_stays_out_of_cited_evidence() 
         reopened.len(),
         1,
         "a row inserted after the citation must stay out of it, whatever its timestamp claims"
+    );
+}
+
+/// The point of the event id: cite the rows of *one* stall event, not
+/// whatever else shared its time window.
+#[tokio::test]
+async fn an_event_filter_returns_only_that_events_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = IncidentStore::new(dir.path().join("incidents.db"))
+        .await
+        .expect("fresh database should initialise");
+
+    let at = now_secs();
+    // Two distinct stall events in the same second — the case a
+    // `(timestamp, stall_us)` grouping cannot tell apart when the stall
+    // figures also match.
+    for (event, offender) in [("evt-a", "image-resizer"), ("evt-b", "batch-etl")] {
+        let mut row = attribution(offender, 2.0, 600_000);
+        row.event_id = event.to_string();
+        row.timestamp = at;
+        store.insert_stall_attribution(&row).await.unwrap();
+    }
+
+    let (all, _) = store
+        .query_attributions_between("payment-api", "prod", at as i64 - 60, at as i64, None)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 2, "both events sit inside the window");
+
+    let (only_a, _) = store
+        .query_attributions_filtered(
+            "payment-api",
+            "prod",
+            at as i64 - 60,
+            at as i64,
+            None,
+            Some("evt-a"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(only_a.len(), 1, "the filter must isolate one event");
+    assert_eq!(only_a[0].offender_pod, "image-resizer");
+    assert_eq!(only_a[0].event_id.as_deref(), Some("evt-a"));
+}
+
+/// Rows written before the monitor emitted ids have no event to match, so an
+/// event-filtered query must return nothing rather than guessing a grouping.
+#[tokio::test]
+async fn rows_predating_event_ids_never_match_an_event_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("incidents.db");
+    let store = IncidentStore::new(&db_path).await.unwrap();
+
+    let at = now_secs();
+    {
+        // Written the way an older daemon would have: no event_id at all.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&format!("sqlite://{}?mode=rwc", db_path.display()))
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO stall_attributions (victim_pod, victim_namespace, offender_pod,
+             offender_namespace, stall_us, blame_score, timestamp, attributed_stall_us)
+             VALUES ('payment-api', 'prod', 'image-resizer', 'prod', 900000, 2.0, ?, 600000)",
+        )
+        .bind(at as i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+    }
+
+    let (unfiltered, _) = store
+        .query_attributions_between("payment-api", "prod", at as i64 - 60, at as i64, None)
+        .await
+        .unwrap();
+    assert_eq!(unfiltered.len(), 1);
+    assert_eq!(
+        unfiltered[0].event_id, None,
+        "an id that was never written must read as absent, not as a guess"
+    );
+
+    let (filtered, _) = store
+        .query_attributions_filtered(
+            "payment-api",
+            "prod",
+            at as i64 - 60,
+            at as i64,
+            None,
+            Some("evt-a"),
+        )
+        .await
+        .unwrap();
+    assert!(
+        filtered.is_empty(),
+        "a NULL event id must not match any event"
     );
 }

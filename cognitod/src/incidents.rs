@@ -72,6 +72,10 @@ pub struct StallAttribution {
     pub cpu_share: f64,
     pub fork_count: u64,
     pub short_job_count: u64,
+    /// The stall event this row belongs to. `None` on rows written before the
+    /// PSI monitor emitted one — those are grouped by `(timestamp, stall_us)`
+    /// as before, with the ambiguity that implies.
+    pub event_id: Option<String>,
 }
 
 /// Incident storage backed by SQLite
@@ -138,7 +142,13 @@ impl IncidentStore {
                 -- defaulted: a row written before this column existed has an
                 -- unknown share, and zero would claim the offender caused no
                 -- stall at all.
-                attributed_stall_us INTEGER
+                attributed_stall_us INTEGER,
+                -- The stall event this row belongs to. Nullable for the same
+                -- reason: rows written before the PSI monitor emitted an id
+                -- genuinely have none, and any default would group unrelated
+                -- events together — inventing exactly the collapse the id was
+                -- added to prevent.
+                event_id TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_victim_time ON stall_attributions(victim_pod, victim_namespace, timestamp);
             CREATE INDEX IF NOT EXISTS idx_offender_time ON stall_attributions(offender_pod, offender_namespace, timestamp);
@@ -166,6 +176,18 @@ impl IncidentStore {
             sqlx::query("ALTER TABLE stall_attributions ADD COLUMN attributed_stall_us INTEGER")
                 .execute(&pool)
                 .await;
+        // No backfill: an id cannot be reconstructed for rows written before
+        // the monitor emitted one, and grouping them by `(timestamp, stall_us)`
+        // to synthesise one would bake today's ambiguity into permanent data.
+        // They stay NULL and consumers keep the existing fallback.
+        let _ = sqlx::query("ALTER TABLE stall_attributions ADD COLUMN event_id TEXT")
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_attr_event ON stall_attributions(event_id)",
+        )
+        .execute(&pool)
+        .await;
 
         // The grounded investigation lives beside the raw reply rather than
         // replacing it: `llm_analysis` keeps meaning exactly what it always
@@ -372,8 +394,9 @@ impl IncidentStore {
             INSERT INTO stall_attributions (
                 victim_pod, victim_namespace, offender_pod, offender_namespace,
                 stall_us, blame_score, timestamp,
-                cpu_share, fork_count, short_job_count, attributed_stall_us
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                cpu_share, fork_count, short_job_count, attributed_stall_us,
+                event_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&attr.victim_pod)
@@ -387,6 +410,7 @@ impl IncidentStore {
         .bind(attr.fork_count as i64)
         .bind(attr.short_job_count as i64)
         .bind(attr.attributed_stall_us as i64)
+        .bind(&attr.event_id)
         .execute(&self.pool)
         .await?;
 
@@ -458,6 +482,26 @@ impl IncidentStore {
         to: i64,
         max_row_id: Option<i64>,
     ) -> Result<(Vec<StallAttribution>, i64), sqlx::Error> {
+        self.query_attributions_filtered(victim_pod, victim_namespace, from, to, max_row_id, None)
+            .await
+    }
+
+    /// As [`query_attributions_between`], narrowed to a single stall event.
+    ///
+    /// An event id makes a citation exact rather than merely bounded: the rows
+    /// of one event, not whatever else shared its window. Rows written before
+    /// the monitor emitted ids have `event_id IS NULL` and can never match, so
+    /// an event-filtered query over old data correctly returns nothing rather
+    /// than guessing at a grouping.
+    pub async fn query_attributions_filtered(
+        &self,
+        victim_pod: &str,
+        victim_namespace: &str,
+        from: i64,
+        to: i64,
+        max_row_id: Option<i64>,
+        event_id: Option<&str>,
+    ) -> Result<(Vec<StallAttribution>, i64), sqlx::Error> {
         // Taken before the select, never after: a watermark read afterwards
         // could include a row the select had already missed, which is the race
         // this exists to remove.
@@ -472,10 +516,15 @@ impl IncidentStore {
         let rows = sqlx::query(
             r#"
             SELECT offender_pod, offender_namespace, stall_us, blame_score, timestamp,
-                   cpu_share, fork_count, short_job_count, attributed_stall_us
+                   cpu_share, fork_count, short_job_count, attributed_stall_us,
+                   event_id
             FROM stall_attributions
             WHERE victim_pod = ? AND victim_namespace = ? AND timestamp >= ? AND timestamp <= ?
                   AND id <= ?
+                  -- Bound twice rather than numbered: `?5` would silently
+                  -- refer to the watermark, since the unnumbered binds above
+                  -- consume positions 1-5.
+                  AND (? IS NULL OR event_id = ?)
             ORDER BY blame_score DESC
             "#,
         )
@@ -484,6 +533,8 @@ impl IncidentStore {
         .bind(from)
         .bind(to)
         .bind(watermark)
+        .bind(event_id)
+        .bind(event_id)
         .fetch_all(&self.pool)
         .await?;
 
@@ -503,6 +554,7 @@ impl IncidentStore {
                 attributed_stall_us: r
                     .get::<Option<i64>, _>("attributed_stall_us")
                     .map(|v| v as u64),
+                event_id: r.get::<Option<String>, _>("event_id"),
             })
             .collect();
 

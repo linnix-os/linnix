@@ -1295,6 +1295,10 @@ struct AttributionQuery {
     /// inside the bounds but was not in the original answer. The watermark
     /// pins the answer to the rows that existed when it was given.
     max_id: Option<i64>,
+    /// Narrows the answer to a single stall event. Rows written before the PSI
+    /// monitor emitted ids carry none, so an event filter never matches them —
+    /// correctly, since their grouping was only ever inferred.
+    event: Option<String>,
 }
 
 fn default_window() -> i64 {
@@ -1396,14 +1400,20 @@ impl AttributionQuery {
     /// with an older timestamp — cannot appear in evidence that has already
     /// been cited.
     fn permalink(&self, from: i64, to: i64, max_id: i64) -> String {
-        format!(
+        let base = format!(
             "/attribution?pod={}&namespace={}&from={}&to={}&max_id={}",
             urlencode(&self.pod),
             urlencode(&self.namespace),
             from,
             to,
             max_id
-        )
+        );
+        // Without this the link silently widens: an answer about one stall
+        // event would reopen as every event in its window.
+        match &self.event {
+            Some(event) => format!("{base}&event={}", urlencode(event)),
+            None => base,
+        }
     }
 }
 
@@ -2261,6 +2271,7 @@ mod tests {
         short_job_count: u64,
     ) -> cognitod::incidents::StallAttribution {
         cognitod::incidents::StallAttribution {
+            event_id: Some("evt-test".to_string()),
             offender_pod: "image-resizer".to_string(),
             offender_namespace: "media".to_string(),
             stall_us: 900_000,
@@ -2830,6 +2841,7 @@ mod tests {
         let blame = Arc::new(cognitod::attribution::BlameMetrics::new("test-node"));
         blame.record_victim_pressure("payments", "payment-api", "container-1", 900_000);
         blame.record_attribution(&cognitod::collectors::psi::BlameAttribution {
+            event_id: "evt-fixture".to_string(),
             victim_pod: "payment-api".to_string(),
             victim_namespace: "payments".to_string(),
             offender_pod: "image-resizer".to_string(),
@@ -3000,6 +3012,7 @@ mod tests {
             from: Some(1_700_000_000),
             to: Some(1_700_000_900),
             max_id: Some(4_096),
+            event: None,
         };
 
         // The whole point: the same request tomorrow returns the same rows, so
@@ -3020,6 +3033,7 @@ mod tests {
             from: None,
             to: None,
             max_id: None,
+            event: None,
         };
 
         let (from, to) = query.resolve_bounds();
@@ -3045,6 +3059,7 @@ mod tests {
             from: Some(1_700_000_000),
             to: None,
             max_id: None,
+            event: None,
         };
         let (from, to) = since.resolve_bounds();
         assert_eq!(from, 1_700_000_000, "an explicit start must be honoured");
@@ -3057,6 +3072,7 @@ mod tests {
             from: None,
             to: Some(1_700_000_900),
             max_id: None,
+            event: None,
         };
         assert_eq!(until.resolve_bounds(), (1_700_000_900 - 300, 1_700_000_900));
     }
@@ -3070,6 +3086,7 @@ mod tests {
             from: None,
             to: None,
             max_id: None,
+            event: None,
         };
 
         let link = query.permalink(1, 2, 3);
@@ -3102,6 +3119,7 @@ mod tests {
             .as_secs();
 
         let row = |offender: &str, blame: f64| cognitod::collectors::psi::BlameAttribution {
+            event_id: format!("evt-{offender}"),
             victim_pod: "payment-api".to_string(),
             victim_namespace: "payments".to_string(),
             offender_pod: offender.to_string(),

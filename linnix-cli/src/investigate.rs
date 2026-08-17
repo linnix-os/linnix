@@ -36,6 +36,28 @@ pub struct Attribution {
     pub short_job_count: u64,
     /// Dominant signal, classified server-side.
     pub reason: Option<String>,
+    /// The stall event this row belongs to. `None` on rows written before the
+    /// daemon emitted one.
+    pub event_id: Option<String>,
+}
+
+/// What identifies the stall event a row belongs to.
+///
+/// The daemon's id when there is one; otherwise `(timestamp, stall_us)`, which
+/// is the best that can be inferred for rows written before ids existed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum EventKey {
+    Id(String),
+    Inferred(u64, u64),
+}
+
+impl Attribution {
+    fn event_key(&self) -> EventKey {
+        match &self.event_id {
+            Some(id) => EventKey::Id(id.clone()),
+            None => EventKey::Inferred(self.timestamp, self.stall_us),
+        }
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -86,25 +108,23 @@ pub struct Investigation {
 
 /// Collapses per-window rows into one ranked entry per offender.
 pub fn summarise(attributions: &[Attribution]) -> Investigation {
-    // One window reports the same victim total on each of its offender rows,
-    // so the rows of an event have to collapse to one figure.
+    // One event reports the same victim total on each of its offender rows, so
+    // the rows of an event have to collapse to one figure.
     //
-    // The key is (timestamp, stall_us), not the timestamp alone. Timestamps
-    // have one-second resolution and a victim's containers are scanned
-    // separately, so one pod can produce two distinct events within a second.
-    // Keying on time alone drops one of them, and the attributed total then
-    // exceeds the victim total it is meant to be a share of. `stall_us` is a
-    // microsecond delta, so it separates them — the same key the store's own
-    // backfill groups on. Two events identical in both fields still collapse;
-    // telling those apart needs an event id the daemon does not yet emit.
-    let mut victim_windows: HashSet<(u64, u64)> = HashSet::new();
+    // Rows now carry the event id the daemon minted, which settles this
+    // exactly. The `(timestamp, stall_us)` fallback remains for rows written
+    // before ids existed, and keeps its old limitation: timestamps have
+    // one-second resolution and a victim's containers are scanned separately,
+    // so two events identical in both fields still collapse. That is now a
+    // property of old data rather than of the design.
+    let mut victim_events: HashMap<EventKey, u64> = HashMap::new();
     for attr in attributions {
-        victim_windows.insert((attr.timestamp, attr.stall_us));
+        victim_events.insert(attr.event_key(), attr.stall_us);
     }
-    let victim_stall_us: u64 = victim_windows.iter().map(|(_, stall)| stall).sum();
+    let victim_stall_us: u64 = victim_events.values().sum();
 
     let mut by_offender: HashMap<(String, String), OffenderSummary> = HashMap::new();
-    let mut seen_windows: HashMap<(String, String), HashSet<(u64, u64)>> = HashMap::new();
+    let mut seen_windows: HashMap<(String, String), HashSet<EventKey>> = HashMap::new();
     // Tracks which window currently justifies each offender's reported reason,
     // so the reason shown is the one from its worst window rather than
     // whichever row happened to sort last.
@@ -150,7 +170,7 @@ pub fn summarise(attributions: &[Attribution]) -> Investigation {
         seen_windows
             .entry(key)
             .or_default()
-            .insert((attr.timestamp, attr.stall_us));
+            .insert(attr.event_key());
     }
 
     for (key, windows) in seen_windows {
@@ -181,7 +201,7 @@ pub fn summarise(attributions: &[Attribution]) -> Investigation {
 
     Investigation {
         victim_stall_us,
-        windows: victim_windows.len(),
+        windows: victim_events.len(),
         offenders,
         rows_without_split,
     }
@@ -467,7 +487,66 @@ mod tests {
             fork_count: 10,
             short_job_count: 5,
             reason: Some("high_cpu_contention".to_string()),
+            // Legacy shape by default: these cases predate event ids, and
+            // keeping them on the fallback path means it stays covered.
+            event_id: None,
         }
+    }
+
+    /// The same row, tagged with the event the daemon minted for it.
+    fn attr_in_event(
+        pod: &str,
+        ts: u64,
+        attributed: Option<u64>,
+        stall: u64,
+        event: &str,
+    ) -> Attribution {
+        Attribution {
+            event_id: Some(event.to_string()),
+            ..attr(pod, ts, attributed, stall)
+        }
+    }
+
+    /// The undercount the event id was added to remove.
+    ///
+    /// Two distinct stall events, same second, same stall figure — the
+    /// `(timestamp, stall_us)` fallback cannot tell them apart and reports one
+    /// event's worth of stall for two events' worth of damage. With ids the
+    /// victim's real total is visible.
+    #[test]
+    fn two_events_identical_in_time_and_stall_no_longer_collapse() {
+        let inferred = summarise(&[
+            attr("resizer", 100, Some(600_000), 1_000_000),
+            attr("etl", 100, Some(600_000), 1_000_000),
+        ]);
+        assert_eq!(
+            inferred.victim_stall_us, 1_000_000,
+            "without ids the two events are indistinguishable and collapse"
+        );
+        assert_eq!(inferred.windows, 1);
+
+        let identified = summarise(&[
+            attr_in_event("resizer", 100, Some(600_000), 1_000_000, "evt-a"),
+            attr_in_event("etl", 100, Some(600_000), 1_000_000, "evt-b"),
+        ]);
+        assert_eq!(
+            identified.victim_stall_us, 2_000_000,
+            "with ids both events count, so the victim's real stall is reported"
+        );
+        assert_eq!(identified.windows, 2);
+    }
+
+    /// A window that spans the upgrade: some rows carry ids, older ones do not.
+    /// Both grouping rules have to coexist without either swallowing the other.
+    #[test]
+    fn identified_and_legacy_rows_group_side_by_side() {
+        let mixed = summarise(&[
+            attr_in_event("resizer", 100, Some(600_000), 1_000_000, "evt-a"),
+            attr("etl", 90, Some(400_000), 500_000),
+        ]);
+
+        assert_eq!(mixed.windows, 2, "each row describes a different event");
+        assert_eq!(mixed.victim_stall_us, 1_500_000);
     }
 
     #[test]

@@ -533,6 +533,7 @@ mod tests {
         short_job_counts.insert("default/short-job-pod".to_string(), 100);
 
         let event = StallEvent {
+            event_id: "evt-test".to_string(),
             victim_pod: "victim".to_string(),
             victim_namespace: "default".to_string(),
             stall_delta_us: 1_000_000, // 1 second stall
