@@ -633,6 +633,7 @@ mod tests {
 
     fn attribution(offender: &str, attributed_us: u64) -> BlameAttribution {
         BlameAttribution {
+            event_id: "evt-test".to_string(),
             victim_pod: "payment-api".to_string(),
             victim_namespace: "prod".to_string(),
             offender_pod: offender.to_string(),

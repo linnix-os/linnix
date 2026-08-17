@@ -34,6 +34,14 @@ pub struct CpuConsumer {
 
 #[derive(Debug, Clone)]
 pub struct StallEvent {
+    /// Identifies this stall event across every attribution it produces.
+    ///
+    /// A UUID rather than a counter: a counter restarts with the process, so
+    /// two events from either side of a restart would share an id and any
+    /// consumer grouping on it would silently merge them — the same undercount
+    /// this field exists to remove. Ordering comes from `timestamp`, so
+    /// sortability is not needed here.
+    pub event_id: String,
     pub victim_pod: String,
     pub victim_namespace: String,
     pub stall_delta_us: u64,
@@ -45,6 +53,10 @@ pub struct StallEvent {
 
 #[derive(Debug, Clone)]
 pub struct BlameAttribution {
+    /// The stall event this attribution belongs to. Every offender blamed for
+    /// one event shares it, which is what lets a consumer group the rows of an
+    /// event without inferring it from `(timestamp, stall_us)`.
+    pub event_id: String,
     pub victim_pod: String,
     pub victim_namespace: String,
     pub offender_pod: String,
@@ -264,6 +276,7 @@ impl PsiMonitor {
                                     .get_pod_activity_window(self.sustained_pressure_duration);
 
                                 let stall_event = StallEvent {
+                                    event_id: uuid::Uuid::new_v4().to_string(),
                                     victim_pod: meta.pod_name.clone(),
                                     victim_namespace: meta.namespace.clone(),
                                     stall_delta_us: delta_stall,
@@ -447,6 +460,7 @@ pub fn calculate_blame_attributions(event: &StallEvent) -> Vec<BlameAttribution>
 
             if blame_score > 0.0 {
                 attributions.push(BlameAttribution {
+                    event_id: event.event_id.clone(),
                     victim_pod: event.victim_pod.clone(),
                     victim_namespace: event.victim_namespace.clone(),
                     offender_pod: pod,
@@ -519,6 +533,7 @@ mod tests {
         short_job_counts.insert("default/short-job-pod".to_string(), 100);
 
         let event = StallEvent {
+            event_id: "evt-test".to_string(),
             victim_pod: "victim".to_string(),
             victim_namespace: "default".to_string(),
             stall_delta_us: 1_000_000, // 1 second stall

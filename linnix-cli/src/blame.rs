@@ -1,5 +1,5 @@
 use colored::*;
-use reqwest::Client;
+
 use serde::Deserialize;
 use std::error::Error;
 use std::io::{BufRead, BufReader};
@@ -58,7 +58,7 @@ pub async fn run_blame(node_name: &str) -> Result<(), Box<dyn Error>> {
             "--field-selector",
             &format!("spec.nodeName={}", node_name),
             "-l",
-            "app=cognitod",
+            "app=linnix",
             "-o",
             "jsonpath={.items[0].metadata.name}/{.items[0].metadata.namespace}",
         ])
@@ -134,7 +134,7 @@ pub async fn run_blame(node_name: &str) -> Result<(), Box<dyn Error>> {
 
     // 3. Query API
     println!("{} Fetching recent insights...", "Step 3:".bold());
-    let client = Client::new();
+    let client = crate::http::client();
     let url = format!("http://127.0.0.1:{}/insights/recent?limit=5", local_port);
 
     let resp = client.get(&url).send().await;

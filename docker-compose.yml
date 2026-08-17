@@ -19,7 +19,13 @@ services:
   # Cognitod - eBPF monitoring daemon
   # Security: root + minimal caps (CAP_BPF + CAP_PERFMON only)
   cognitod:
-    image: ${COGNITOD_IMAGE:-linnix-cognitod}
+    # Defaults to the image CI publishes, so a fresh clone pulls instead of
+    # waiting on a full eBPF toolchain build. The build stanza is the fallback:
+    # quickstart.sh builds from it when the pull is unavailable.
+    image: ${COGNITOD_IMAGE:-ghcr.io/linnix-os/cognitod:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: linnix-cognitod
 
     network_mode: host
@@ -69,7 +75,11 @@ services:
       start_period: 30s
 
   # LLM Server - Linnix 3B distilled model
+  #
+  # Optional. Contention attribution runs without it; this only powers the AI
+  # insight text. Start it with: docker compose --profile ai up -d
   llama-server:
+    profiles: ["ai"]
     image: ${LLAMA_IMAGE:-ghcr.io/ggml-org/llama.cpp:server}
     container_name: linnix-llm
     volumes:

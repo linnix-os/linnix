@@ -1,6 +1,5 @@
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
-use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::error::Error;
@@ -10,6 +9,7 @@ mod blame;
 mod doctor;
 mod event;
 mod export;
+mod http;
 mod investigate;
 mod pretty;
 mod processes;
@@ -105,7 +105,7 @@ struct Status {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
-    let client = Client::new();
+    let client = crate::http::client();
     let color = !args.no_color;
 
     if let Some(Command::Export {
