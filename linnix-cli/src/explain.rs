@@ -1,0 +1,184 @@
+//! `linnix explain <incident-id>` — what was concluded about an incident, and
+//! on what evidence.
+//!
+//! The daemon renders the investigation; this command prints it. That split is
+//! deliberate and is the same rule the grounding itself follows: every cited
+//! fact is resolved through the daemon's own wording, so a client cannot
+//! restate a fact while appearing to quote it. A CLI that formatted the
+//! hypotheses itself would be free to drift from what was stored.
+
+use colored::*;
+use reqwest::Client;
+use serde::Deserialize;
+use std::error::Error;
+
+#[derive(Deserialize, Debug)]
+pub struct IncidentView {
+    pub timestamp: i64,
+    pub event_type: String,
+    pub action: String,
+    pub target_name: Option<String>,
+    pub target_pid: Option<i64>,
+    pub psi_cpu: f32,
+    pub cpu_percent: f32,
+    /// Present only when a grounded investigation exists.
+    pub investigation_rendered: Option<String>,
+    /// The model's reply verbatim. Kept even when nothing grounded, which is
+    /// the only way to tell a broken endpoint from a model that answers badly.
+    pub llm_analysis: Option<String>,
+    pub psi_after: Option<f32>,
+    pub recovery_time_ms: Option<i64>,
+}
+
+/// Renders the incident. Returned rather than printed so tests can read it.
+pub fn render(incident: &IncidentView, id: &str, color: bool) -> String {
+    let heading = |s: &str| {
+        if color {
+            s.bold().to_string()
+        } else {
+            s.to_string()
+        }
+    };
+
+    let mut out = format!(
+        "{} #{} — {} at unix {}\n",
+        heading("Incident:"),
+        id,
+        incident.event_type,
+        incident.timestamp
+    );
+
+    let target = match (&incident.target_name, incident.target_pid) {
+        (Some(name), Some(pid)) => format!("{name} ({pid})"),
+        (Some(name), None) => name.clone(),
+        (None, Some(pid)) => format!("pid {pid}"),
+        (None, None) => "unknown target".to_string(),
+    };
+    out.push_str(&format!(
+        "  Action:   {} on {}\n  At the time: CPU {:.1}%, CPU pressure {:.1}%\n",
+        incident.action, target, incident.cpu_percent, incident.psi_cpu
+    ));
+
+    // The outcome, kept in the three states the daemon distinguishes: it
+    // recovered, it was watched and did not, or nobody measured.
+    match (incident.recovery_time_ms, incident.psi_after) {
+        (Some(ms), Some(psi)) => out.push_str(&format!(
+            "  Afterwards:  recovered after {:.1}s, pressure {:.1}%\n",
+            ms as f64 / 1000.0,
+            psi
+        )),
+        (None, Some(psi)) => out.push_str(&format!(
+            "  Afterwards:  did not recover — pressure still {psi:.1}% when the watch ended\n"
+        )),
+        _ => out.push_str("  Afterwards:  not measured\n"),
+    }
+
+    out.push('\n');
+
+    match &incident.investigation_rendered {
+        Some(rendered) => {
+            out.push_str(&format!("{}\n", heading("Investigation")));
+            out.push_str(rendered);
+        }
+        None => {
+            // Saying which of the two happened matters: an operator debugging a
+            // silent reasoner needs to know whether the model was never asked
+            // or answered in a way nothing could be checked against.
+            out.push_str(match incident.llm_analysis {
+                Some(_) => {
+                    "No hypothesis survived grounding for this incident: the model \
+                            replied, but nothing it claimed could be checked against the \
+                            facts the daemon supplied.\n"
+                }
+                None => "No analysis has run for this incident.\n",
+            });
+        }
+    }
+
+    out
+}
+
+pub async fn run_explain(
+    client: &Client,
+    base: &str,
+    id: &str,
+    color: bool,
+) -> Result<(), Box<dyn Error>> {
+    let resp = client
+        .get(format!("{}/incidents/{}", base.trim_end_matches('/'), id))
+        .send()
+        .await?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(format!("no incident #{id}").into());
+    }
+    if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        return Err("cognitod has no incident store configured".into());
+    }
+    if !resp.status().is_success() {
+        return Err(format!("incident query failed: {}", resp.status()).into());
+    }
+
+    let incident: IncidentView = resp.json().await?;
+    print!("{}", render(&incident, id, color));
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn incident() -> IncidentView {
+        IncidentView {
+            timestamp: 1_732_242_135,
+            event_type: "circuit_breaker_cpu".to_string(),
+            action: "auto_kill".to_string(),
+            target_name: Some("aggressive-stress.sh".to_string()),
+            target_pid: Some(472_693),
+            psi_cpu: 75.2,
+            cpu_percent: 96.3,
+            investigation_rendered: None,
+            llm_analysis: None,
+            psi_after: None,
+            recovery_time_ms: None,
+        }
+    }
+
+    #[test]
+    fn the_daemons_rendering_is_printed_verbatim() {
+        let mut view = incident();
+        view.investigation_rendered =
+            Some("1. [cpu_spin] A runaway loop\n   supports:    CPU usage was 96.3%\n".to_string());
+
+        let out = render(&view, "7", false);
+        assert!(out.contains("1. [cpu_spin] A runaway loop"), "{out}");
+        assert!(out.contains("supports:    CPU usage was 96.3%"), "{out}");
+    }
+
+    #[test]
+    fn a_reply_that_did_not_ground_is_distinguished_from_no_analysis() {
+        let mut answered = incident();
+        answered.llm_analysis = Some("some prose".to_string());
+        let out = render(&answered, "7", false);
+        assert!(out.contains("nothing it claimed could be checked"), "{out}");
+
+        let never = incident();
+        let out = render(&never, "7", false);
+        assert!(out.contains("No analysis has run"), "{out}");
+    }
+
+    #[test]
+    fn the_three_outcome_states_read_differently() {
+        let mut recovered = incident();
+        recovered.recovery_time_ms = Some(3_200);
+        recovered.psi_after = Some(4.1);
+        assert!(render(&recovered, "7", false).contains("recovered after 3.2s"));
+
+        let mut stuck = incident();
+        stuck.psi_after = Some(71.0);
+        assert!(render(&stuck, "7", false).contains("did not recover"));
+
+        // Never measured must not read as a finding.
+        assert!(render(&incident(), "7", false).contains("not measured"));
+    }
+}

@@ -1968,7 +1968,7 @@ async fn get_incidents(
 async fn get_incident_by_id(
     Path(id): Path<i64>,
     State(app): State<Arc<AppState>>,
-) -> Result<Json<Incident>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let store = app.incident_store.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1982,7 +1982,42 @@ async fn get_incident_by_id(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Incident not found".to_string()))?;
 
-    Ok(Json(incident))
+    Ok(Json(with_rendered_investigation(&incident)))
+}
+
+/// Serialises an incident with its investigation made legible.
+///
+/// The column holds JSON as text, so the endpoint used to return it as one
+/// escaped string — the grounding work was there and unreadable. This parses it
+/// into a real object and adds `investigation_rendered`, the same text
+/// `IncidentInvestigation::render` produces.
+///
+/// Rendering happens here rather than in each client for the reason the
+/// grounding exists at all: every cited fact is resolved through the daemon's
+/// own wording, so no consumer can restate a fact while claiming to quote it.
+fn with_rendered_investigation(incident: &Incident) -> serde_json::Value {
+    let mut value = serde_json::to_value(incident).unwrap_or_default();
+
+    let Some(raw) = incident.investigation.as_deref() else {
+        return value;
+    };
+
+    // A stored investigation that no longer parses is left exactly as it is.
+    // It is evidence about a past incident, and silently dropping it would be
+    // worse than showing it in the shape it was written.
+    let Ok(parsed) = serde_json::from_str::<cognitod::incidents::IncidentInvestigation>(raw) else {
+        return value;
+    };
+
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "investigation".into(),
+            serde_json::to_value(&parsed).unwrap_or_default(),
+        );
+        obj.insert("investigation_rendered".into(), parsed.render().into());
+    }
+
+    value
 }
 
 /// GET /incidents/stats - Get incident statistics
@@ -3323,6 +3358,195 @@ mod tests {
             reopened["attributions"].as_array().unwrap().len(),
             1,
             "an event link must stay event-specific when reopened: {link}"
+        );
+    }
+
+    /// The grounding work has to reach a human. Until now `/incidents/{id}`
+    /// returned the investigation as one escaped JSON string and
+    /// `IncidentInvestigation::render` was called only from tests.
+    #[tokio::test]
+    async fn an_incident_exposes_its_investigation_as_text_and_structure() {
+        use cognitod::incidents::investigation::{Fact, parse_and_ground};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            cognitod::IncidentStore::new(dir.path().join("incidents.db"))
+                .await
+                .unwrap(),
+        );
+
+        let facts = vec![
+            Fact::new("f1", "CPU usage was 96.3%"),
+            Fact::new("f2", "CPU pressure stall was 75.2%"),
+        ];
+        let grounded = parse_and_ground(
+            r#"{"hypotheses":[{"reason_code":"cpu_spin",
+               "statement":"A single runaway process held the CPU",
+               "supporting_fact_ids":["f1","f2"],
+               "proposed_action":"Inspect the deployment"}]}"#,
+            facts,
+        )
+        .expect("the reply grounds");
+
+        let mut incident = cognitod::Incident {
+            id: None,
+            timestamp: 1_732_242_135,
+            event_type: "circuit_breaker_cpu".to_string(),
+            psi_cpu: 75.21,
+            psi_memory: 12.34,
+            cpu_percent: 96.3,
+            load_avg: "26.00,24.20,21.30".to_string(),
+            action: "auto_kill".to_string(),
+            target_pid: Some(472_693),
+            target_name: Some("aggressive-stress.sh".to_string()),
+            system_snapshot: None,
+            llm_analysis: None,
+            llm_analyzed_at: None,
+            investigation: None,
+            recovery_time_ms: None,
+            psi_after: None,
+        };
+        // The real flow: an incident is recorded first, and the analysis lands
+        // afterwards — `insert` deliberately does not write those columns.
+        let id = store.insert(&incident).await.unwrap();
+        incident.id = Some(id);
+        store
+            .add_llm_analysis(
+                id,
+                &cognitod::incidents::AnalysisOutcome {
+                    raw_response: "raw model reply".to_string(),
+                    investigation: Some(grounded),
+                    parse_error: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let app_state = Arc::new(AppState {
+            context: Arc::new(ContextStore::new(Duration::from_secs(60), 10, None)),
+            metrics: Arc::new(Metrics::new()),
+            alerts: None,
+            insights: Arc::new(InsightStore::new(16, None)),
+            offline: Arc::new(OfflineGuard::new(false)),
+            transport: "perf",
+            probe_state: ProbeState::disabled(),
+            require_kernel_instrumentation: true,
+            enforcement: None,
+            reasoner: ReasonerConfig::default(),
+            prometheus_enabled: false,
+            alert_history: Arc::new(AlertHistory::new(16)),
+            auth_token: None,
+            incident_store: Some(Arc::clone(&store)),
+            k8s: None,
+            blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+        });
+
+        let response = super::all_routes(app_state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/incidents/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Structure, not an escaped string: a client can walk the hypotheses.
+        assert!(
+            json["investigation"]["hypotheses"][0]["statement"]
+                .as_str()
+                .unwrap()
+                .contains("runaway process"),
+            "investigation must be an object, got: {}",
+            json["investigation"]
+        );
+
+        // And the rendered form, where every citation is the daemon's wording.
+        let rendered = json["investigation_rendered"].as_str().unwrap();
+        assert!(rendered.contains("cpu_spin"), "{rendered}");
+        assert!(
+            rendered.contains("CPU pressure stall was 75.2%"),
+            "cited facts must be quoted from the daemon: {rendered}"
+        );
+        assert!(rendered.contains("Inspect the deployment"), "{rendered}");
+
+        // The raw reply is still there, unchanged.
+        assert_eq!(json["llm_analysis"], "raw model reply");
+    }
+
+    /// An incident with no investigation must not grow empty fields that read
+    /// as "analysed, found nothing".
+    #[tokio::test]
+    async fn an_incident_without_an_investigation_gains_no_rendered_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            cognitod::IncidentStore::new(dir.path().join("incidents.db"))
+                .await
+                .unwrap(),
+        );
+
+        let incident = cognitod::Incident {
+            id: None,
+            timestamp: 1_732_242_135,
+            event_type: "circuit_breaker_cpu".to_string(),
+            psi_cpu: 75.21,
+            psi_memory: 12.34,
+            cpu_percent: 96.3,
+            load_avg: "26.00,24.20,21.30".to_string(),
+            action: "auto_kill".to_string(),
+            target_pid: Some(472_693),
+            target_name: Some("aggressive-stress.sh".to_string()),
+            system_snapshot: None,
+            llm_analysis: None,
+            llm_analyzed_at: None,
+            investigation: None,
+            recovery_time_ms: None,
+            psi_after: None,
+        };
+        let id = store.insert(&incident).await.unwrap();
+
+        let app_state = Arc::new(AppState {
+            context: Arc::new(ContextStore::new(Duration::from_secs(60), 10, None)),
+            metrics: Arc::new(Metrics::new()),
+            alerts: None,
+            insights: Arc::new(InsightStore::new(16, None)),
+            offline: Arc::new(OfflineGuard::new(false)),
+            transport: "perf",
+            probe_state: ProbeState::disabled(),
+            require_kernel_instrumentation: true,
+            enforcement: None,
+            reasoner: ReasonerConfig::default(),
+            prometheus_enabled: false,
+            alert_history: Arc::new(AlertHistory::new(16)),
+            auth_token: None,
+            incident_store: Some(Arc::clone(&store)),
+            k8s: None,
+            blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+        });
+
+        let response = super::all_routes(app_state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/incidents/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert!(
+            json.get("investigation_rendered").is_none(),
+            "no investigation means no rendered field, not an empty one"
         );
     }
 
