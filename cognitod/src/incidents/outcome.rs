@@ -203,6 +203,14 @@ where
 mod tests {
     use super::*;
 
+    /// Above Linux's maximum `pid_max` (2^22), so no process can hold it.
+    ///
+    /// `SafetyGuard::is_safe_to_kill` inspects the live process table, so a
+    /// plausible-looking pid makes these tests depend on whatever happens to
+    /// be running on the machine — which is how they passed locally and failed
+    /// in CI, where pid 1234 belonged to a process on the critical list.
+    const UNUSED_PID: u32 = 4_000_001;
+
     /// A queue of readings, so a test can describe pressure over time.
     fn readings(values: &[Option<f32>]) -> impl FnMut() -> Option<f32> + '_ {
         let mut idx = 0;
@@ -315,7 +323,7 @@ mod tests {
         let id = queue
             .propose_auto(
                 ActionType::KillProcess {
-                    pid: 1234,
+                    pid: UNUSED_PID,
                     signal: 9,
                 },
                 "test".to_string(),
@@ -342,7 +350,7 @@ mod tests {
         let id = queue
             .propose_auto(
                 ActionType::KillProcess {
-                    pid: 1234,
+                    pid: UNUSED_PID,
                     signal: 9,
                 },
                 "test".to_string(),
@@ -368,7 +376,7 @@ mod tests {
         let id = queue
             .propose_auto(
                 ActionType::KillProcess {
-                    pid: 1234,
+                    pid: UNUSED_PID,
                     signal: 9,
                 },
                 "test".to_string(),
@@ -413,7 +421,7 @@ mod tests {
         let id = queue
             .propose_auto(
                 ActionType::KillProcess {
-                    pid: 1234,
+                    pid: UNUSED_PID,
                     signal: 9,
                 },
                 "test".to_string(),
@@ -461,7 +469,7 @@ mod tests {
         let id = queue
             .propose_auto(
                 ActionType::KillProcess {
-                    pid: 1234,
+                    pid: UNUSED_PID,
                     signal: 9,
                 },
                 "test".to_string(),
@@ -498,7 +506,7 @@ mod tests {
         let id = queue
             .propose_auto(
                 ActionType::KillProcess {
-                    pid: 1234,
+                    pid: UNUSED_PID,
                     signal: 9,
                 },
                 "test".to_string(),
@@ -535,7 +543,7 @@ mod tests {
         let id = queue
             .propose_auto(
                 ActionType::KillProcess {
-                    pid: 1234,
+                    pid: UNUSED_PID,
                     signal: 9,
                 },
                 "test".to_string(),
