@@ -1283,6 +1283,11 @@ struct AttributionQuery {
     namespace: String,
     #[serde(default = "default_window")]
     window: i64, // minutes
+    /// Absolute unix-second bounds. When both are given they replace `window`,
+    /// which is what turns a query into something citable: `window` answers
+    /// "lately" and means something different every time it is asked.
+    from: Option<i64>,
+    to: Option<i64>,
 }
 
 fn default_window() -> i64 {
@@ -1321,8 +1326,13 @@ async fn get_attributions(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     match &app_state.incident_store {
         Some(store) => {
+            // Resolved once, then used for both the query and the link. Asking
+            // the clock twice would hand back a permalink to a window that is
+            // not quite the one just answered.
+            let (from, to) = query.resolve_bounds();
+
             let attributions = store
-                .query_attributions(&query.pod, &query.namespace, query.window * 60)
+                .query_attributions_between(&query.pod, &query.namespace, from, to)
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -1335,11 +1345,67 @@ async fn get_attributions(
                     "namespace": query.namespace
                 },
                 "window_minutes": query.window,
+                // The bounds actually queried, always absolute — a caller that
+                // asked for "the last 15 minutes" can cite what that turned
+                // out to mean instead of re-asking and getting a later answer.
+                "from": from,
+                "to": to,
+                "permalink": query.permalink(from, to),
                 "attributions": attributions
             })))
         }
         None => Err(StatusCode::SERVICE_UNAVAILABLE),
     }
+}
+
+impl AttributionQuery {
+    /// The absolute bounds this query means right now.
+    ///
+    /// Explicit `from`/`to` win. A half-specified range is treated as the open
+    /// side being unbounded rather than as an error: `from` alone reads as
+    /// "since then", which is what someone pasting a start time intends.
+    fn resolve_bounds(&self) -> (i64, i64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        match (self.from, self.to) {
+            (Some(from), Some(to)) => (from, to),
+            (Some(from), None) => (from, now),
+            (None, Some(to)) => (to - self.window * 60, to),
+            (None, None) => (now - self.window * 60, now),
+        }
+    }
+
+    /// A query string that returns these exact rows whenever it is opened.
+    fn permalink(&self, from: i64, to: i64) -> String {
+        format!(
+            "/attribution?pod={}&namespace={}&from={}&to={}",
+            urlencode(&self.pod),
+            urlencode(&self.namespace),
+            from,
+            to
+        )
+    }
+}
+
+/// Percent-encodes the characters that can appear in a Kubernetes name and
+/// still break a query string. Names are restricted to lowercase alphanumerics,
+/// `-` and `.`, so this is a guard against malformed input reaching a link
+/// rather than a general-purpose encoder.
+fn urlencode(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '.' | '_' | '~' => c.to_string(),
+            other => other
+                .to_string()
+                .bytes()
+                .map(|b| format!("%{b:02X}"))
+                .collect(),
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -2906,6 +2972,90 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n")
             + "\n"
+    }
+
+    #[test]
+    fn explicit_bounds_are_used_verbatim_and_echoed_as_a_link() {
+        let query = super::AttributionQuery {
+            pod: "payment-api".to_string(),
+            namespace: "payments".to_string(),
+            window: 5,
+            from: Some(1_700_000_000),
+            to: Some(1_700_000_900),
+        };
+
+        // The whole point: the same request tomorrow returns the same rows, so
+        // `window` must not quietly re-enter the calculation.
+        assert_eq!(query.resolve_bounds(), (1_700_000_000, 1_700_000_900));
+        assert_eq!(
+            query.permalink(1_700_000_000, 1_700_000_900),
+            "/attribution?pod=payment-api&namespace=payments&from=1700000000&to=1700000900"
+        );
+    }
+
+    #[test]
+    fn a_relative_window_resolves_to_absolute_bounds() {
+        let query = super::AttributionQuery {
+            pod: "payment-api".to_string(),
+            namespace: "payments".to_string(),
+            window: 15,
+            from: None,
+            to: None,
+        };
+
+        let (from, to) = query.resolve_bounds();
+        assert_eq!(to - from, 15 * 60, "the window must survive resolution");
+
+        // A caller who asked for "the last 15 minutes" gets back the fixed
+        // range that turned out to be, which is the thing they can cite.
+        let link = query.permalink(from, to);
+        assert!(link.contains(&format!("from={from}")), "{link}");
+        assert!(link.contains(&format!("to={to}")), "{link}");
+        assert!(
+            !link.contains("window="),
+            "a link must not be relative: {link}"
+        );
+    }
+
+    #[test]
+    fn one_sided_bounds_leave_the_open_end_open() {
+        let since = super::AttributionQuery {
+            pod: "p".to_string(),
+            namespace: "n".to_string(),
+            window: 5,
+            from: Some(1_700_000_000),
+            to: None,
+        };
+        let (from, to) = since.resolve_bounds();
+        assert_eq!(from, 1_700_000_000, "an explicit start must be honoured");
+        assert!(to > from, "an open end runs to now");
+
+        let until = super::AttributionQuery {
+            pod: "p".to_string(),
+            namespace: "n".to_string(),
+            window: 5,
+            from: None,
+            to: Some(1_700_000_900),
+        };
+        assert_eq!(until.resolve_bounds(), (1_700_000_900 - 300, 1_700_000_900));
+    }
+
+    #[test]
+    fn names_that_would_break_a_link_are_encoded() {
+        let query = super::AttributionQuery {
+            pod: "pod name&evil=1".to_string(),
+            namespace: "ns/../etc".to_string(),
+            window: 5,
+            from: None,
+            to: None,
+        };
+
+        let link = query.permalink(1, 2);
+        assert!(
+            !link.contains("&evil=1") && !link.contains(' '),
+            "a name must not be able to inject query parameters: {link}"
+        );
+        assert!(!link.contains("ns/../etc"), "{link}");
     }
 
     /// The one intended difference between the two listeners, pinned: same

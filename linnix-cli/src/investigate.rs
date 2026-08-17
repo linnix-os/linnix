@@ -41,6 +41,10 @@ pub struct Attribution {
 #[derive(Deserialize, Debug)]
 pub struct AttributionResponse {
     pub attributions: Vec<Attribution>,
+    /// Query string that returns exactly these rows whenever it is opened.
+    /// `None` against a daemon older than this field, which is why the report
+    /// omits the line rather than printing a link that would 404.
+    pub permalink: Option<String>,
 }
 
 /// An offender's aggregated contribution across every window in the query.
@@ -235,6 +239,7 @@ pub fn render(
     pod: &str,
     since: &str,
     color: bool,
+    permalink: Option<&str>,
 ) -> String {
     let mut out = String::new();
     let heading = |s: &str| {
@@ -260,6 +265,10 @@ pub fn render(
              the node as the cause. Look at the pod's own limits, throttling and \
              workload next.\n",
         );
+        // "Nothing was attributed here" is a finding worth citing too — it is
+        // what rules the neighbours out, and it stops being reproducible the
+        // moment the window slides.
+        push_permalink(&mut out, &heading, permalink);
         return out;
     }
 
@@ -369,7 +378,20 @@ pub fn render(
          the victim's stall falls.\n",
     );
 
+    push_permalink(&mut out, &heading, permalink);
+
     out
+}
+
+/// Appends the shareable link, if the daemon supplied one.
+///
+/// Printed as the fixed window it resolved to rather than the `--since` the
+/// user typed: pasting "the last 20 minutes" into a ticket describes a
+/// different 20 minutes to everyone who opens it afterwards.
+fn push_permalink(out: &mut String, heading: &dyn Fn(&str) -> String, permalink: Option<&str>) {
+    if let Some(link) = permalink {
+        out.push_str(&format!("\n{} {}\n", heading("Evidence link:"), link));
+    }
 }
 
 pub async fn run_investigate(
@@ -408,7 +430,25 @@ pub async fn run_investigate(
 
     let body: AttributionResponse = resp.json().await?;
     let investigation = summarise(&body.attributions);
-    print!("{}", render(&investigation, namespace, pod, since, color));
+
+    // The daemon returns a path; a link is only pasteable with the host the
+    // caller actually reached, which is the one thing the daemon cannot know.
+    let permalink = body
+        .permalink
+        .as_ref()
+        .map(|path| format!("{}{}", base.trim_end_matches('/'), path));
+
+    print!(
+        "{}",
+        render(
+            &investigation,
+            namespace,
+            pod,
+            since,
+            color,
+            permalink.as_deref()
+        )
+    );
     Ok(())
 }
 
@@ -526,7 +566,7 @@ mod tests {
         assert_eq!(legacy.share, None);
         assert_eq!(legacy.unsplit_rows, 1);
 
-        let report = render(&out, "payments", "api", "20m", false);
+        let report = render(&out, "payments", "api", "20m", false, None);
         let legacy_line = report
             .lines()
             .find(|l| l.contains("media/legacy"))
@@ -540,7 +580,7 @@ mod tests {
     fn no_offenders_reports_absence_rather_than_accusing() {
         let out = summarise(&[]);
         assert!(out.offenders.is_empty());
-        let report = render(&out, "payments", "api", "20m", false);
+        let report = render(&out, "payments", "api", "20m", false, None);
         assert!(report.contains("No contention attributed"));
         assert!(!report.contains("Likely offender"));
     }
@@ -551,7 +591,7 @@ mod tests {
             attr("resizer", 100, Some(700_000), 1_000_000),
             attr("etl", 100, Some(300_000), 1_000_000),
         ];
-        let report = render(&summarise(&rows), "payments", "api", "20m", false);
+        let report = render(&summarise(&rows), "payments", "api", "20m", false, None);
         assert!(report.contains("media/resizer"));
         assert!(report.contains("70% of attributed stall"));
         assert!(report.contains("high CPU contention"));
@@ -566,7 +606,7 @@ mod tests {
         // the offender at 100% without naming the denominator would read as
         // "this pod caused the whole second".
         let rows = vec![attr("resizer", 100, Some(400_000), 1_000_000)];
-        let report = render(&summarise(&rows), "payments", "api", "20m", false);
+        let report = render(&summarise(&rows), "payments", "api", "20m", false, None);
         assert!(report.contains("lost 1.0s to stalls"));
         assert!(report.contains("400ms of that is attributed to neighbours"));
     }

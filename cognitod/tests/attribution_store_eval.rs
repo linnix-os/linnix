@@ -283,3 +283,75 @@ async fn a_row_with_no_recoverable_blame_stays_unknown_rather_than_zero() {
         "an unrecoverable share must read as unknown, not as zero stall caused"
     );
 }
+
+/// The property a permalink rests on: fixed bounds give the same answer later.
+///
+/// A relative window cannot promise this — it slides — so anything shareable
+/// has to resolve to absolute timestamps first. This is the test that would
+/// fail if `query_attributions_between` ever reintroduced `now`.
+#[tokio::test]
+async fn absolute_bounds_return_the_same_rows_however_much_later_they_are_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = IncidentStore::new(dir.path().join("incidents.db"))
+        .await
+        .expect("fresh database should initialise");
+
+    let at = now_secs();
+    let mut old = attribution("image-resize-worker", 2.0, 600_000);
+    old.timestamp = at - 3_600; // an hour ago, outside any short window
+    store.insert_stall_attribution(&old).await.unwrap();
+
+    let bounds = (at as i64 - 3_660, at as i64 - 3_540);
+
+    let first = store
+        .query_attributions_between("payment-api", "prod", bounds.0, bounds.1)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1, "the row should be inside the fixed bounds");
+
+    // A newer stall lands. The fixed window must not notice it, or a link
+    // shared during an incident would keep growing new evidence afterwards.
+    store
+        .insert_stall_attribution(&attribution("batch-etl", 1.0, 300_000))
+        .await
+        .unwrap();
+
+    let second = store
+        .query_attributions_between("payment-api", "prod", bounds.0, bounds.1)
+        .await
+        .unwrap();
+    assert_eq!(
+        second.len(),
+        1,
+        "a fixed window must not pick up rows written after it was cited"
+    );
+    assert_eq!(second[0].offender_pod, first[0].offender_pod);
+    assert_eq!(second[0].attributed_stall_us, first[0].attributed_stall_us);
+}
+
+/// One-second timestamp resolution means an exclusive upper bound silently
+/// drops whatever was recorded in the current second — the rows most likely to
+/// matter while an incident is live.
+#[tokio::test]
+async fn a_row_written_on_the_upper_bound_is_included() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = IncidentStore::new(dir.path().join("incidents.db"))
+        .await
+        .expect("fresh database should initialise");
+
+    let at = now_secs();
+    let mut row = attribution("image-resize-worker", 2.0, 600_000);
+    row.timestamp = at;
+    store.insert_stall_attribution(&row).await.unwrap();
+
+    let rows = store
+        .query_attributions_between("payment-api", "prod", at as i64 - 60, at as i64)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "the instant named as the end of the window is part of it"
+    );
+}
