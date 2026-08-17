@@ -2819,6 +2819,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn scrubbing_hides_values_without_hiding_contract_changes() {
+        let scrubbed = scrub_volatile(
+            "# HELP linnix_uptime_seconds Cognitod uptime in seconds.\n\
+             # TYPE linnix_uptime_seconds gauge\n\
+             linnix_uptime_seconds 4210\n\
+             linnix_process_cpu_percent{pid=\"7\"} 1.5\n\
+             linnix_uptime_seconds_total 9\n\
+             linnix_events_total 4242\n",
+        );
+
+        let lines: Vec<&str> = scrubbed.lines().collect();
+
+        // Help and type text is contract, not value: never touched.
+        assert_eq!(
+            lines[0],
+            "# HELP linnix_uptime_seconds Cognitod uptime in seconds."
+        );
+        assert_eq!(lines[2], "linnix_uptime_seconds <volatile>");
+
+        // A label added to a volatile metric is itself a contract change, so
+        // it has to survive scrubbing and fail the comparison.
+        assert_eq!(lines[3], "linnix_process_cpu_percent{pid=\"7\"} <volatile>");
+
+        // A different metric that merely starts with a volatile name keeps its
+        // value: prefix matching would have swallowed it.
+        assert_eq!(lines[4], "linnix_uptime_seconds_total 9");
+
+        assert_eq!(lines[5], "linnix_events_total 4242");
+    }
+
     /// The differing lines between two metric bodies, as `-expected/+actual`.
     fn line_diff(expected: &str, actual: &str) -> String {
         let expected_lines: Vec<&str> = expected.lines().collect();
@@ -2851,12 +2882,25 @@ mod tests {
 
         body.lines()
             .map(|line| {
-                match VOLATILE
-                    .iter()
-                    .find(|name| line.starts_with(*name) && line.contains(' '))
-                {
-                    Some(name) => format!("{name} <volatile>"),
-                    None => line.to_string(),
+                // Only the value is replaced, and only when the metric *name*
+                // matches exactly. Rebuilding the line from the name alone
+                // would erase whatever sits between it and the value, so a
+                // label added to one of these — or a longer name sharing the
+                // prefix — would be scrubbed out of existence and the fixture
+                // would keep passing through the very change it exists to
+                // catch.
+                let Some((series, _value)) = line.rsplit_once(' ') else {
+                    return line.to_string();
+                };
+                let name = series
+                    .split_once('{')
+                    .map(|(name, _labels)| name)
+                    .unwrap_or(series);
+
+                if VOLATILE.contains(&name) {
+                    format!("{series} <volatile>")
+                } else {
+                    line.to_string()
                 }
             })
             .collect::<Vec<_>>()
