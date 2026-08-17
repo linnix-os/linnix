@@ -17,6 +17,8 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+use tokio::sync::Semaphore;
+
 use crate::enforcement::{ActionStatus, EnforcementQueue};
 
 /// How long to watch, and what counts as recovered.
@@ -140,7 +142,7 @@ pub async fn await_execution(
     queue: &Arc<EnforcementQueue>,
     action_id: &str,
     poll_interval: Duration,
-) -> bool {
+) -> Option<u64> {
     // Deadlines live on the same clock as the sleeps below. Comparing a wall
     // clock against virtual sleeps is not merely untestable — under paused
     // time the sleeps advance and the wall clock does not, so the loop spins
@@ -149,13 +151,11 @@ pub async fn await_execution(
     let mut approved_deadline: Option<Instant> = None;
 
     loop {
-        let Some(action) = queue.get_by_id(action_id).await else {
-            return false;
-        };
+        let action = queue.get_by_id(action_id).await?;
 
         match action.status {
-            ActionStatus::Executed => return true,
-            ActionStatus::Rejected | ActionStatus::Expired | ActionStatus::Failed => return false,
+            ActionStatus::Executed => return Some(action.executed_at.unwrap_or_else(epoch_secs)),
+            ActionStatus::Rejected | ActionStatus::Expired | ActionStatus::Failed => return None,
             ActionStatus::Pending => {
                 // While pending, the action's own approval lifetime is the
                 // deadline: the queue holds proposals for 300s while the
@@ -178,7 +178,7 @@ pub async fn await_execution(
                 });
 
                 if Instant::now() > deadline {
-                    return false;
+                    return None;
                 }
             }
             ActionStatus::Approved => {
@@ -191,7 +191,7 @@ pub async fn await_execution(
                     *approved_deadline.get_or_insert_with(|| Instant::now() + EXECUTION_GRACE);
 
                 if Instant::now() >= deadline {
-                    return false;
+                    return None;
                 }
             }
         }
@@ -207,6 +207,13 @@ pub async fn await_execution(
 /// waiting forever.
 const EXECUTION_GRACE: Duration = Duration::from_secs(60);
 
+fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// The whole verification, in the order it has to happen: wait for the action
 /// to run, then measure.
 ///
@@ -220,18 +227,39 @@ const EXECUTION_GRACE: Duration = Duration::from_secs(60);
 pub async fn verify_action_outcome<S>(
     queue: &Arc<EnforcementQueue>,
     action_id: &str,
+    slot: &Arc<Semaphore>,
     sample: S,
     watch: RecoveryWatch,
 ) -> Option<RecoveryOutcome>
 where
     S: FnMut() -> Option<f32>,
 {
-    if !await_execution(queue, action_id, watch.poll_interval).await {
+    let executed_at = await_execution(queue, action_id, watch.poll_interval).await?;
+
+    // Only one action is verified at a time. The sampler reads *system-wide*
+    // pressure, so two overlapping watches would both credit themselves with
+    // the same fall — and a second kill during a sustained incident is exactly
+    // when that happens. A verification that cannot be attributed to one
+    // action is worth less than no verification, so the loser records nothing.
+    let Ok(_slot) = slot.try_acquire() else {
+        return None;
+    };
+
+    let outcome = observe_recovery(sample, watch).await;
+    if !outcome.is_measured() {
         return None;
     }
 
-    let outcome = observe_recovery(sample, watch).await;
-    outcome.is_measured().then_some(outcome)
+    // Timed from the kill, not from when this watch started: the insert and
+    // the polling gap in between are real delay, and dropping them stores an
+    // already-recovered system as a 0ms recovery.
+    let since_execution_ms = epoch_secs().saturating_sub(executed_at) * 1_000;
+    Some(RecoveryOutcome {
+        recovery_time_ms: outcome
+            .recovery_time_ms
+            .map(|ms| ms + since_execution_ms as i64),
+        ..outcome
+    })
 }
 
 #[cfg(test)]
@@ -369,7 +397,9 @@ mod tests {
             .await
             .unwrap();
 
-        let executed = await_execution(&queue, &id, Duration::from_secs(1)).await;
+        let executed = await_execution(&queue, &id, Duration::from_secs(1))
+            .await
+            .is_some();
 
         assert!(
             !executed,
@@ -398,7 +428,9 @@ mod tests {
         queue.reject(&id, "operator".to_string()).await.unwrap();
 
         assert!(
-            !await_execution(&queue, &id, Duration::from_secs(1)).await,
+            await_execution(&queue, &id, Duration::from_secs(1))
+                .await
+                .is_none(),
             "a rejected action is a decision, not something to keep waiting on"
         );
     }
@@ -428,6 +460,7 @@ mod tests {
         let outcome = verify_action_outcome(
             &queue,
             &id,
+            &Arc::new(Semaphore::new(1)),
             || Some(0.0),
             RecoveryWatch {
                 poll_interval: Duration::from_secs(1),
@@ -477,7 +510,9 @@ mod tests {
         });
 
         assert!(
-            await_execution(&queue, &id, Duration::from_millis(200)).await,
+            await_execution(&queue, &id, Duration::from_millis(200))
+                .await
+                .is_some(),
             "an action approved at the boundary and then executed must be seen"
         );
     }
@@ -508,7 +543,9 @@ mod tests {
             .expect("failing an approved action is a valid transition");
 
         assert!(
-            !await_execution(&queue, &id, Duration::from_millis(200)).await,
+            await_execution(&queue, &id, Duration::from_millis(200))
+                .await
+                .is_none(),
             "a failed kill must not start a recovery watch"
         );
     }
@@ -533,7 +570,9 @@ mod tests {
             .unwrap();
 
         assert!(
-            !await_execution(&queue, &id, Duration::from_secs(1)).await,
+            await_execution(&queue, &id, Duration::from_secs(1))
+                .await
+                .is_none(),
             "a stalled executor must not hold the watch open indefinitely"
         );
     }
@@ -576,6 +615,7 @@ mod tests {
         let outcome = verify_action_outcome(
             &queue,
             &id,
+            &Arc::new(Semaphore::new(1)),
             || Some(1.0),
             RecoveryWatch {
                 poll_interval: Duration::from_secs(1),
@@ -588,6 +628,101 @@ mod tests {
         assert!(
             outcome.is_some(),
             "an action approved at 180s is inside its 300s life and must be measured"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_second_overlapping_verification_records_nothing() {
+        use crate::enforcement::{ActionType, EnforcementQueue};
+
+        let queue = Arc::new(EnforcementQueue::new(60));
+        let slot = Arc::new(Semaphore::new(1));
+
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let id = queue
+                .propose_auto(
+                    ActionType::KillProcess {
+                        pid: UNUSED_PID,
+                        signal: 9,
+                    },
+                    "test".to_string(),
+                    "circuit_breaker".to_string(),
+                    None,
+                    true,
+                )
+                .await
+                .unwrap();
+            queue.complete(&id).await.unwrap();
+            ids.push(id);
+        }
+
+        let watch = RecoveryWatch {
+            poll_interval: Duration::from_secs(1),
+            max_wait: Duration::from_secs(10),
+            recovered_below: 10.0,
+        };
+
+        // Both kills happened; both watches would see the same system-wide
+        // pressure fall and each claim it. Only one may record an outcome.
+        let (first, second) = tokio::join!(
+            verify_action_outcome(&queue, &ids[0], &slot, || Some(50.0), watch),
+            verify_action_outcome(&queue, &ids[1], &slot, || Some(50.0), watch),
+        );
+
+        assert!(
+            first.is_some() ^ second.is_some(),
+            "exactly one overlapping verification may record an outcome"
+        );
+    }
+
+    /// Real time on purpose: `executed_at` is a wall-clock stamp, so a paused
+    /// clock would advance the sleeps and not the stamp, and the test would
+    /// pass for the wrong reason. Kept to one second for that reason.
+    #[tokio::test]
+    async fn recovery_is_timed_from_the_kill_not_from_the_watch() {
+        use crate::enforcement::{ActionType, EnforcementQueue};
+
+        let queue = Arc::new(EnforcementQueue::new(60));
+        let id = queue
+            .propose_auto(
+                ActionType::KillProcess {
+                    pid: UNUSED_PID,
+                    signal: 9,
+                },
+                "test".to_string(),
+                "circuit_breaker".to_string(),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        queue.complete(&id).await.unwrap();
+
+        // Time passes between the kill and the watch — the incident insert,
+        // the executor poll. Pressure is already fine by the time we look.
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+        let outcome = verify_action_outcome(
+            &queue,
+            &id,
+            &Arc::new(Semaphore::new(1)),
+            || Some(1.0),
+            RecoveryWatch {
+                poll_interval: Duration::from_secs(1),
+                max_wait: Duration::from_secs(10),
+                recovered_below: 10.0,
+            },
+        )
+        .await
+        .expect("an executed action with readable pressure is measured");
+
+        // Storing 0ms would claim the kill worked instantly, when in truth
+        // nobody looked for half a minute.
+        assert!(
+            outcome.recovery_time_ms.unwrap() >= 1_000,
+            "recovery must be timed from the kill, got {:?}",
+            outcome.recovery_time_ms
         );
     }
 
@@ -614,6 +749,7 @@ mod tests {
         let outcome = verify_action_outcome(
             &queue,
             &id,
+            &Arc::new(Semaphore::new(1)),
             || Some(2.0),
             RecoveryWatch {
                 poll_interval: Duration::from_secs(1),
@@ -652,6 +788,7 @@ mod tests {
             verify_action_outcome(
                 &queue,
                 &id,
+                &Arc::new(Semaphore::new(1)),
                 || None,
                 RecoveryWatch {
                     poll_interval: Duration::from_secs(1),
@@ -685,7 +822,11 @@ mod tests {
             .unwrap();
         queue.complete(&id).await.unwrap();
 
-        assert!(await_execution(&queue, &id, Duration::from_secs(1)).await);
+        assert!(
+            await_execution(&queue, &id, Duration::from_secs(1))
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test(start_paused = true)]

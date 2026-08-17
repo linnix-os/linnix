@@ -40,6 +40,14 @@ pub struct EnforcementAction {
     pub status: ActionStatus,
     pub created_at: u64,
     pub expires_at: u64,
+    /// When the executor actually carried the action out.
+    ///
+    /// Recovery has to be timed from the kill, not from whenever the watcher
+    /// got around to noticing it: the insert and the polling gap in between
+    /// would otherwise be silently dropped, and pressure that had already
+    /// fallen would be stored as a 0ms recovery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executed_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approved_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -125,6 +133,7 @@ impl EnforcementQueue {
             status,
             created_at: now,
             expires_at: now + self.ttl_secs,
+            executed_at: None,
             approved_by: approved_by.clone(),
             approved_at,
         };
@@ -196,6 +205,7 @@ impl EnforcementQueue {
         }
 
         action.status = ActionStatus::Executed;
+        action.executed_at = Some(current_epoch_secs());
         log::info!("[enforcement] completed {id}");
         Ok(())
     }
