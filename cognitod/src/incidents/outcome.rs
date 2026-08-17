@@ -139,23 +139,37 @@ impl RecoveryOutcome {
 pub async fn await_execution(
     queue: &Arc<EnforcementQueue>,
     action_id: &str,
-    timeout: Duration,
     poll_interval: Duration,
 ) -> bool {
-    let started = Instant::now();
-
     loop {
-        match queue.get_by_id(action_id).await.map(|a| a.status) {
-            Some(ActionStatus::Executed) => return true,
-            Some(ActionStatus::Rejected) | Some(ActionStatus::Expired) | None => return false,
+        let Some(action) = queue.get_by_id(action_id).await else {
+            return false;
+        };
+
+        match action.status {
+            ActionStatus::Executed => return true,
+            ActionStatus::Rejected | ActionStatus::Expired => return false,
             _ => {}
         }
 
-        if started.elapsed() >= timeout {
+        // The deadline is the action's own approval lifetime, not the recovery
+        // window. The queue holds proposals for 300s while the recovery watch
+        // runs for 120s, so borrowing the shorter number would abandon an
+        // incident at two minutes and leave it permanently without an outcome
+        // even though an operator could still validly approve it at four.
+        if current_epoch_secs() >= action.expires_at {
             return false;
         }
+
         tokio::time::sleep(poll_interval).await;
     }
+}
+
+fn current_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// The whole verification, in the order it has to happen: wait for the action
@@ -177,7 +191,7 @@ pub async fn verify_action_outcome<S>(
 where
     S: FnMut() -> Option<f32>,
 {
-    if !await_execution(queue, action_id, watch.max_wait, watch.poll_interval).await {
+    if !await_execution(queue, action_id, watch.poll_interval).await {
         return None;
     }
 
@@ -296,7 +310,7 @@ mod tests {
     async fn an_action_that_never_executes_is_never_credited() {
         use crate::enforcement::{ActionType, EnforcementQueue};
 
-        let queue = Arc::new(EnforcementQueue::new(3_600));
+        let queue = Arc::new(EnforcementQueue::new(5));
         // The default posture: proposed, awaiting a human.
         let id = queue
             .propose_auto(
@@ -312,8 +326,7 @@ mod tests {
             .await
             .unwrap();
 
-        let executed =
-            await_execution(&queue, &id, Duration::from_secs(5), Duration::from_secs(1)).await;
+        let executed = await_execution(&queue, &id, Duration::from_secs(1)).await;
 
         assert!(
             !executed,
@@ -342,13 +355,7 @@ mod tests {
         queue.reject(&id, "operator".to_string()).await.unwrap();
 
         assert!(
-            !await_execution(
-                &queue,
-                &id,
-                Duration::from_secs(600),
-                Duration::from_secs(1)
-            )
-            .await,
+            !await_execution(&queue, &id, Duration::from_secs(1)).await,
             "a rejected action is a decision, not something to keep waiting on"
         );
     }
@@ -357,7 +364,7 @@ mod tests {
     async fn a_pending_action_is_never_measured_however_calm_the_machine_gets() {
         use crate::enforcement::{ActionType, EnforcementQueue};
 
-        let queue = Arc::new(EnforcementQueue::new(3_600));
+        let queue = Arc::new(EnforcementQueue::new(5));
         let id = queue
             .propose_auto(
                 ActionType::KillProcess {
@@ -390,6 +397,59 @@ mod tests {
         assert!(
             outcome.is_none(),
             "an action that never ran must produce no verification at all"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_approval_after_the_recovery_window_is_still_measured() {
+        use crate::enforcement::{ActionType, EnforcementQueue};
+
+        // The production shape: proposals live for 300s, the recovery watch
+        // runs for 120s. An operator approving at minute three is acting well
+        // within the action's life, and that incident must still get an
+        // outcome — borrowing the watch duration as the execution deadline
+        // would abandon it at two minutes, permanently.
+        let queue = Arc::new(EnforcementQueue::new(300));
+        let id = queue
+            .propose_auto(
+                ActionType::KillProcess {
+                    pid: 1234,
+                    signal: 9,
+                },
+                "test".to_string(),
+                "circuit_breaker".to_string(),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let approver = Arc::clone(&queue);
+        let late_id = id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(180)).await;
+            approver
+                .approve(&late_id, "operator".to_string())
+                .await
+                .unwrap();
+            approver.complete(&late_id).await.unwrap();
+        });
+
+        let outcome = verify_action_outcome(
+            &queue,
+            &id,
+            || Some(1.0),
+            RecoveryWatch {
+                poll_interval: Duration::from_secs(1),
+                max_wait: Duration::from_secs(120),
+                recovered_below: 10.0,
+            },
+        )
+        .await;
+
+        assert!(
+            outcome.is_some(),
+            "an action approved at 180s is inside its 300s life and must be measured"
         );
     }
 
@@ -487,7 +547,7 @@ mod tests {
             .unwrap();
         queue.complete(&id).await.unwrap();
 
-        assert!(await_execution(&queue, &id, Duration::from_secs(5), Duration::from_secs(1)).await);
+        assert!(await_execution(&queue, &id, Duration::from_secs(1)).await);
     }
 
     #[tokio::test(start_paused = true)]

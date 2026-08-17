@@ -1113,14 +1113,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                             &outcome_queue,
                                                             &watch_action_id,
                                                             || {
-                                                                // A failed read is not a low
-                                                                // reading: PsiMetrics yields zeros
-                                                                // when /proc/pressure is missing,
-                                                                // and zero would score as an
-                                                                // instant recovery.
-                                                                cognitod::utils::psi::PsiMetrics::read()
-                                                                    .ok()
-                                                                    .map(|m| m.cpu_some_avg10)
+                                                                // Not `PsiMetrics::read`: that
+                                                                // degrades to zeros when
+                                                                // /proc/pressure is unreadable,
+                                                                // and zero is below every
+                                                                // threshold, so a failed read
+                                                                // would score as an instant
+                                                                // recovery.
+                                                                cognitod::utils::psi::PsiMetrics::read_cpu_some_avg10()
                                                             },
                                                             cognitod::incidents::outcome::RecoveryWatch::with_threshold(
                                                                 psi_threshold,
@@ -1253,10 +1253,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         match action.action {
                             cognitod::enforcement::ActionType::KillProcess { pid, signal } => {
                                 info!("[enforcement] EXECUTING KILL pid={} signal={}", pid, signal);
-                                unsafe {
-                                    libc::kill(pid as i32, signal);
+                                let sent = unsafe { libc::kill(pid as i32, signal) };
+                                if sent == 0 {
+                                    let _ = queue_clone.complete(&action.id).await;
+                                } else {
+                                    // The process was already gone, or the
+                                    // signal was refused. Marking this executed
+                                    // would let a later fall in pressure be
+                                    // credited to a kill that never landed.
+                                    let err = std::io::Error::last_os_error();
+                                    warn!(
+                                        "[enforcement] kill pid={} signal={} failed: {}",
+                                        pid, signal, err
+                                    );
+                                    let _ = queue_clone
+                                        .reject(&action.id, "executor: kill failed".to_string())
+                                        .await;
                                 }
-                                let _ = queue_clone.complete(&action.id).await;
                             }
                         }
                     }
