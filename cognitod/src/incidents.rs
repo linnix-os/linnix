@@ -5,6 +5,7 @@
 
 mod analyzer;
 pub mod investigation;
+pub mod outcome;
 
 pub use analyzer::{AnalysisOutcome, IncidentAnalyzer};
 pub use investigation::{Fact, IncidentInvestigation};
@@ -561,6 +562,30 @@ impl IncidentStore {
         Ok((rows, watermark))
     }
 
+    /// Records what happened after the action.
+    ///
+    /// Separate from `insert` because the outcome is not known when the
+    /// incident is written — that is the whole point of measuring it. Called
+    /// once per incident, after the recovery window closes.
+    pub async fn record_outcome(
+        &self,
+        id: i64,
+        outcome: &crate::incidents::outcome::RecoveryOutcome,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE incidents SET psi_after = ?, recovery_time_ms = ? WHERE id = ?")
+            .bind(outcome.psi_after)
+            .bind(outcome.recovery_time_ms)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        debug!(
+            "Recorded outcome for incident #{}: psi_after={:?} recovery={:?}",
+            id, outcome.psi_after, outcome.recovery_time_ms
+        );
+        Ok(())
+    }
+
     /// Get incident by ID
     pub async fn get(&self, id: i64) -> Result<Option<Incident>, sqlx::Error> {
         let row = sqlx::query(
@@ -737,6 +762,13 @@ impl IncidentStore {
 pub struct IncidentStats {
     pub total: u64,
     pub circuit_breaker_triggers: u64,
+    /// Mean recovery time across incidents that *did* recover.
+    ///
+    /// Incidents watched but still stalling at the end of the window record no
+    /// recovery time, so they are absent here rather than counted as slow
+    /// recoveries. Read it as "when it worked, how fast", not "how well it
+    /// works" — `total` against the number with a recovery time is
+    /// the second half of that picture.
     pub avg_recovery_time_ms: Option<u64>,
     pub feedback_entries: u64,
 }

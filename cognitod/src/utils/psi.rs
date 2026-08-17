@@ -83,6 +83,25 @@ impl PsiMetrics {
         Ok(metrics)
     }
 
+    /// CPU "some" pressure over the last 10s, or `None` if it could not be
+    /// read or parsed.
+    ///
+    /// [`PsiMetrics::read`] deliberately degrades to zeros so that a kernel
+    /// without PSI still yields a snapshot. That is the wrong contract for a
+    /// caller that must tell a *low* reading from a *missing* one: zero is
+    /// below every pressure threshold, so a failed read would otherwise look
+    /// like a perfectly healthy machine.
+    pub fn read_cpu_some_avg10() -> Option<f32> {
+        Self::read_cpu_some_avg10_from(&get_psi_path("cpu"))
+    }
+
+    /// The path-taking half, so the failure modes are testable without
+    /// touching `/proc` or process-wide environment.
+    fn read_cpu_some_avg10_from(path: &str) -> Option<f32> {
+        let content = fs::read_to_string(path).ok()?;
+        parse_avg10(&content, "some")
+    }
+
     /// Check if PSI is available on this kernel
     pub fn is_available() -> bool {
         Path::new(&get_psi_path("cpu")).exists()
@@ -123,6 +142,37 @@ fn parse_avg10(content: &str, line_prefix: &str) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_pressure_file_reads_as_unknown_not_as_calm() {
+        // The distinction the recovery watcher depends on: absent is not zero.
+        assert_eq!(
+            PsiMetrics::read_cpu_some_avg10_from("/nonexistent/pressure/cpu"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_malformed_pressure_file_reads_as_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cpu");
+        std::fs::write(&path, "garbage that is not psi\n").unwrap();
+        assert_eq!(
+            PsiMetrics::read_cpu_some_avg10_from(path.to_str().unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_well_formed_pressure_file_yields_its_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cpu");
+        std::fs::write(&path, "some avg10=42.50 avg60=3.45 avg300=2.11 total=1\n").unwrap();
+        assert_eq!(
+            PsiMetrics::read_cpu_some_avg10_from(path.to_str().unwrap()),
+            Some(42.5)
+        );
+    }
 
     #[test]
     fn test_parse_avg10_some() {

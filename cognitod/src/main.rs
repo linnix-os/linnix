@@ -1054,7 +1054,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     )
                                     .await
                                 {
-                                    Ok(_) => {
+                                    Ok(action_id) => {
                                         warn!(
                                             "[circuit_breaker] AUTO-KILLED {}({}): {}",
                                             proc.comm, proc.pid, reason
@@ -1088,6 +1088,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                                             let store_clone = Arc::clone(store);
                                             let analyzer_clone = incident_analyzer_clone.clone();
+                                            let psi_threshold = cb_cfg.cpu_psi_threshold;
+                                            let watch_queue = Arc::clone(&queue_clone);
+                                            let watch_action_id = action_id.clone();
                                             tokio::spawn(async move {
                                                 if let Ok(id) = store_clone.insert(&incident).await
                                                 {
@@ -1095,6 +1098,67 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                         "[circuit_breaker] Incident #{} recorded",
                                                         id
                                                     );
+
+                                                    // Watch what the action actually achieved.
+                                                    // Spawned separately from the analyzer: the
+                                                    // measurement is the part that must happen
+                                                    // whether or not a model is configured.
+                                                    let outcome_store = Arc::clone(&store_clone);
+                                                    let outcome_queue = Arc::clone(&watch_queue);
+                                                    tokio::spawn(async move {
+                                                        // Ordering — wait for execution, then
+                                                        // measure — lives in one tested function
+                                                        // rather than being a convention here.
+                                                        let Some(outcome) = cognitod::incidents::outcome::verify_action_outcome(
+                                                            &outcome_queue,
+                                                            &watch_action_id,
+                                                            || {
+                                                                // Not `PsiMetrics::read`: that
+                                                                // degrades to zeros when
+                                                                // /proc/pressure is unreadable,
+                                                                // and zero is below every
+                                                                // threshold, so a failed read
+                                                                // would score as an instant
+                                                                // recovery.
+                                                                cognitod::utils::psi::PsiMetrics::read_cpu_some_avg10()
+                                                            },
+                                                            cognitod::incidents::outcome::RecoveryWatch::with_threshold(
+                                                                psi_threshold,
+                                                            ),
+                                                        )
+                                                        .await
+                                                        else {
+                                                            info!(
+                                                                "[circuit_breaker] Incident #{} left unverified: the action did not run, or pressure could not be read",
+                                                                id
+                                                            );
+                                                            return;
+                                                        };
+
+                                                        match (
+                                                            outcome.recovery_time_ms,
+                                                            outcome.psi_after,
+                                                        ) {
+                                                            (Some(ms), psi) => info!(
+                                                                "[circuit_breaker] Incident #{} recovered after {}ms (PSI {:?})",
+                                                                id, ms, psi
+                                                            ),
+                                                            (None, psi) => warn!(
+                                                                "[circuit_breaker] Incident #{} did not recover: PSI still {:?} after the watch window",
+                                                                id, psi
+                                                            ),
+                                                        }
+
+                                                        if let Err(e) = outcome_store
+                                                            .record_outcome(id, &outcome)
+                                                            .await
+                                                        {
+                                                            warn!(
+                                                                "[circuit_breaker] Incident #{} outcome not recorded: {}",
+                                                                id, e
+                                                            );
+                                                        }
+                                                    });
 
                                                     if let Some(analyzer) = analyzer_clone {
                                                         tokio::spawn(async move {
@@ -1189,10 +1253,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         match action.action {
                             cognitod::enforcement::ActionType::KillProcess { pid, signal } => {
                                 info!("[enforcement] EXECUTING KILL pid={} signal={}", pid, signal);
-                                unsafe {
-                                    libc::kill(pid as i32, signal);
+                                let sent = unsafe { libc::kill(pid as i32, signal) };
+                                if sent == 0 {
+                                    let _ = queue_clone.complete(&action.id).await;
+                                } else {
+                                    // The process was already gone, or the
+                                    // signal was refused. Marking this executed
+                                    // would let a later fall in pressure be
+                                    // credited to a kill that never landed.
+                                    let err = std::io::Error::last_os_error();
+                                    warn!(
+                                        "[enforcement] kill pid={} signal={} failed: {}",
+                                        pid, signal, err
+                                    );
+                                    // `reject` is the operator's path and only
+                                    // applies to pending proposals; this action
+                                    // is Approved, so rejecting it fails and
+                                    // leaves it to be retried every second
+                                    // against a pid that may be reused.
+                                    let _ = queue_clone
+                                        .fail(&action.id, format!("kill failed: {err}"))
+                                        .await;
                                 }
-                                let _ = queue_clone.complete(&action.id).await;
                             }
                         }
                     }
