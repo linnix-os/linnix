@@ -23,6 +23,11 @@ pub struct IncidentView {
     pub cpu_percent: f32,
     /// Present only when a grounded investigation exists.
     pub investigation_rendered: Option<String>,
+    /// The stored investigation itself. Present-but-unrendered means the
+    /// daemon kept the row and could not read it — a different situation from
+    /// there being no investigation at all, and one the operator has to be
+    /// told about rather than shown a plausible wrong explanation.
+    pub investigation: Option<serde_json::Value>,
     /// The model's reply verbatim. Kept even when nothing grounded, which is
     /// the only way to tell a broken endpoint from a model that answers badly.
     pub llm_analysis: Option<String>,
@@ -78,24 +83,48 @@ pub fn render(incident: &IncidentView, id: &str, color: bool) -> String {
     match &incident.investigation_rendered {
         Some(rendered) => {
             out.push_str(&format!("{}\n", heading("Investigation")));
-            out.push_str(rendered);
+            // Facts quote process names, which are attacker-controlled, and
+            // hypothesis text comes from a model. Either can carry escape
+            // sequences that rewrite what the terminal displays — including
+            // overwriting the evidence above this line.
+            out.push_str(&strip_terminal_controls(rendered));
         }
         None => {
-            // Saying which of the two happened matters: an operator debugging a
-            // silent reasoner needs to know whether the model was never asked
-            // or answered in a way nothing could be checked against.
-            out.push_str(match incident.llm_analysis {
-                Some(_) => {
-                    "No hypothesis survived grounding for this incident: the model \
-                            replied, but nothing it claimed could be checked against the \
-                            facts the daemon supplied.\n"
+            // Three distinct situations, and telling an operator the wrong one
+            // sends them to debug the wrong thing.
+            out.push_str(match (&incident.investigation, &incident.llm_analysis) {
+                // Stored but unrendered: the daemon kept the row and could not
+                // read it — corrupt, or written by a newer build.
+                (Some(_), _) => {
+                    "This incident has a stored investigation the daemon could not read: \
+                     it is corrupt, or was written by a newer version. The raw record is \
+                     still on the incident.\n"
                 }
-                None => "No analysis has run for this incident.\n",
+                (None, Some(_)) => {
+                    "No hypothesis survived grounding for this incident: the model \
+                     replied, but nothing it claimed could be checked against the \
+                     facts the daemon supplied.\n"
+                }
+                (None, None) => "No analysis has run for this incident.\n",
             });
         }
     }
 
     out
+}
+
+/// Removes control characters that a terminal would act on rather than print.
+///
+/// Newline and tab are kept because the daemon's rendering uses them for
+/// layout. Everything else in the C0 range, plus DEL, is dropped — ESC is the
+/// entry point for ANSI and OSC sequences, so removing it disarms the whole
+/// family without needing to parse it. The wording itself is untouched, which
+/// matters: this text is evidence, and rewriting it would defeat the point of
+/// resolving citations through the daemon.
+fn strip_terminal_controls(text: &str) -> String {
+    text.chars()
+        .filter(|c| *c == '\n' || *c == '\t' || (!c.is_control()))
+        .collect()
 }
 
 pub async fn run_explain(
@@ -138,6 +167,7 @@ mod tests {
             psi_cpu: 75.2,
             cpu_percent: 96.3,
             investigation_rendered: None,
+            investigation: None,
             llm_analysis: None,
             psi_after: None,
             recovery_time_ms: None,
@@ -165,6 +195,44 @@ mod tests {
         let never = incident();
         let out = render(&never, "7", false);
         assert!(out.contains("No analysis has run"), "{out}");
+    }
+
+    #[test]
+    fn an_unreadable_investigation_is_not_reported_as_ungrounded() {
+        // The daemon keeps the row and omits the rendering when it cannot
+        // parse it. Reading only `llm_analysis` here would tell the operator
+        // the model failed to ground, sending them to debug the reasoner when
+        // the real problem is a corrupt or newer-version record.
+        let mut view = incident();
+        view.llm_analysis = Some("some prose".to_string());
+        view.investigation = Some(serde_json::json!({"schema_version": 99}));
+
+        let out = render(&view, "7", false);
+        assert!(out.contains("could not read"), "{out}");
+        assert!(
+            !out.contains("No hypothesis survived grounding"),
+            "an unreadable record must not be reported as a grounding failure: {out}"
+        );
+    }
+
+    #[test]
+    fn terminal_controls_in_evidence_are_disarmed() {
+        let mut view = incident();
+        // A process name is attacker-controlled and reaches the facts verbatim.
+        view.investigation_rendered = Some(
+            "1. [cpu_spin] Runaway loop\n   supports:    process \u{1b}[2J\u{1b}[Hevil was busy\n"
+                .to_string(),
+        );
+
+        let out = render(&view, "7", false);
+        assert!(
+            !out.contains('\u{1b}'),
+            "escape sequences must not reach the terminal: {out:?}"
+        );
+        // The wording survives — this is evidence, not decoration.
+        assert!(out.contains("Runaway loop"), "{out}");
+        assert!(out.contains("evil was busy"), "{out}");
+        assert!(out.contains("supports:"), "{out}");
     }
 
     #[test]

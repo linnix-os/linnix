@@ -2009,6 +2009,15 @@ fn with_rendered_investigation(incident: &Incident) -> serde_json::Value {
         return value;
     };
 
+    // Serde ignores unknown fields, so an investigation written by a newer
+    // build parses here and would be re-serialised at *this* version — quietly
+    // dropping whatever it knew and rendering the remainder with older
+    // semantics. `IncidentStore::get_investigation` already refuses those, and
+    // this path has to agree or one row means two things depending on route.
+    if parsed.schema_version > cognitod::incidents::investigation::SCHEMA_VERSION {
+        return value;
+    }
+
     if let Some(obj) = value.as_object_mut() {
         obj.insert(
             "investigation".into(),
@@ -3478,6 +3487,57 @@ mod tests {
 
         // The raw reply is still there, unchanged.
         assert_eq!(json["llm_analysis"], "raw model reply");
+    }
+
+    /// An investigation from a newer build must be handed back untouched.
+    ///
+    /// Serde ignores unknown fields, so it parses cleanly here; re-serialising
+    /// it would silently drop what that build knew and render the remainder
+    /// with this build's semantics. `IncidentStore::get_investigation` already
+    /// refuses those, and both routes have to agree.
+    #[tokio::test]
+    async fn an_investigation_from_a_newer_build_is_left_alone() {
+        let incident = cognitod::Incident {
+            id: Some(1),
+            timestamp: 1_732_242_135,
+            event_type: "circuit_breaker_cpu".to_string(),
+            psi_cpu: 75.21,
+            psi_memory: 12.34,
+            cpu_percent: 96.3,
+            load_avg: "26.00,24.20,21.30".to_string(),
+            action: "auto_kill".to_string(),
+            target_pid: Some(472_693),
+            target_name: Some("aggressive-stress.sh".to_string()),
+            system_snapshot: None,
+            llm_analysis: Some("raw model reply".to_string()),
+            llm_analyzed_at: Some(1_732_242_200),
+            investigation: Some(
+                r#"{"schema_version":99,"hypotheses":[],"discarded":[],
+                    "facts":[],"certainty_note":"from the future"}"#
+                    .to_string(),
+            ),
+            recovery_time_ms: None,
+            psi_after: None,
+        };
+
+        let value = super::with_rendered_investigation(&incident);
+
+        assert!(
+            value.get("investigation_rendered").is_none(),
+            "a future-version investigation must not be rendered with today's semantics"
+        );
+        assert!(
+            value["investigation"].is_string(),
+            "it must be handed back exactly as stored, got: {}",
+            value["investigation"]
+        );
+        assert!(
+            value["investigation"]
+                .as_str()
+                .unwrap()
+                .contains("from the future"),
+            "nothing may be dropped from it"
+        );
     }
 
     /// An incident with no investigation must not grow empty fields that read
