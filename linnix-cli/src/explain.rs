@@ -35,6 +35,31 @@ pub struct IncidentView {
     pub recovery_time_ms: Option<i64>,
 }
 
+impl IncidentView {
+    /// Strips terminal controls from every string that arrived from the
+    /// daemon, once, on the way in.
+    ///
+    /// Doing this per-field at the point of printing is what failed review:
+    /// `investigation_rendered` was sanitized and `target_name` — which is
+    /// `proc.comm`, chosen by whoever started the process — was not. Cleaning
+    /// at the boundary means a field added later cannot reintroduce the hole,
+    /// and it keeps the intended styling below safe, since that is applied
+    /// after this runs rather than being stripped by it.
+    fn sanitized(self) -> Self {
+        Self {
+            event_type: strip_terminal_controls(&self.event_type),
+            action: strip_terminal_controls(&self.action),
+            target_name: self.target_name.as_deref().map(strip_terminal_controls),
+            investigation_rendered: self
+                .investigation_rendered
+                .as_deref()
+                .map(strip_terminal_controls),
+            llm_analysis: self.llm_analysis.as_deref().map(strip_terminal_controls),
+            ..self
+        }
+    }
+}
+
 /// Renders the incident. Returned rather than printed so tests can read it.
 pub fn render(incident: &IncidentView, id: &str, color: bool) -> String {
     let heading = |s: &str| {
@@ -87,7 +112,7 @@ pub fn render(incident: &IncidentView, id: &str, color: bool) -> String {
             // hypothesis text comes from a model. Either can carry escape
             // sequences that rewrite what the terminal displays — including
             // overwriting the evidence above this line.
-            out.push_str(&strip_terminal_controls(rendered));
+            out.push_str(rendered);
         }
         None => {
             // Three distinct situations, and telling an operator the wrong one
@@ -149,7 +174,7 @@ pub async fn run_explain(
     }
 
     let incident: IncidentView = resp.json().await?;
-    print!("{}", render(&incident, id, color));
+    print!("{}", render(&incident.sanitized(), id, color));
     Ok(())
 }
 
@@ -216,6 +241,44 @@ mod tests {
     }
 
     #[test]
+    fn every_daemon_supplied_string_is_disarmed_not_just_the_evidence() {
+        // `target_name` is `proc.comm`: whoever started the process chose it.
+        // The header prints before the investigation, so an escape here can
+        // clear the screen and rewrite everything that follows.
+        let mut view = incident();
+        view.target_name = Some("\u{1b}[2J\u{1b}[Hinnocent".to_string());
+        view.event_type = "\u{1b}[31mcircuit_breaker_cpu".to_string();
+        view.action = "auto_kill\u{7}".to_string();
+        view.llm_analysis = Some("prose\u{1b}[2J".to_string());
+
+        let out = render(&view.sanitized(), "7", false);
+
+        assert!(
+            !out.contains('\u{1b}') && !out.contains('\u{7}'),
+            "no daemon-supplied string may carry terminal controls: {out:?}"
+        );
+        // The names themselves survive — an operator still needs to read them.
+        assert!(out.contains("innocent"), "{out}");
+        assert!(out.contains("circuit_breaker_cpu"), "{out}");
+        assert!(out.contains("auto_kill"), "{out}");
+    }
+
+    #[test]
+    fn sanitizing_does_not_strip_the_cli_own_styling() {
+        // `colored` disables itself when stdout is not a terminal, which it is
+        // not under a test harness, so the override is what makes this assert
+        // anything at all.
+        colored::control::set_override(true);
+        let out = render(&incident().sanitized(), "7", true);
+        colored::control::unset_override();
+
+        assert!(
+            out.contains('\u{1b}'),
+            "styling is applied after cleaning and must survive it"
+        );
+    }
+
+    #[test]
     fn terminal_controls_in_evidence_are_disarmed() {
         let mut view = incident();
         // A process name is attacker-controlled and reaches the facts verbatim.
@@ -224,7 +287,7 @@ mod tests {
                 .to_string(),
         );
 
-        let out = render(&view, "7", false);
+        let out = render(&view.sanitized(), "7", false);
         assert!(
             !out.contains('\u{1b}'),
             "escape sequences must not reach the terminal: {out:?}"
