@@ -8,6 +8,7 @@ mod alert;
 mod blame;
 mod doctor;
 mod event;
+mod explain;
 mod export;
 mod http;
 mod investigate;
@@ -63,6 +64,16 @@ enum Command {
         /// Time window to investigate (e.g. 20m, 1h)
         #[clap(long, default_value = "15m")]
         since: String,
+    },
+    /// Explain an incident: what was concluded, and on what evidence
+    Explain {
+        /// Incident id, as shown by /incidents
+        ///
+        /// Numeric on purpose: it is printed in the header and interpolated
+        /// into the request URL, and an id copied from a ticket or an alert
+        /// payload is not necessarily trustworthy. Parsing it here means a
+        /// forged value is rejected rather than escaped.
+        id: i64,
     },
     /// Blame a node for performance issues (requires kubectl)
     Blame {
@@ -121,6 +132,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     if let Some(Command::Investigate { pod, since }) = args.command.clone() {
         investigate::run_investigate(&client, &args.url, &pod, &since, color).await?;
+        return Ok(());
+    }
+
+    if let Some(Command::Explain { id }) = args.command.clone() {
+        explain::run_explain(&client, &args.url, id, color).await?;
         return Ok(());
     }
 

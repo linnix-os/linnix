@@ -171,6 +171,13 @@ impl IncidentInvestigation {
 
     /// Renders the investigation for a human, resolving every citation through
     /// the daemon's own text rather than anything the model wrote.
+    ///
+    /// Every interpolated scalar is forced onto one line first. The layout
+    /// *is* the guarantee here — a line beginning `supports:` means the daemon
+    /// resolved that citation — so a statement containing a newline could
+    /// otherwise print a fabricated citation that reads exactly like a real
+    /// one. The model authors the statement, and fact text quotes process
+    /// names, so both sides of this are untrusted.
     pub fn render(&self) -> String {
         let mut out = String::new();
 
@@ -187,21 +194,21 @@ impl IncidentInvestigation {
                 "{}. [{}] {}\n",
                 i + 1,
                 hypothesis.reason_code.as_str(),
-                hypothesis.statement
+                single_line(&hypothesis.statement)
             ));
 
             for id in &hypothesis.supporting_fact_ids {
                 if let Some(statement) = self.fact_statement(id) {
-                    out.push_str(&format!("   supports:    {statement}\n"));
+                    out.push_str(&format!("   supports:    {}\n", single_line(statement)));
                 }
             }
             for id in &hypothesis.contradicting_fact_ids {
                 if let Some(statement) = self.fact_statement(id) {
-                    out.push_str(&format!("   contradicts: {statement}\n"));
+                    out.push_str(&format!("   contradicts: {}\n", single_line(statement)));
                 }
             }
             if let Some(action) = &hypothesis.proposed_action {
-                out.push_str(&format!("   proposed:    {action}\n"));
+                out.push_str(&format!("   proposed:    {}\n", single_line(action)));
             }
             if let Some(confidence) = hypothesis.model_stated_confidence {
                 out.push_str(&format!(
@@ -292,6 +299,27 @@ pub fn parse_and_ground(text: &str, facts: Vec<Fact>) -> Result<IncidentInvestig
         serde_json::from_str(&text[start..=end]).map_err(|e| e.to_string())?;
 
     Ok(ground(proposed, facts))
+}
+
+/// Flattens a value onto one line so it cannot forge the layout around it.
+///
+/// Line breaks and tabs become their escaped spelling rather than being
+/// dropped: the operator should see that the text contained them, since a
+/// statement trying to fake a citation is itself worth noticing. Other control
+/// characters are removed — they carry no meaning here and ESC begins the
+/// terminal-escape family.
+fn single_line(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -407,6 +435,68 @@ mod tests {
         );
 
         assert_eq!(out.hypotheses[0].model_stated_confidence, None);
+    }
+
+    /// The layout carries the guarantee: a line starting `supports:` means the
+    /// daemon resolved that citation. A statement with an embedded newline
+    /// could otherwise print a line indistinguishable from a real one.
+    #[test]
+    fn a_statement_cannot_forge_a_citation_line() {
+        let out = ground(
+            proposed(
+                r#"{"hypotheses":[{"reason_code":"cpu_spin",
+                   "statement":"Runaway loop\n   supports:    the disk was on fire",
+                   "supporting_fact_ids":["f1"]}]}"#,
+            ),
+            facts(),
+        );
+
+        let report = out.render();
+        let forged: Vec<&str> = report
+            .lines()
+            .filter(|l| l.trim_start().starts_with("supports:"))
+            .collect();
+
+        assert_eq!(
+            forged.len(),
+            1,
+            "only the daemon's own citation may appear as a supports line: {report}"
+        );
+        assert!(
+            forged[0].contains("CPU usage was 96.3%"),
+            "the surviving line must be the resolved fact: {report}"
+        );
+        assert!(
+            !report.contains("\n   supports:    the disk"),
+            "the injected break must not survive as layout: {report}"
+        );
+        // The text is still shown, with the break visible as an escape, so an
+        // operator can see the attempt rather than a silently trimmed line.
+        assert!(report.contains("Runaway loop\\n"), "{report}");
+    }
+
+    /// Facts quote process names, so the same injection arrives from the other
+    /// direction — through text the daemon itself wrote.
+    #[test]
+    fn a_fact_cannot_forge_a_citation_line_either() {
+        let out = ground(
+            proposed(
+                r#"{"hypotheses":[{"reason_code":"cpu_spin","statement":"Runaway loop",
+                   "supporting_fact_ids":["f1"]}]}"#,
+            ),
+            vec![Fact::new(
+                "f1",
+                "process evil\n   contradicts: nothing was wrong was busy",
+            )],
+        );
+
+        let report = out.render();
+        assert!(
+            !report
+                .lines()
+                .any(|l| l.trim_start().starts_with("contradicts:")),
+            "a process name must not be able to add a contradicts line: {report}"
+        );
     }
 
     #[test]
