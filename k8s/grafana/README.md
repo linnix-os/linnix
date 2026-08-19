@@ -24,7 +24,7 @@ purpose. Don't sum across the two.
 ## Metrics listener
 
 The Kubernetes DaemonSet serves Prometheus on its separate operational listener
-at port 9090. This endpoint is intentionally unauthenticated so Prometheus and
+at port 9464. This endpoint is intentionally unauthenticated so Prometheus and
 Kubernetes probes can scrape it, but it exposes no process, incident, system,
 or enforcement routes. The API remains on port 3000 and requires the
 Secret-backed bearer token.
@@ -45,7 +45,7 @@ explicit scrape job can use the same dedicated port without API credentials:
       regex: linnix
     - source_labels: [__meta_kubernetes_pod_ip]
       target_label: __address__
-      replacement: $1:9090
+      replacement: $1:9464
     - target_label: __metrics_path__
       replacement: /metrics/prometheus
     - source_labels: [__meta_kubernetes_pod_node_name]
@@ -71,13 +71,13 @@ spec:
 ## If the panels are empty
 
 1. **Is the endpoint on?** `kubectl exec` into an agent pod and
-   `curl localhost:9090/metrics/prometheus`. A 404 means `[outputs] prometheus`
+   `curl localhost:9464/metrics/prometheus`. A 404 means `[outputs] prometheus`
    is not set — check the ConfigMap.
 2. **Is Prometheus scraping it?** The DaemonSet carries `prometheus.io/scrape`
    annotations, which the standard `kubernetes-pods` job honours. Prometheus
    Operator ignores annotations; add a `PodMonitor` selecting `app: linnix` on
-   port 9090, path `/metrics/prometheus`.
-3. **Are the probes attached?** `curl localhost:9090/readyz`. Attribution is
+   port 9464, path `/metrics/prometheus`.
+3. **Are the probes attached?** `curl localhost:9464/readyz`. Attribution is
    kernel-derived, so a node running userspace-only reports nothing to blame.
 4. **Has anything stalled yet?** The offender metric only appears once a pod
    sustains pressure for `sustained_pressure_seconds`. On an idle cluster both

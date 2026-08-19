@@ -389,7 +389,7 @@ curl -fsSL https://raw.githubusercontent.com/linnix-os/linnix/main/docs/examples
 | SSH | TCP | 22 | Your IP | SSH access |
 | Custom TCP | TCP | 3000 | Your IP / VPC CIDR | Linnix API/Dashboard |
 | Custom TCP | TCP | 8090 | Localhost only | LLM Server (internal) |
-| Custom TCP | TCP | 9090 | Your IP (optional) | Prometheus metrics |
+| Custom TCP | TCP | 9464 | Your IP (optional) | Prometheus metrics |
 
 **Note:** Port 8090 (LLM server) should typically only be accessible from localhost. The cognitod service connects to it internally via `http://127.0.0.1:8090`.
 
@@ -451,9 +451,9 @@ enabled = true  # Enable if you have LLM installed via Docker
 endpoint = "http://127.0.0.1:8090/v1/chat/completions"
 model = "linnix-3b-distilled"
 
-[prometheus]
-enabled = true  # Enable Prometheus metrics
-listen_addr = "0.0.0.0:9090"
+[outputs]
+prometheus = true  # Enable Prometheus metrics
+metrics_listen_addr = "0.0.0.0:9464"
 
 [alerts]
 # Add Apprise notification URLs

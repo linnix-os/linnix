@@ -13,9 +13,10 @@ services:
     # Override network mode from host to bridge
     network_mode: bridge
     
-    # Map port 3000 to macOS host
+    # Keep the unauthenticated operational listener local to the macOS host.
     ports:
       - "3000:3000"
+      - "127.0.0.1:9464:9464"
     
     # Can't use pid: host on macOS
     pid: null

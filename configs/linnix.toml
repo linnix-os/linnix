@@ -30,7 +30,7 @@ timeout_ms = 30000
 [outputs]
 # Serve Prometheus, health, and readiness on a separate operational listener.
 prometheus = true
-metrics_listen_addr = "127.0.0.1:9090"
+metrics_listen_addr = "127.0.0.1:9464"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Notifications via Apprise (optional)

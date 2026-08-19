@@ -1391,23 +1391,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let api = all_routes(app_state.clone());
     let listener = TcpListener::bind(&listen_addr).await?;
 
-    let metrics_listener = if config.outputs.prometheus {
-        let metrics_listen_addr = std::env::var("LINNIX_METRICS_LISTEN_ADDR")
-            .unwrap_or(config.outputs.metrics_listen_addr.clone());
-        let metrics_listener =
-            TcpListener::bind(&metrics_listen_addr)
-                .await
-                .with_context(|| {
-                    format!("failed to bind operational metrics listener on {metrics_listen_addr}")
-                })?;
-        info!(
-            "[cognitod] operational metrics server on http://{}",
-            metrics_listen_addr
-        );
-        Some(metrics_listener)
-    } else {
-        None
-    };
+    let metrics_listen_addr = std::env::var("LINNIX_METRICS_LISTEN_ADDR")
+        .unwrap_or(config.outputs.metrics_listen_addr.clone());
+    let metrics_listener = TcpListener::bind(&metrics_listen_addr)
+        .await
+        .with_context(|| {
+            format!("failed to bind operational metrics listener on {metrics_listen_addr}")
+        })?;
+    info!(
+        "[cognitod] operational metrics server on http://{}",
+        metrics_listen_addr
+    );
 
     info!("[cognitod] HTTP server on http://{}", listen_addr);
     tokio::spawn(async move {
@@ -1416,14 +1410,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
-    if let Some(metrics_listener) = metrics_listener {
-        let metrics_api = metrics_routes(app_state.clone());
-        tokio::spawn(async move {
-            if let Err(e) = axum::serve(metrics_listener, metrics_api).await {
-                eprintln!("metrics server error: {e}");
-            }
-        });
-    }
+    let metrics_api = metrics_routes(app_state.clone());
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(metrics_listener, metrics_api).await {
+            eprintln!("metrics server error: {e}");
+        }
+    });
 
     // ── Unix domain socket listener (bypasses token auth) ──
     let uds_path = std::env::var("LINNIX_UDS_PATH")

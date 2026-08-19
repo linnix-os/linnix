@@ -32,7 +32,7 @@ output "api_healthz_url" {
 
 output "prometheus_url" {
   description = "URL to access Prometheus metrics"
-  value       = var.enable_prometheus ? "http://${var.allocate_elastic_ip ? aws_eip.linnix[0].public_ip : aws_instance.linnix.public_ip}:9090/metrics" : null
+  value       = var.enable_prometheus ? "http://${var.allocate_elastic_ip ? aws_eip.linnix[0].public_ip : aws_instance.linnix.public_ip}:9464/metrics/prometheus" : null
 }
 
 output "ssh_command" {

@@ -14,6 +14,7 @@ NC='\033[0m' # No Color
 # --- Globals ---
 COMPOSE_CMD=""
 ACTION="start"
+API_TOKEN_FILE=""
 # The LLM is optional: attribution works without it. Opt in with --with-ai.
 WITH_AI=false
 
@@ -92,6 +93,38 @@ detect_compose() {
     if [ "$WITH_AI" = true ] || [ "$ACTION" = "stop" ]; then
         COMPOSE_CMD="$COMPOSE_CMD --profile ai"
     fi
+}
+
+# Docker Desktop requires the API to bind beyond container loopback. Persist a
+# generated token so repeated quickstart runs keep the same API credentials.
+ensure_macos_api_token() {
+    if [[ "$OSTYPE" != "darwin"* ]]; then
+        return
+    fi
+
+    if [ -n "${LINNIX_API_TOKEN:-}" ]; then
+        echo -e "${GREEN}✅ Using LINNIX_API_TOKEN from the environment.${NC}"
+        return
+    fi
+
+    local config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+    API_TOKEN_FILE="$config_home/linnix/quickstart-api-token"
+    if [ -s "$API_TOKEN_FILE" ]; then
+        LINNIX_API_TOKEN="$(<"$API_TOKEN_FILE")"
+    else
+        mkdir -p "$(dirname "$API_TOKEN_FILE")"
+        if command -v openssl &> /dev/null; then
+            LINNIX_API_TOKEN="$(openssl rand -hex 32)"
+        elif command -v od &> /dev/null; then
+            LINNIX_API_TOKEN="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+        else
+            echo -e "${RED}❌ Cannot generate an API token: openssl and od are unavailable.${NC}"
+            exit 1
+        fi
+        (umask 077 && printf '%s\n' "$LINNIX_API_TOKEN" > "$API_TOKEN_FILE")
+        echo -e "${GREEN}✅ Generated an API token at $API_TOKEN_FILE.${NC}"
+    fi
+    export LINNIX_API_TOKEN
 }
 
 # Check for all necessary prerequisites
@@ -182,7 +215,7 @@ check_model() {
 check_ports() {
     echo -e "\n${BLUE}[3/5]${NC} Checking port availability..."
     local ports_in_use=()
-    local required_ports=(3000)
+    local required_ports=(3000 9464)
     [ "$WITH_AI" = true ] && required_ports+=(8090)
     
     for port in "${required_ports[@]}"; do
@@ -292,7 +325,7 @@ wait_for_health() {
     echo -e "\n${BLUE}[5/5]${NC} Waiting for services to become healthy..."
     echo -n "   Cognitod: "
     for i in {1..30}; do
-        if curl -sf http://localhost:3000/healthz > /dev/null; then
+        if curl -sf http://localhost:9464/healthz > /dev/null; then
             echo -e "${GREEN}✅ Running${NC}"
             break
         fi
@@ -335,11 +368,22 @@ show_summary() {
     if [ "$WITH_AI" = true ]; then
         echo "   • LLM Server:               http://localhost:8090"
     fi
-    echo "   • Prometheus Metrics:       http://localhost:3000/metrics/prometheus"
+    echo "   • Prometheus Metrics:       http://localhost:9464/metrics/prometheus"
     echo ""
     echo -e "${GREEN}Quick Commands:${NC}"
-    echo "   • Watch alerts:             curl -N http://localhost:3000/stream"
-    echo "   • Get LLM insights:         curl http://localhost:3000/insights | jq"
+    if [ -n "${LINNIX_API_TOKEN:-}" ]; then
+        if [ -n "$API_TOKEN_FILE" ]; then
+            echo "   • API token:                $API_TOKEN_FILE"
+            echo "   • Watch alerts:             curl -H \"Authorization: Bearer \$(cat '$API_TOKEN_FILE')\" -N http://localhost:3000/stream"
+            echo "   • Get LLM insights:         curl -H \"Authorization: Bearer \$(cat '$API_TOKEN_FILE')\" http://localhost:3000/insights | jq"
+        else
+            echo '   • Watch alerts:             curl -H "Authorization: Bearer $LINNIX_API_TOKEN" -N http://localhost:3000/stream'
+            echo '   • Get LLM insights:         curl -H "Authorization: Bearer $LINNIX_API_TOKEN" http://localhost:3000/insights | jq'
+        fi
+    else
+        echo "   • Watch alerts:             curl -N http://localhost:3000/stream"
+        echo "   • Get LLM insights:         curl http://localhost:3000/insights | jq"
+    fi
     echo "   • View all logs:            $COMPOSE_CMD logs -f"
     echo "   • Stop services:            ./quickstart.sh stop"
     echo ""
@@ -372,6 +416,7 @@ main() {
         exit 0
     fi
 
+    ensure_macos_api_token
     banner
     check_prerequisites
     check_model
