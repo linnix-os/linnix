@@ -167,10 +167,17 @@ pub fn render(incident: &IncidentView, id: i64, color: bool) -> String {
                      version that cannot render it. Upgrade cognitod, or read the raw \
                      record on the incident.\n"
                 }
+                // Not a grounding failure. A reply that parses but whose
+                // hypotheses are all discarded is still *stored* as an
+                // investigation and renders its own "no grounded hypothesis"
+                // message above. Reaching here means the reply could not be
+                // parsed at all — malformed JSON, or prose where an object was
+                // expected — so pointing the operator at the model's evidence
+                // would send them to debug the wrong half of it.
                 (None, Some(_)) => {
-                    "No hypothesis survived grounding for this incident: the model \
-                     replied, but nothing it claimed could be checked against the \
-                     facts the daemon supplied.\n"
+                    "The model replied, but the response could not be parsed into an \
+                     investigation: it was malformed, or not in the expected shape. \
+                     The raw reply is on the incident.\n"
                 }
                 (None, None) => "No analysis has run for this incident.\n",
             });
@@ -273,15 +280,46 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_that_did_not_ground_is_distinguished_from_no_analysis() {
+    fn an_unparseable_reply_is_named_as_such_not_as_a_grounding_failure() {
+        // A reply whose hypotheses are all discarded still parses, so it is
+        // stored and renders its own "no grounded hypothesis" message. A
+        // stored reply with no investigation means the opposite: the response
+        // could not be parsed. Telling an operator their model produced
+        // uncheckable evidence would send them to debug its reasoning when the
+        // problem is its output format.
         let mut answered = incident();
-        answered.llm_analysis = Some("some prose".to_string());
+        answered.llm_analysis = Some("I think the CPU was busy.".to_string());
+
         let out = render(&answered, 7, false);
-        assert!(out.contains("nothing it claimed could be checked"), "{out}");
+        assert!(out.contains("could not be parsed"), "{out}");
+        assert!(
+            !out.contains("nothing it claimed could be checked"),
+            "a parse failure is not a grounding failure: {out}"
+        );
 
         let never = incident();
         let out = render(&never, 7, false);
         assert!(out.contains("No analysis has run"), "{out}");
+    }
+
+    /// The genuine grounding failure travels the other path: it is stored, so
+    /// it arrives as a rendering rather than as an absence.
+    #[test]
+    fn a_grounding_failure_arrives_as_the_daemons_own_rendering() {
+        let mut view = incident();
+        view.llm_analysis = Some("valid but unsupported".to_string());
+        view.investigation = Some(serde_json::json!({"schema_version": 1, "hypotheses": []}));
+        view.investigation_rendered = Some(Some(
+            "No grounded hypothesis for this incident.\n1 hypothesis discarded: cited unknown facts.\n"
+                .to_string(),
+        ));
+
+        let out = render(&view.sanitized(), 7, false);
+        assert!(out.contains("No grounded hypothesis"), "{out}");
+        assert!(
+            !out.contains("could not be parsed"),
+            "a stored investigation is not a parse failure: {out}"
+        );
     }
 
     /// The three states, taken through actual deserialization.
