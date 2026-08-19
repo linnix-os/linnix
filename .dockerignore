@@ -63,6 +63,12 @@ venv/
 .env*
 !.env.distilled
 
+# Secrets and local workflow state
+_workflow/
+*.pem
+*.key
+.ssh/
+
 # Database
 *.db
 *.sqlite

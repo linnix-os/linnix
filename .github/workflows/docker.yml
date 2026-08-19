@@ -31,6 +31,52 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Verify Docker context excludes local secrets
+        run: |
+          set -euo pipefail
+          mkdir -p _workflow/ssh .ssh
+          printf '%s\n' 'docker-context-secret-sentinel' > _workflow/ssh/docker-context-secret-check.pem
+          printf '%s\n' 'docker-context-secret-sentinel' > docker-context-secret-check.key
+          printf '%s\n' 'docker-context-secret-sentinel' > .ssh/docker-context-secret-check.key
+          trap 'rm -f _workflow/ssh/docker-context-secret-check.pem docker-context-secret-check.key .ssh/docker-context-secret-check.key' EXIT
+
+          mapfile -t secret_candidates < <(
+            find . \
+              -path './.git' -prune -o \
+              -type f \( \
+                -path './_workflow/*' -o \
+                -path './.ssh/*' -o \
+                -name '*.pem' -o \
+                -name '*.key' \
+              \) -printf '%P\n'
+          )
+
+          if [ "${#secret_candidates[@]}" -lt 3 ]
+          then
+            echo "::error::Docker context secret sentinel setup failed"
+            exit 1
+          fi
+
+          for path in "${secret_candidates[@]}"
+          do
+            dockerfile="$(mktemp)"
+            printf 'FROM scratch\nCOPY %s /leak\n' "${path}" > "${dockerfile}"
+            if output="$(docker buildx build --progress=plain -f "${dockerfile}" . 2>&1)"
+            then
+              echo "::error file=.dockerignore::${path} is available to the Docker build context"
+              exit 1
+            fi
+            if ! grep -Eq 'excluded by \.dockerignore|not found|failed to (calculate checksum|compute cache key)' <<<"${output}"
+            then
+              echo "${output}"
+              echo "::error::Docker context check failed before verifying ${path}"
+              exit 1
+            fi
+            rm -f "${dockerfile}"
+          done
+
+          echo "Docker context excludes local secret sentinels."
+
       - name: Log in to Container Registry
         if: github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork
         uses: docker/login-action@v3
