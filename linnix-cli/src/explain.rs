@@ -9,7 +9,7 @@
 
 use colored::*;
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::error::Error;
 
 #[derive(Deserialize, Debug)]
@@ -25,12 +25,14 @@ pub struct IncidentView {
     ///
     /// Three states that have to stay distinct: a string is the rendering; an
     /// explicit `null` means this daemon tried and could not read the stored
-    /// record; an **absent** key means the daemon predates this field. Typed
-    /// as `Value` because serde cannot otherwise tell a null from a missing
-    /// key, and collapsing those two reports a version skew as a corrupt
-    /// record.
-    #[serde(default)]
-    pub investigation_rendered: Option<serde_json::Value>,
+    /// record; an **absent** key means the daemon predates this field.
+    ///
+    /// A double option because serde collapses an explicit `null` to `None`
+    /// exactly as it does a missing key — `Option<T>` of any inner type cannot
+    /// express this, which is how a real unreadable record got reported as a
+    /// version skew. Outer `None` is "key absent"; `Some(None)` is "null".
+    #[serde(default, deserialize_with = "deserialize_present")]
+    pub investigation_rendered: Option<Option<String>>,
     /// The stored investigation itself. Present-but-unrendered means the
     /// daemon kept the row and could not read it — a different situation from
     /// there being no investigation at all, and one the operator has to be
@@ -41,6 +43,19 @@ pub struct IncidentView {
     pub llm_analysis: Option<String>,
     pub psi_after: Option<f32>,
     pub recovery_time_ms: Option<i64>,
+}
+
+/// Keeps `null` distinguishable from a missing key.
+///
+/// Serde's own `Option` impl answers "was it null *or* absent" with one
+/// `None`. Wrapping it means the outer layer records presence and the inner
+/// one records the value, which is the only way to carry a three-state field
+/// over JSON.
+fn deserialize_present<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 impl IncidentView {
@@ -65,12 +80,9 @@ impl IncidentView {
             // The one field whose newlines *are* the daemon's layout. Its
             // scalars were already flattened server-side before being placed
             // into that layout, so only escape sequences need removing here.
-            investigation_rendered: self.investigation_rendered.map(|v| match v {
-                serde_json::Value::String(s) => {
-                    serde_json::Value::String(strip_terminal_controls(&s))
-                }
-                other => other,
-            }),
+            investigation_rendered: self
+                .investigation_rendered
+                .map(|inner| inner.as_deref().map(strip_terminal_controls)),
             llm_analysis: self.llm_analysis.as_deref().map(single_line),
             ..self
         }
@@ -125,7 +137,7 @@ pub fn render(incident: &IncidentView, id: i64, color: bool) -> String {
     match incident
         .investigation_rendered
         .as_ref()
-        .and_then(|v| v.as_str())
+        .and_then(|inner| inner.as_deref())
     {
         Some(rendered) => {
             out.push_str(&format!("{}\n", heading("Investigation")));
@@ -251,8 +263,8 @@ mod tests {
     #[test]
     fn the_daemons_rendering_is_printed_verbatim() {
         let mut view = incident();
-        view.investigation_rendered = Some(serde_json::json!(
-            "1. [cpu_spin] A runaway loop\n   supports:    CPU usage was 96.3%\n"
+        view.investigation_rendered = Some(Some(
+            "1. [cpu_spin] A runaway loop\n   supports:    CPU usage was 96.3%\n".to_string(),
         ));
 
         let out = render(&view, 7, false);
@@ -270,6 +282,59 @@ mod tests {
         let never = incident();
         let out = render(&never, 7, false);
         assert!(out.contains("No analysis has run"), "{out}");
+    }
+
+    /// The three states, taken through actual deserialization.
+    ///
+    /// The previous version of this contract was tested by building the struct
+    /// by hand, which is exactly why it passed while being broken: serde
+    /// collapses an explicit `null` into `None` just as it does a missing key,
+    /// and a hand-built value never exercises that.
+    #[test]
+    fn the_wire_format_carries_all_three_states() {
+        let base =
+            r#""timestamp":1,"event_type":"cb","action":"kill","psi_cpu":1.0,"cpu_percent":1.0"#;
+
+        let rendered: IncidentView =
+            serde_json::from_str(&format!(r#"{{{base},"investigation_rendered":"text"}}"#))
+                .unwrap();
+        assert_eq!(
+            rendered.investigation_rendered,
+            Some(Some("text".to_string())),
+            "a string is the rendering"
+        );
+
+        let unreadable: IncidentView =
+            serde_json::from_str(&format!(r#"{{{base},"investigation_rendered":null}}"#)).unwrap();
+        assert_eq!(
+            unreadable.investigation_rendered,
+            Some(None),
+            "an explicit null means the daemon tried and could not"
+        );
+
+        let older: IncidentView = serde_json::from_str(&format!(r#"{{{base}}}"#)).unwrap();
+        assert_eq!(
+            older.investigation_rendered, None,
+            "an absent key means the daemon predates the field"
+        );
+    }
+
+    /// And the diagnosis that depends on it, driven from JSON rather than from
+    /// a struct literal.
+    #[test]
+    fn an_unreadable_record_from_the_wire_is_not_called_a_version_skew() {
+        let json = r#"{"timestamp":1,"event_type":"cb","action":"kill","psi_cpu":1.0,
+            "cpu_percent":1.0,"llm_analysis":"prose",
+            "investigation":{"schema_version":99},"investigation_rendered":null}"#;
+
+        let view: IncidentView = serde_json::from_str(json).unwrap();
+        let out = render(&view.sanitized(), 7, false);
+
+        assert!(out.contains("could not read"), "{out}");
+        assert!(
+            !out.contains("older version"),
+            "an explicit null is this daemon failing, not an old one: {out}"
+        );
     }
 
     #[test]
@@ -302,7 +367,7 @@ mod tests {
         view.investigation = Some(serde_json::json!({"schema_version": 99}));
         // The daemon says "I tried and could not" with an explicit null, which
         // is what separates this from a daemon that has no such field.
-        view.investigation_rendered = Some(serde_json::Value::Null);
+        view.investigation_rendered = Some(None);
 
         let out = render(&view, 7, false);
         assert!(out.contains("could not read"), "{out}");
@@ -399,8 +464,9 @@ mod tests {
     fn terminal_controls_in_evidence_are_disarmed() {
         let mut view = incident();
         // A process name is attacker-controlled and reaches the facts verbatim.
-        view.investigation_rendered = Some(serde_json::json!(
+        view.investigation_rendered = Some(Some(
             "1. [cpu_spin] Runaway loop\n   supports:    process \u{1b}[2J\u{1b}[Hevil was busy\n"
+                .to_string(),
         ));
 
         let out = render(&view.sanitized(), 7, false);
