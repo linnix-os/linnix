@@ -68,7 +68,12 @@ enum Command {
     /// Explain an incident: what was concluded, and on what evidence
     Explain {
         /// Incident id, as shown by /incidents
-        id: String,
+        ///
+        /// Numeric on purpose: it is printed in the header and interpolated
+        /// into the request URL, and an id copied from a ticket or an alert
+        /// payload is not necessarily trustworthy. Parsing it here means a
+        /// forged value is rejected rather than escaped.
+        id: i64,
     },
     /// Blame a node for performance issues (requires kubectl)
     Blame {
@@ -131,7 +136,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     if let Some(Command::Explain { id }) = args.command.clone() {
-        explain::run_explain(&client, &args.url, &id, color).await?;
+        explain::run_explain(&client, &args.url, id, color).await?;
         return Ok(());
     }
 

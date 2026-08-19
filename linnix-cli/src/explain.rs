@@ -68,7 +68,7 @@ impl IncidentView {
 }
 
 /// Renders the incident. Returned rather than printed so tests can read it.
-pub fn render(incident: &IncidentView, id: &str, color: bool) -> String {
+pub fn render(incident: &IncidentView, id: i64, color: bool) -> String {
     let heading = |s: &str| {
         if color {
             s.bold().to_string()
@@ -181,7 +181,7 @@ fn strip_terminal_controls(text: &str) -> String {
 pub async fn run_explain(
     client: &Client,
     base: &str,
-    id: &str,
+    id: i64,
     color: bool,
 ) -> Result<(), Box<dyn Error>> {
     let resp = client
@@ -231,7 +231,7 @@ mod tests {
         view.investigation_rendered =
             Some("1. [cpu_spin] A runaway loop\n   supports:    CPU usage was 96.3%\n".to_string());
 
-        let out = render(&view, "7", false);
+        let out = render(&view, 7, false);
         assert!(out.contains("1. [cpu_spin] A runaway loop"), "{out}");
         assert!(out.contains("supports:    CPU usage was 96.3%"), "{out}");
     }
@@ -240,11 +240,11 @@ mod tests {
     fn a_reply_that_did_not_ground_is_distinguished_from_no_analysis() {
         let mut answered = incident();
         answered.llm_analysis = Some("some prose".to_string());
-        let out = render(&answered, "7", false);
+        let out = render(&answered, 7, false);
         assert!(out.contains("nothing it claimed could be checked"), "{out}");
 
         let never = incident();
-        let out = render(&never, "7", false);
+        let out = render(&never, 7, false);
         assert!(out.contains("No analysis has run"), "{out}");
     }
 
@@ -258,7 +258,7 @@ mod tests {
         view.llm_analysis = Some("some prose".to_string());
         view.investigation = Some(serde_json::json!({"schema_version": 99}));
 
-        let out = render(&view, "7", false);
+        let out = render(&view, 7, false);
         assert!(out.contains("could not read"), "{out}");
         assert!(
             !out.contains("No hypothesis survived grounding"),
@@ -277,7 +277,7 @@ mod tests {
         view.action = "auto_kill\u{7}".to_string();
         view.llm_analysis = Some("prose\u{1b}[2J".to_string());
 
-        let out = render(&view.sanitized(), "7", false);
+        let out = render(&view.sanitized(), 7, false);
 
         assert!(
             !out.contains('\u{1b}') && !out.contains('\u{7}'),
@@ -290,6 +290,23 @@ mod tests {
     }
 
     #[test]
+    fn the_incident_id_cannot_carry_layout_at_all() {
+        // The id is typed `i64` at the command line, so a value like
+        // `7#\n  Afterwards: recovered` — which the daemon would still answer,
+        // since a URL fragment is never sent — cannot reach this function.
+        // This pins the type rather than a sanitizer: the class is impossible,
+        // not escaped.
+        let out = render(&incident().sanitized(), 7, false);
+        assert!(out.contains("Incident: #7 "), "{out}");
+
+        let forged: Vec<&str> = out
+            .lines()
+            .filter(|l| l.trim_start().starts_with("Afterwards:"))
+            .collect();
+        assert_eq!(forged.len(), 1, "one outcome row only: {out}");
+    }
+
+    #[test]
     fn a_process_name_cannot_forge_a_header_row() {
         // Removing escapes is not enough: a bare newline in `proc.comm` splits
         // the Action line and the second half reads as a header the daemon
@@ -298,7 +315,7 @@ mod tests {
         let mut view = incident();
         view.target_name = Some("innocent\n  Afterwards:  recovered after 0.1s".to_string());
 
-        let out = render(&view.sanitized(), "7", false);
+        let out = render(&view.sanitized(), 7, false);
 
         let forged: Vec<&str> = out
             .lines()
@@ -323,7 +340,7 @@ mod tests {
         // not under a test harness, so the override is what makes this assert
         // anything at all.
         colored::control::set_override(true);
-        let out = render(&incident().sanitized(), "7", true);
+        let out = render(&incident().sanitized(), 7, true);
         colored::control::unset_override();
 
         assert!(
@@ -341,7 +358,7 @@ mod tests {
                 .to_string(),
         );
 
-        let out = render(&view.sanitized(), "7", false);
+        let out = render(&view.sanitized(), 7, false);
         assert!(
             !out.contains('\u{1b}'),
             "escape sequences must not reach the terminal: {out:?}"
@@ -357,13 +374,13 @@ mod tests {
         let mut recovered = incident();
         recovered.recovery_time_ms = Some(3_200);
         recovered.psi_after = Some(4.1);
-        assert!(render(&recovered, "7", false).contains("recovered after 3.2s"));
+        assert!(render(&recovered, 7, false).contains("recovered after 3.2s"));
 
         let mut stuck = incident();
         stuck.psi_after = Some(71.0);
-        assert!(render(&stuck, "7", false).contains("did not recover"));
+        assert!(render(&stuck, 7, false).contains("did not recover"));
 
         // Never measured must not read as a finding.
-        assert!(render(&incident(), "7", false).contains("not measured"));
+        assert!(render(&incident(), 7, false).contains("not measured"));
     }
 }
