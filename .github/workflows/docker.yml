@@ -189,7 +189,7 @@ jobs:
           echo "Waiting for cognitod..."
           COGNITOD_READY=false
           for i in {1..30}; do
-            if curl -sf http://localhost:3000/healthz > /dev/null 2>&1; then
+            if curl -sf http://localhost:9464/healthz > /dev/null 2>&1; then
               echo "✅ Cognitod is healthy"
               COGNITOD_READY=true
               break
@@ -227,7 +227,7 @@ jobs:
           
           # Test healthz
           echo "GET /healthz"
-          curl -f http://localhost:3000/healthz || exit 1
+          curl -f http://localhost:9464/healthz || exit 1
           
           # Test status
           echo "GET /status"
