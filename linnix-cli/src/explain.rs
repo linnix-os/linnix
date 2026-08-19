@@ -47,14 +47,21 @@ impl IncidentView {
     /// after this runs rather than being stripped by it.
     fn sanitized(self) -> Self {
         Self {
-            event_type: strip_terminal_controls(&self.event_type),
-            action: strip_terminal_controls(&self.action),
-            target_name: self.target_name.as_deref().map(strip_terminal_controls),
+            // Header fields are interpolated into single lines, so a break in
+            // one forges a line: a process named "x\n  Afterwards: recovered"
+            // would print a header row the daemon never wrote. Same reasoning
+            // as the daemon's own renderer — layout is meaning.
+            event_type: single_line(&self.event_type),
+            action: single_line(&self.action),
+            target_name: self.target_name.as_deref().map(single_line),
+            // The one field whose newlines *are* the daemon's layout. Its
+            // scalars were already flattened server-side before being placed
+            // into that layout, so only escape sequences need removing here.
             investigation_rendered: self
                 .investigation_rendered
                 .as_deref()
                 .map(strip_terminal_controls),
-            llm_analysis: self.llm_analysis.as_deref().map(strip_terminal_controls),
+            llm_analysis: self.llm_analysis.as_deref().map(single_line),
             ..self
         }
     }
@@ -135,6 +142,25 @@ pub fn render(incident: &IncidentView, id: &str, color: bool) -> String {
         }
     }
 
+    out
+}
+
+/// Flattens a value onto one line, so it cannot forge the layout around it.
+///
+/// For every field printed inside a single line. Breaks become their escaped
+/// spelling rather than vanishing: a process name that tried to fake a header
+/// row is worth seeing as an attempt.
+fn single_line(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
     out
 }
 
@@ -261,6 +287,34 @@ mod tests {
         assert!(out.contains("innocent"), "{out}");
         assert!(out.contains("circuit_breaker_cpu"), "{out}");
         assert!(out.contains("auto_kill"), "{out}");
+    }
+
+    #[test]
+    fn a_process_name_cannot_forge_a_header_row() {
+        // Removing escapes is not enough: a bare newline in `proc.comm` splits
+        // the Action line and the second half reads as a header the daemon
+        // wrote. The outcome row is the tempting target — "recovered" is the
+        // most useful lie available.
+        let mut view = incident();
+        view.target_name = Some("innocent\n  Afterwards:  recovered after 0.1s".to_string());
+
+        let out = render(&view.sanitized(), "7", false);
+
+        let forged: Vec<&str> = out
+            .lines()
+            .filter(|l| l.trim_start().starts_with("Afterwards:"))
+            .collect();
+        assert_eq!(
+            forged.len(),
+            1,
+            "only the daemon's own outcome row may appear: {out}"
+        );
+        assert!(
+            forged[0].contains("not measured"),
+            "the surviving row must be the real one: {out}"
+        );
+        // Still legible, with the attempt visible rather than trimmed away.
+        assert!(out.contains("innocent\\n"), "{out}");
     }
 
     #[test]
