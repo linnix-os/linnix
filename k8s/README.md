@@ -29,7 +29,7 @@ must have label `linnix.io/api-access: "true"`, be in the same namespace, and
 send `Authorization: Bearer <token>`.
 
 Prometheus, liveness, and readiness use the separate unauthenticated
-operational listener on port 9090. It exposes only `/metrics/prometheus`,
+operational listener on port 9464. It exposes only `/metrics/prometheus`,
 `/healthz`, and `/readyz`; it cannot serve process, incident, or action data.
 The included NetworkPolicy allows this port from pods in any namespace. Narrow
 the Prometheus rule to your collector's labels if your cluster policy supports

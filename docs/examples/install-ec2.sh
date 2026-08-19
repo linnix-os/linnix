@@ -379,10 +379,10 @@ enabled = ${INSTALL_LLM}
 endpoint = "http://127.0.0.1:8090/v1/chat/completions"
 model = "linnix-qwen-v1"
 
-[prometheus]
+[outputs]
 # Prometheus metrics export
-enabled = false
-listen_addr = "0.0.0.0:9090"
+prometheus = false
+metrics_listen_addr = "0.0.0.0:9464"
 
 [alerts]
 # Alert destinations

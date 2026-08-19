@@ -121,10 +121,10 @@ curl http://localhost:3000/metrics | jq
 
 #### GET /metrics/prometheus (operational listener)
 Returns metrics in Prometheus text exposition format from the separate
-operational listener, which defaults to `http://localhost:9090`.
+operational listener, which defaults to `http://localhost:9464`.
 
 ```bash
-curl http://localhost:9090/metrics/prometheus
+curl http://localhost:9464/metrics/prometheus
 ```
 
 ---

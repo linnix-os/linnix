@@ -451,9 +451,9 @@ enabled = true  # Enable if you have LLM installed via Docker
 endpoint = "http://127.0.0.1:8090/v1/chat/completions"
 model = "linnix-3b-distilled"
 
-[prometheus]
-enabled = true  # Enable Prometheus metrics
-listen_addr = "0.0.0.0:9090"
+[outputs]
+prometheus = true  # Enable Prometheus metrics
+metrics_listen_addr = "0.0.0.0:9464"
 
 [alerts]
 # Add Apprise notification URLs

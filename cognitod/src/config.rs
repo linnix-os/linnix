@@ -593,7 +593,7 @@ impl Default for OutputConfig {
 }
 
 fn default_metrics_listen_addr() -> String {
-    "127.0.0.1:9090".to_string()
+    "127.0.0.1:9464".to_string()
 }
 
 #[derive(Clone)]
@@ -827,7 +827,10 @@ offline = true
     fn the_shipped_configs_enable_the_metrics_endpoint() {
         // Guards the actual regression: a shipped config that looks like it
         // turns metrics on but does not.
-        for path in ["../configs/linnix.toml", "../configs/linnix.darwin.toml"] {
+        for (path, expected_addr) in [
+            ("../configs/linnix.toml", "127.0.0.1:9464"),
+            ("../configs/linnix.darwin.toml", "0.0.0.0:9464"),
+        ] {
             let contents = std::fs::read_to_string(path)
                 .unwrap_or_else(|e| panic!("cannot read {}: {}", path, e));
             let mut cfg: Config = toml::from_str(&contents)
@@ -836,6 +839,11 @@ offline = true
             assert!(
                 cfg.outputs.prometheus,
                 "{} should serve /metrics/prometheus",
+                path
+            );
+            assert_eq!(
+                cfg.outputs.metrics_listen_addr, expected_addr,
+                "{} should use the dedicated operational port",
                 path
             );
         }
@@ -862,9 +870,50 @@ offline = true
             "the DaemonSet must serve /metrics/prometheus or the dashboard is empty"
         );
         assert_eq!(
-            cfg.outputs.metrics_listen_addr, "0.0.0.0:9090",
+            cfg.outputs.metrics_listen_addr, "0.0.0.0:9464",
             "Kubernetes must expose unauthenticated metrics on the dedicated surface"
         );
+    }
+
+    #[test]
+    fn the_docker_quickstart_injects_auth_and_probes_the_operational_listener() {
+        let compose = std::fs::read_to_string("../docker-compose.yml")
+            .expect("cannot read docker-compose.yml");
+        let compose: serde_yaml::Value =
+            serde_yaml::from_str(&compose).expect("docker-compose.yml is not valid YAML");
+        let cognitod = &compose["services"]["cognitod"];
+        let environment = cognitod["environment"]
+            .as_sequence()
+            .expect("cognitod environment must be a sequence");
+        assert!(
+            environment
+                .iter()
+                .any(|entry| { entry.as_str() == Some("LINNIX_API_TOKEN=${LINNIX_API_TOKEN:-}") })
+        );
+        assert!(
+            cognitod["healthcheck"]["test"]
+                .as_sequence()
+                .expect("cognitod healthcheck test must be a sequence")
+                .iter()
+                .any(|entry| entry.as_str() == Some("http://localhost:9464/readyz"))
+        );
+
+        let darwin = std::fs::read_to_string("../docker-compose.darwin.yml")
+            .expect("cannot read docker-compose.darwin.yml");
+        let darwin: serde_yaml::Value =
+            serde_yaml::from_str(&darwin).expect("docker-compose.darwin.yml is not valid YAML");
+        assert!(
+            darwin["services"]["cognitod"]["ports"]
+                .as_sequence()
+                .expect("Darwin cognitod ports must be a sequence")
+                .iter()
+                .any(|entry| entry.as_str() == Some("127.0.0.1:9464:9464"))
+        );
+
+        let quickstart =
+            std::fs::read_to_string("../quickstart.sh").expect("cannot read quickstart.sh");
+        assert!(quickstart.contains("openssl rand -hex 32"));
+        assert!(quickstart.contains("http://localhost:9464/healthz"));
     }
 
     #[test]

@@ -60,6 +60,7 @@ services:
     environment:
       - RUST_LOG=info
       - LINNIX_CONFIG=/etc/linnix/linnix.toml
+      - LINNIX_API_TOKEN=${LINNIX_API_TOKEN:-}
 
     # Demo mode: Run all demo scenarios on startup
     # Uncomment the line below to enable demo mode
@@ -68,7 +69,7 @@ services:
     restart: unless-stopped
 
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/readyz"]
+      test: ["CMD", "curl", "-f", "http://localhost:9464/readyz"]
       interval: 10s
       timeout: 5s
       retries: 3

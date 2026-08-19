@@ -22,7 +22,7 @@ spec:
         # Metrics are intentionally exposed only by the operational listener;
         # the host-privileged API listener on 3000 always requires a token.
         prometheus.io/scrape: "true"
-        prometheus.io/port: "9090"
+        prometheus.io/port: "9464"
         prometheus.io/path: "/metrics/prometheus"
     spec:
       serviceAccountName: linnix-agent
@@ -66,7 +66,7 @@ spec:
           ports:
             - containerPort: 3000
               name: api
-            - containerPort: 9090
+            - containerPort: 9464
               name: metrics
           # Liveness only asks "is the process alive?". It deliberately does NOT
           # check eBPF: a kernel that cannot load our programs never will, so

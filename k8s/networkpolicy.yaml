@@ -17,7 +17,7 @@ spec:
         - namespaceSelector: {}
       ports:
         - protocol: TCP
-          port: 9090
+          port: 9464
     # API consumers must opt in with this label and authenticate with the
     # Secret-backed bearer token. Adjust this selector for your API client.
     - from:

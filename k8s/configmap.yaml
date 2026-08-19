@@ -32,7 +32,7 @@ data:
     # Prometheus and kubelet probes use a separate, unauthenticated operational
     # listener. It never exposes process, system, incident, or action routes.
     prometheus = true
-    metrics_listen_addr = "0.0.0.0:9090"
+    metrics_listen_addr = "0.0.0.0:9464"
 
     [psi]
     # Seconds of sustained pressure before a stall is attributed to neighbours.

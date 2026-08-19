@@ -38,7 +38,7 @@ Linnix combines eBPF probes, BTF-powered compatibility helpers, and an AI reason
    - `http://localhost:3000/stream` (Server-Sent Events)
    - `http://localhost:3000/insights` (AI output)
    - `http://localhost:3000/metrics` (JSON) and
-     `http://localhost:9090/metrics/prometheus`
+     `http://localhost:9464/metrics/prometheus`
 5. **Prometheus integration** is just a config flag; no sidecar required.
 
 ## 4. AI Reasoning Loop
