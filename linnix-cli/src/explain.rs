@@ -9,7 +9,7 @@
 
 use colored::*;
 use reqwest::Client;
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 use std::error::Error;
 
 #[derive(Deserialize, Debug)]
