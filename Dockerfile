@@ -23,15 +23,22 @@ WORKDIR /build
 
 # Copy Cargo files for dependency caching
 COPY Cargo.toml Cargo.lock ./
+COPY .cargo/config.toml ./.cargo/config.toml
 COPY linnix-ai-ebpf/linnix-ai-ebpf-common/Cargo.toml ./linnix-ai-ebpf/linnix-ai-ebpf-common/
 COPY linnix-ai-ebpf/linnix-ai-ebpf-ebpf/Cargo.toml ./linnix-ai-ebpf/linnix-ai-ebpf-ebpf/
 COPY linnix-ai-ebpf/linnix-ai-ebpf-ebpf/rust-toolchain.toml ./linnix-ai-ebpf/linnix-ai-ebpf-ebpf/
 COPY cognitod/Cargo.toml ./cognitod/
 COPY linnix-cli/Cargo.toml ./linnix-cli/
 COPY linnix-reasoner/Cargo.toml ./linnix-reasoner/
+COPY xtask/Cargo.toml ./xtask/
 
-# Copy source code
-COPY . .
+# Copy only workspace source trees needed for target discovery and build.
+COPY cognitod/src ./cognitod/src
+COPY linnix-ai-ebpf/linnix-ai-ebpf-common/src ./linnix-ai-ebpf/linnix-ai-ebpf-common/src
+COPY linnix-ai-ebpf/linnix-ai-ebpf-ebpf/src ./linnix-ai-ebpf/linnix-ai-ebpf-ebpf/src
+COPY linnix-cli/src ./linnix-cli/src
+COPY linnix-reasoner/src ./linnix-reasoner/src
+COPY xtask/src ./xtask/src
 
 # Build eBPF programs.
 # Use the xtask entrypoint so this shares one build path (and one set of
@@ -48,13 +55,22 @@ WORKDIR /build
 
 # Copy Cargo files
 COPY Cargo.toml Cargo.lock ./
+COPY .cargo/config.toml ./.cargo/config.toml
 COPY linnix-ai-ebpf/linnix-ai-ebpf-common/Cargo.toml ./linnix-ai-ebpf/linnix-ai-ebpf-common/
+COPY linnix-ai-ebpf/linnix-ai-ebpf-ebpf/Cargo.toml ./linnix-ai-ebpf/linnix-ai-ebpf-ebpf/
+COPY linnix-ai-ebpf/linnix-ai-ebpf-ebpf/rust-toolchain.toml ./linnix-ai-ebpf/linnix-ai-ebpf-ebpf/
 COPY cognitod/Cargo.toml ./cognitod/
 COPY linnix-cli/Cargo.toml ./linnix-cli/
 COPY linnix-reasoner/Cargo.toml ./linnix-reasoner/
+COPY xtask/Cargo.toml ./xtask/
 
-# Copy source
-COPY . .
+# Copy only workspace source trees needed for target discovery and build.
+COPY cognitod/src ./cognitod/src
+COPY linnix-ai-ebpf/linnix-ai-ebpf-common/src ./linnix-ai-ebpf/linnix-ai-ebpf-common/src
+COPY linnix-ai-ebpf/linnix-ai-ebpf-ebpf/src ./linnix-ai-ebpf/linnix-ai-ebpf-ebpf/src
+COPY linnix-cli/src ./linnix-cli/src
+COPY linnix-reasoner/src ./linnix-reasoner/src
+COPY xtask/src ./xtask/src
 
 # Build release binaries with demo feature
 RUN cargo build --release -p cognitod
