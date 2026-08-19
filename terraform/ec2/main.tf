@@ -77,8 +77,8 @@ resource "aws_security_group" "linnix" {
     for_each = var.enable_prometheus ? [1] : []
     content {
       description = "Prometheus metrics"
-      from_port   = 9090
-      to_port     = 9090
+      from_port   = 9464
+      to_port     = 9464
       protocol    = "tcp"
       cidr_blocks = var.prometheus_cidr_blocks
     }

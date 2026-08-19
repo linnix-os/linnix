@@ -44,9 +44,9 @@ fi
 if [ "${enable_prometheus}" = "true" ]; then
     cat >> /etc/linnix/linnix.toml <<EOF
 
-[prometheus]
-enabled = true
-listen_addr = "0.0.0.0:9090"
+[outputs]
+prometheus = true
+metrics_listen_addr = "0.0.0.0:9464"
 EOF
     systemctl restart linnix-cognitod
 fi

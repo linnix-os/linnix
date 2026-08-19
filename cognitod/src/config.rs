@@ -917,6 +917,24 @@ offline = true
     }
 
     #[test]
+    fn the_ec2_deployment_exposes_the_operational_listener() {
+        let user_data = std::fs::read_to_string("../terraform/ec2/user-data.sh")
+            .expect("cannot read terraform/ec2/user-data.sh");
+        assert!(user_data.contains("[outputs]"));
+        assert!(user_data.contains("prometheus = true"));
+        assert!(user_data.contains("metrics_listen_addr = \"0.0.0.0:9464\""));
+
+        let main = std::fs::read_to_string("../terraform/ec2/main.tf")
+            .expect("cannot read terraform/ec2/main.tf");
+        assert!(main.contains("from_port   = 9464"));
+        assert!(main.contains("to_port     = 9464"));
+
+        let outputs = std::fs::read_to_string("../terraform/ec2/outputs.tf")
+            .expect("cannot read terraform/ec2/outputs.tf");
+        assert!(outputs.contains(":9464/metrics/prometheus"));
+    }
+
+    #[test]
     fn the_kubernetes_daemonset_uses_a_secret_for_the_public_api_token() {
         let manifest = std::fs::read_to_string("../k8s/daemonset.yaml")
             .expect("cannot read k8s/daemonset.yaml");

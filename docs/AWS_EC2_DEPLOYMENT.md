@@ -389,7 +389,7 @@ curl -fsSL https://raw.githubusercontent.com/linnix-os/linnix/main/docs/examples
 | SSH | TCP | 22 | Your IP | SSH access |
 | Custom TCP | TCP | 3000 | Your IP / VPC CIDR | Linnix API/Dashboard |
 | Custom TCP | TCP | 8090 | Localhost only | LLM Server (internal) |
-| Custom TCP | TCP | 9090 | Your IP (optional) | Prometheus metrics |
+| Custom TCP | TCP | 9464 | Your IP (optional) | Prometheus metrics |
 
 **Note:** Port 8090 (LLM server) should typically only be accessible from localhost. The cognitod service connects to it internally via `http://127.0.0.1:8090`.
 
