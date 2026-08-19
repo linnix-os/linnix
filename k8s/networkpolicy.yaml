@@ -1,0 +1,29 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: linnix-agent-ingress
+  namespace: default
+  labels:
+    app: linnix
+spec:
+  podSelector:
+    matchLabels:
+      app: linnix
+  policyTypes:
+    - Ingress
+  ingress:
+    # Prometheus scrapers need only the dedicated operational listener.
+    - from:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 9090
+    # API consumers must opt in with this label and authenticate with the
+    # Secret-backed bearer token. Adjust this selector for your API client.
+    - from:
+        - podSelector:
+            matchLabels:
+              linnix.io/api-access: "true"
+      ports:
+        - protocol: TCP
+          port: 3000

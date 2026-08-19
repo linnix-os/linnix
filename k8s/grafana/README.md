@@ -21,21 +21,22 @@ The victim metric is in microseconds and the offender metric is in seconds —
 they come from different sources, so the panels carry different units on
 purpose. Don't sum across the two.
 
-## If you set an API token
+## Metrics listener
 
-`api.auth_token` protects every route, `/metrics/prometheus` included, and the
-scrape annotations carry no credential — so an authenticated deployment returns
-401 to the annotation-based job and the dashboard stays empty. Point Prometheus
-at the same token instead of relying on annotations:
+The Kubernetes DaemonSet serves Prometheus on its separate operational listener
+at port 9090. This endpoint is intentionally unauthenticated so Prometheus and
+Kubernetes probes can scrape it, but it exposes no process, incident, system,
+or enforcement routes. The API remains on port 3000 and requires the
+Secret-backed bearer token.
+
+The included annotations work with Prometheus' standard pod discovery. An
+explicit scrape job can use the same dedicated port without API credentials:
 
 ```yaml
 # prometheus.yml — replaces the annotation-driven job for Linnix
 - job_name: linnix
   kubernetes_sd_configs:
     - role: pod
-  authorization:
-    type: Bearer
-    credentials_file: /etc/prometheus/secrets/linnix-token/token
   # The metric's own victim_* labels never collide with the target labels
   # Prometheus attaches, so honor_labels is not needed.
   relabel_configs:
@@ -44,7 +45,7 @@ at the same token instead of relying on annotations:
       regex: linnix
     - source_labels: [__meta_kubernetes_pod_ip]
       target_label: __address__
-      replacement: $1:3000
+      replacement: $1:9090
     - target_label: __metrics_path__
       replacement: /metrics/prometheus
     - source_labels: [__meta_kubernetes_pod_node_name]
@@ -63,24 +64,20 @@ spec:
     matchLabels:
       app: linnix
   podMetricsEndpoints:
-    - port: api
+    - port: metrics
       path: /metrics/prometheus
-      authorization:
-        credentials:
-          name: linnix-api-token
-          key: token
 ```
 
 ## If the panels are empty
 
 1. **Is the endpoint on?** `kubectl exec` into an agent pod and
-   `curl localhost:3000/metrics/prometheus`. A 404 means `[outputs] prometheus`
+   `curl localhost:9090/metrics/prometheus`. A 404 means `[outputs] prometheus`
    is not set — check the ConfigMap.
 2. **Is Prometheus scraping it?** The DaemonSet carries `prometheus.io/scrape`
    annotations, which the standard `kubernetes-pods` job honours. Prometheus
    Operator ignores annotations; add a `PodMonitor` selecting `app: linnix` on
-   port 3000, path `/metrics/prometheus`.
-3. **Are the probes attached?** `curl localhost:3000/readyz`. Attribution is
+   port 9090, path `/metrics/prometheus`.
+3. **Are the probes attached?** `curl localhost:9090/readyz`. Attribution is
    kernel-derived, so a node running userspace-only reports nothing to blame.
 4. **Has anything stalled yet?** The offender metric only appears once a pod
    sustains pressure for `sustained_pressure_seconds`. On an idle cluster both

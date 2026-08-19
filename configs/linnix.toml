@@ -3,6 +3,8 @@
 
 [api]
 listen_addr = "127.0.0.1:3000"
+# Non-loopback API binds require LINNIX_API_TOKEN or this setting.
+# Prefer LINNIX_API_TOKEN in production so the token is not stored in this file.
 # auth_token = "your-secret-token"
 
 [runtime]
@@ -26,8 +28,9 @@ model = "linnix-3b-distilled"
 timeout_ms = 30000
 
 [outputs]
-# Serve the Prometheus text exposition at /metrics/prometheus
+# Serve Prometheus, health, and readiness on a separate operational listener.
 prometheus = true
+metrics_listen_addr = "127.0.0.1:9090"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Notifications via Apprise (optional)

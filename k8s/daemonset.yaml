@@ -19,11 +19,10 @@ spec:
         # stays empty. Prometheus Operator users should add a PodMonitor
         # instead; these annotations are ignored by it.
         #
-        # If you set api.auth_token in the ConfigMap, the metrics route requires
-        # it too and this annotation-based scrape gets 401. See
-        # k8s/grafana/README.md for a scrape job that sends the token.
+        # Metrics are intentionally exposed only by the operational listener;
+        # the host-privileged API listener on 3000 always requires a token.
         prometheus.io/scrape: "true"
-        prometheus.io/port: "3000"
+        prometheus.io/port: "9090"
         prometheus.io/path: "/metrics/prometheus"
     spec:
       serviceAccountName: linnix-agent
@@ -36,6 +35,14 @@ spec:
             privileged: true  # Simplest for eBPF. Can be refined with caps.
             # capabilities:
             #   add: ["BPF", "PERFMON", "SYS_RESOURCE", "SYS_ADMIN"]
+          env:
+            # Required for the non-loopback API listener. Do not put this
+            # token in the ConfigMap.
+            - name: LINNIX_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: linnix-api-token
+                  key: token
           volumeMounts:
             - name: config
               mountPath: /etc/linnix
@@ -58,14 +65,16 @@ spec:
               cpu: 100m
           ports:
             - containerPort: 3000
-              name: http
+              name: api
+            - containerPort: 9090
+              name: metrics
           # Liveness only asks "is the process alive?". It deliberately does NOT
           # check eBPF: a kernel that cannot load our programs never will, so
           # failing liveness would CrashLoopBackOff and bury the real reason.
           livenessProbe:
             httpGet:
               path: /healthz
-              port: http
+              port: metrics
             initialDelaySeconds: 15
             periodSeconds: 20
           # Readiness reflects whether this agent is actually producing
@@ -76,7 +85,7 @@ spec:
           readinessProbe:
             httpGet:
               path: /readyz
-              port: http
+              port: metrics
             initialDelaySeconds: 20
             periodSeconds: 30
             failureThreshold: 2

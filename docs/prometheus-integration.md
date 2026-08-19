@@ -11,9 +11,13 @@ Set the Prometheus flag in the Cognitod config (usually `/etc/linnix/linnix.toml
 ```toml
 [outputs]
 prometheus = true
+metrics_listen_addr = "127.0.0.1:9090"
 ```
 
-Restart Cognitod if it is already running. The daemon will now serve a text exposition at `http://<host>:3000/metrics/prometheus` alongside the JSON `/metrics` endpoint.
+Restart Cognitod if it is already running. The daemon serves Prometheus text
+exposition at `http://<host>:9090/metrics/prometheus`. This operational listener
+also serves health and readiness, but it does not expose the JSON `/metrics`
+endpoint or any process, incident, or action routes.
 
 ## 2. Install & run Cognitod via systemd
 
@@ -75,7 +79,7 @@ scrape_configs:
   - job_name: 'linnix'
     metrics_path: /metrics/prometheus
     static_configs:
-      - targets: ['127.0.0.1:3000']
+      - targets: ['127.0.0.1:9090']
 ```
 
 Reload Prometheus:
@@ -91,7 +95,7 @@ Verify in the UI (`http://localhost:9090 → Status → Targets`) that the `linn
 1. Tail the exporter directly:
 
    ```bash
-   curl -H 'Accept: text/plain' http://127.0.0.1:3000/metrics/prometheus
+   curl -H 'Accept: text/plain' http://127.0.0.1:9090/metrics/prometheus
    ```
 
    You should see counters such as `linnix_events_total`, `linnix_alerts_emitted_total`, and gauges for process CPU/RSS.

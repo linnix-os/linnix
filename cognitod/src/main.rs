@@ -14,7 +14,7 @@ use aya::{Ebpf, EbpfLoader};
 use aya_log::EbpfLogger;
 use caps::{CapSet, Capability};
 use log::{info, warn};
-use std::{convert::TryFrom, error::Error, path::PathBuf, sync::Arc, time::Duration};
+use std::{convert::TryFrom, error::Error, net::IpAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::broadcast;
@@ -30,7 +30,7 @@ use linnix_ai_ebpf_common::TelemetryConfig;
 mod api;
 // mod routes; // Deleted (dead code cleanup)
 
-use crate::api::{AppState, all_routes};
+use crate::api::{AppState, all_routes, metrics_routes};
 use crate::bpf_config::{CoreRssMode, derive_telemetry_config};
 use crate::runtime::probes::{ProbeState, RssProbeMode};
 use clap::Parser;
@@ -64,6 +64,65 @@ struct BpfRuntimeGuards {
 }
 
 const INSIGHT_STORE_CAPACITY: usize = 50;
+
+fn configured_auth_token(
+    env_token: Option<String>,
+    config_token: Option<String>,
+) -> Option<String> {
+    env_token
+        .filter(|token| !token.trim().is_empty())
+        .or_else(|| config_token.filter(|token| !token.trim().is_empty()))
+}
+
+fn listener_host(listen_addr: &str) -> anyhow::Result<&str> {
+    let listen_addr = listen_addr.trim();
+
+    if let Some(bracketed) = listen_addr.strip_prefix('[') {
+        let (host, port) = bracketed
+            .split_once(']')
+            .ok_or_else(|| anyhow::anyhow!("invalid listen address {listen_addr:?}"))?;
+        if host.is_empty() || !port.starts_with(':') || port.len() == 1 {
+            anyhow::bail!("invalid listen address {listen_addr:?}");
+        }
+        return Ok(host);
+    }
+
+    let (host, port) = listen_addr
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("invalid listen address {listen_addr:?}"))?;
+    if port.is_empty() {
+        anyhow::bail!("invalid listen address {listen_addr:?}");
+    }
+    Ok(host)
+}
+
+fn api_listener_requires_auth(listen_addr: &str) -> anyhow::Result<bool> {
+    let host = listener_host(listen_addr)?;
+
+    if host.eq_ignore_ascii_case("localhost") {
+        return Ok(false);
+    }
+
+    match host.parse::<IpAddr>() {
+        Ok(ip) => Ok(!ip.is_loopback()),
+        // A hostname can resolve to a non-loopback address. Require a token
+        // rather than attempting name resolution before startup.
+        Err(_) => Ok(true),
+    }
+}
+
+fn validate_api_auth(listen_addr: &str, auth_token: Option<&str>) -> anyhow::Result<()> {
+    if api_listener_requires_auth(listen_addr)?
+        && auth_token.is_none_or(|token| token.trim().is_empty())
+    {
+        anyhow::bail!(
+            "refusing to start HTTP API on {listen_addr} without authentication; \
+             set LINNIX_API_TOKEN from a Kubernetes Secret, set api.auth_token, \
+             or bind api.listen_addr to a loopback address"
+        );
+    }
+    Ok(())
+}
 
 fn attach_kprobe_internal(bpf: &mut Ebpf, program: &str, symbol: &str) -> anyhow::Result<()> {
     let probe: &mut KProbe = bpf
@@ -1302,9 +1361,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
     }
 
-    let auth_token = std::env::var("LINNIX_API_TOKEN")
-        .ok()
-        .or(config.api.auth_token.clone());
+    let auth_token = configured_auth_token(
+        std::env::var("LINNIX_API_TOKEN").ok(),
+        config.api.auth_token.clone(),
+    );
 
     let app_state = Arc::new(AppState {
         context: Arc::clone(&context),
@@ -1325,17 +1385,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
         blame_metrics: blame_metrics.clone(),
     });
 
-    let api = all_routes(app_state.clone());
     let listen_addr = std::env::var("LINNIX_LISTEN_ADDR").unwrap_or(config.api.listen_addr.clone());
+    validate_api_auth(&listen_addr, auth_token.as_deref())?;
+
+    let api = all_routes(app_state.clone());
     let listener = TcpListener::bind(&listen_addr).await?;
 
-    if listen_addr.starts_with("0.0.0.0") && auth_token.is_none() {
-        warn!(
-            "API listening on {} with NO AUTHENTICATION. \
-            Set LINNIX_API_TOKEN to secure the API.",
-            listen_addr
+    let metrics_listener = if config.outputs.prometheus {
+        let metrics_listen_addr = std::env::var("LINNIX_METRICS_LISTEN_ADDR")
+            .unwrap_or(config.outputs.metrics_listen_addr.clone());
+        let metrics_listener =
+            TcpListener::bind(&metrics_listen_addr)
+                .await
+                .with_context(|| {
+                    format!("failed to bind operational metrics listener on {metrics_listen_addr}")
+                })?;
+        info!(
+            "[cognitod] operational metrics server on http://{}",
+            metrics_listen_addr
         );
-    }
+        Some(metrics_listener)
+    } else {
+        None
+    };
 
     info!("[cognitod] HTTP server on http://{}", listen_addr);
     tokio::spawn(async move {
@@ -1343,6 +1415,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             eprintln!("server error: {e}");
         }
     });
+
+    if let Some(metrics_listener) = metrics_listener {
+        let metrics_api = metrics_routes(app_state.clone());
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(metrics_listener, metrics_api).await {
+                eprintln!("metrics server error: {e}");
+            }
+        });
+    }
 
     // ── Unix domain socket listener (bypasses token auth) ──
     let uds_path = std::env::var("LINNIX_UDS_PATH")
@@ -1416,6 +1497,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_loopback_api_without_a_token_is_rejected() {
+        let error = validate_api_auth("0.0.0.0:3000", None)
+            .expect_err("a publicly bound API must require authentication");
+        assert!(error.to_string().contains("without authentication"));
+
+        assert!(validate_api_auth("[::]:3000", None).is_err());
+        assert!(validate_api_auth("127.0.0.1:3000", None).is_ok());
+        assert!(validate_api_auth("0.0.0.0:3000", Some("token-from-secret")).is_ok());
+    }
 
     #[test]
     fn bpf_search_paths_canonical_order() {
