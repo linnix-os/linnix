@@ -167,17 +167,24 @@ pub fn render(incident: &IncidentView, id: i64, color: bool) -> String {
                      version that cannot render it. Upgrade cognitod, or read the raw \
                      record on the incident.\n"
                 }
-                // Not a grounding failure. A reply that parses but whose
-                // hypotheses are all discarded is still *stored* as an
-                // investigation and renders its own "no grounded hypothesis"
-                // message above. Reaching here means the reply could not be
-                // parsed at all — malformed JSON, or prose where an object was
-                // expected — so pointing the operator at the model's evidence
-                // would send them to debug the wrong half of it.
+                // A reply is stored but no investigation is. Two things
+                // produce that and the daemon cannot currently tell them
+                // apart: a modern reply that failed to parse, or an incident
+                // analysed before grounded investigations existed, where prose
+                // was all that was ever stored.
+                //
+                // Not a grounding failure either way — a reply that parses and
+                // has every hypothesis discarded is still stored, and renders
+                // its own "no grounded hypothesis" message above.
+                //
+                // The wording therefore states what is known and offers both
+                // readings rather than accusing a legacy record of being
+                // malformed. Persisting `AnalysisOutcome::parse_error` would
+                // make this precise; see the follow-up issue.
                 (None, Some(_)) => {
-                    "The model replied, but the response could not be parsed into an \
-                     investigation: it was malformed, or not in the expected shape. \
-                     The raw reply is on the incident.\n"
+                    "The model replied, but no investigation was stored. Either the reply \
+                     could not be parsed into one, or this incident predates grounded \
+                     investigations. The raw reply is on the incident.\n"
                 }
                 (None, None) => "No analysis has run for this incident.\n",
             });
@@ -291,10 +298,16 @@ mod tests {
         answered.llm_analysis = Some("I think the CPU was busy.".to_string());
 
         let out = render(&answered, 7, false);
-        assert!(out.contains("could not be parsed"), "{out}");
+        assert!(out.contains("no investigation was stored"), "{out}");
         assert!(
             !out.contains("nothing it claimed could be checked"),
-            "a parse failure is not a grounding failure: {out}"
+            "this is not a grounding failure: {out}"
+        );
+        // An incident analysed before grounding existed lands in this same
+        // state legitimately, so the wording must not call it malformed.
+        assert!(
+            out.contains("predates grounded investigations"),
+            "a legacy analysis must not be accused of being malformed: {out}"
         );
 
         let never = incident();
