@@ -2005,8 +2005,19 @@ fn with_rendered_investigation(incident: &Incident) -> serde_json::Value {
     // A stored investigation that no longer parses is left exactly as it is.
     // It is evidence about a past incident, and silently dropping it would be
     // worse than showing it in the shape it was written.
+    // An explicit null says "this build tried and could not". Omitting the key
+    // instead would be indistinguishable from an older daemon that never had
+    // this field, and a client cannot tell an unreadable record from a version
+    // skew without that difference.
+    let unreadable = |mut value: serde_json::Value| {
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("investigation_rendered".into(), serde_json::Value::Null);
+        }
+        value
+    };
+
     let Ok(parsed) = serde_json::from_str::<cognitod::incidents::IncidentInvestigation>(raw) else {
-        return value;
+        return unreadable(value);
     };
 
     // Serde ignores unknown fields, so an investigation written by a newer
@@ -2015,7 +2026,7 @@ fn with_rendered_investigation(incident: &Incident) -> serde_json::Value {
     // semantics. `IncidentStore::get_investigation` already refuses those, and
     // this path has to agree or one row means two things depending on route.
     if parsed.schema_version > cognitod::incidents::investigation::SCHEMA_VERSION {
-        return value;
+        return unreadable(value);
     }
 
     if let Some(obj) = value.as_object_mut() {
@@ -3522,9 +3533,14 @@ mod tests {
 
         let value = super::with_rendered_investigation(&incident);
 
-        assert!(
-            value.get("investigation_rendered").is_none(),
-            "a future-version investigation must not be rendered with today's semantics"
+        // Present and null, not absent. Null says "this build tried and could
+        // not"; an absent key is what an *older* daemon returns, and a client
+        // that cannot tell them apart reports a staggered upgrade as a corrupt
+        // record.
+        assert_eq!(
+            value.get("investigation_rendered"),
+            Some(&serde_json::Value::Null),
+            "a future-version investigation must be refused explicitly, not silently"
         );
         assert!(
             value["investigation"].is_string(),

@@ -21,8 +21,16 @@ pub struct IncidentView {
     pub target_pid: Option<i64>,
     pub psi_cpu: f32,
     pub cpu_percent: f32,
-    /// Present only when a grounded investigation exists.
-    pub investigation_rendered: Option<String>,
+    /// The daemon's rendering.
+    ///
+    /// Three states that have to stay distinct: a string is the rendering; an
+    /// explicit `null` means this daemon tried and could not read the stored
+    /// record; an **absent** key means the daemon predates this field. Typed
+    /// as `Value` because serde cannot otherwise tell a null from a missing
+    /// key, and collapsing those two reports a version skew as a corrupt
+    /// record.
+    #[serde(default)]
+    pub investigation_rendered: Option<serde_json::Value>,
     /// The stored investigation itself. Present-but-unrendered means the
     /// daemon kept the row and could not read it — a different situation from
     /// there being no investigation at all, and one the operator has to be
@@ -57,10 +65,12 @@ impl IncidentView {
             // The one field whose newlines *are* the daemon's layout. Its
             // scalars were already flattened server-side before being placed
             // into that layout, so only escape sequences need removing here.
-            investigation_rendered: self
-                .investigation_rendered
-                .as_deref()
-                .map(strip_terminal_controls),
+            investigation_rendered: self.investigation_rendered.map(|v| match v {
+                serde_json::Value::String(s) => {
+                    serde_json::Value::String(strip_terminal_controls(&s))
+                }
+                other => other,
+            }),
             llm_analysis: self.llm_analysis.as_deref().map(single_line),
             ..self
         }
@@ -112,7 +122,11 @@ pub fn render(incident: &IncidentView, id: i64, color: bool) -> String {
 
     out.push('\n');
 
-    match &incident.investigation_rendered {
+    match incident
+        .investigation_rendered
+        .as_ref()
+        .and_then(|v| v.as_str())
+    {
         Some(rendered) => {
             out.push_str(&format!("{}\n", heading("Investigation")));
             // Facts quote process names, which are attacker-controlled, and
@@ -122,15 +136,24 @@ pub fn render(incident: &IncidentView, id: i64, color: bool) -> String {
             out.push_str(rendered);
         }
         None => {
-            // Three distinct situations, and telling an operator the wrong one
+            // Four distinct situations, and telling an operator the wrong one
             // sends them to debug the wrong thing.
+            //
+            // An explicit null means this daemon tried and failed; an absent
+            // key means it has no such field, which is a version skew rather
+            // than a bad record.
+            let daemon_tried = incident.investigation_rendered.is_some();
+
             out.push_str(match (&incident.investigation, &incident.llm_analysis) {
-                // Stored but unrendered: the daemon kept the row and could not
-                // read it — corrupt, or written by a newer build.
-                (Some(_), _) => {
+                (Some(_), _) if daemon_tried => {
                     "This incident has a stored investigation the daemon could not read: \
                      it is corrupt, or was written by a newer version. The raw record is \
                      still on the incident.\n"
+                }
+                (Some(_), _) => {
+                    "This incident has a stored investigation, but this daemon is an older \
+                     version that cannot render it. Upgrade cognitod, or read the raw \
+                     record on the incident.\n"
                 }
                 (None, Some(_)) => {
                     "No hypothesis survived grounding for this incident: the model \
@@ -228,8 +251,9 @@ mod tests {
     #[test]
     fn the_daemons_rendering_is_printed_verbatim() {
         let mut view = incident();
-        view.investigation_rendered =
-            Some("1. [cpu_spin] A runaway loop\n   supports:    CPU usage was 96.3%\n".to_string());
+        view.investigation_rendered = Some(serde_json::json!(
+            "1. [cpu_spin] A runaway loop\n   supports:    CPU usage was 96.3%\n"
+        ));
 
         let out = render(&view, 7, false);
         assert!(out.contains("1. [cpu_spin] A runaway loop"), "{out}");
@@ -249,6 +273,25 @@ mod tests {
     }
 
     #[test]
+    fn an_older_daemon_is_not_reported_as_a_corrupt_record() {
+        // The previous daemon returns the investigation as a JSON string and
+        // has no `investigation_rendered` key at all. Telling an operator
+        // mid-upgrade that their record is corrupt sends them to fix data that
+        // is fine.
+        let mut view = incident();
+        view.llm_analysis = Some("some prose".to_string());
+        view.investigation = Some(serde_json::json!("{\"schema_version\":1}"));
+        view.investigation_rendered = None; // absent, not null
+
+        let out = render(&view.sanitized(), 7, false);
+        assert!(out.contains("older version that cannot render"), "{out}");
+        assert!(
+            !out.contains("could not read"),
+            "a version skew is not a corrupt record: {out}"
+        );
+    }
+
+    #[test]
     fn an_unreadable_investigation_is_not_reported_as_ungrounded() {
         // The daemon keeps the row and omits the rendering when it cannot
         // parse it. Reading only `llm_analysis` here would tell the operator
@@ -257,6 +300,9 @@ mod tests {
         let mut view = incident();
         view.llm_analysis = Some("some prose".to_string());
         view.investigation = Some(serde_json::json!({"schema_version": 99}));
+        // The daemon says "I tried and could not" with an explicit null, which
+        // is what separates this from a daemon that has no such field.
+        view.investigation_rendered = Some(serde_json::Value::Null);
 
         let out = render(&view, 7, false);
         assert!(out.contains("could not read"), "{out}");
@@ -353,10 +399,9 @@ mod tests {
     fn terminal_controls_in_evidence_are_disarmed() {
         let mut view = incident();
         // A process name is attacker-controlled and reaches the facts verbatim.
-        view.investigation_rendered = Some(
+        view.investigation_rendered = Some(serde_json::json!(
             "1. [cpu_spin] Runaway loop\n   supports:    process \u{1b}[2J\u{1b}[Hevil was busy\n"
-                .to_string(),
-        );
+        ));
 
         let out = render(&view.sanitized(), 7, false);
         assert!(
