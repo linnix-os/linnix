@@ -1758,15 +1758,15 @@ pub struct AppState {
     pub blame_metrics: Arc<cognitod::attribution::BlameMetrics>,
 }
 
-/// Every route the daemon serves, listed once.
+/// Every application route the daemon serves over the API listener.
 ///
-/// Both listeners build from this. The difference between them is the auth
+/// Both API listeners build from this. The difference between them is the auth
 /// layer, not the route set — and on an auth boundary that distinction has to
 /// be structural rather than clerical. Two hand-maintained lists meant a route
 /// added to one and forgotten in the other either vanished silently from the
 /// socket, or became reachable over TCP *without token auth*.
-fn base_router(prometheus_enabled: bool) -> Router<Arc<AppState>> {
-    let mut router = Router::new()
+fn base_router() -> Router<Arc<AppState>> {
+    Router::new()
         .route("/", get(crate::ui::dashboard_handler))
         .route("/dashboard", get(crate::ui::dashboard_handler))
         .route("/context", get(get_context_route))
@@ -1800,20 +1800,14 @@ fn base_router(prometheus_enabled: bool) -> Router<Arc<AppState>> {
         .route("/actions", get(get_actions))
         .route("/actions/{id}", get(get_action_by_id))
         .route("/actions/{id}/approve", axum::routing::post(approve_action))
-        .route("/actions/{id}/reject", axum::routing::post(reject_action));
-
-    if prometheus_enabled {
-        router = router.route("/metrics/prometheus", get(prometheus_metrics));
-    }
-
-    router
+        .route("/actions/{id}/reject", axum::routing::post(reject_action))
 }
 
 /// Build routes for the TCP listener, which requires a bearer token when one
 /// is configured.
 pub fn all_routes(app_state: Arc<AppState>) -> Router {
     let auth_token = app_state.auth_token.clone();
-    let mut router = base_router(app_state.prometheus_enabled);
+    let mut router = base_router();
 
     if auth_token.is_some() {
         router = router.layer(axum::middleware::from_fn_with_state(
@@ -1831,7 +1825,21 @@ pub fn all_routes(app_state: Arc<AppState>) -> Router {
 /// middleware: UDS connections are trusted because local process identity is
 /// verified by socket credentials (`SO_PEERCRED`).
 pub fn uds_routes(app_state: Arc<AppState>) -> Router {
-    base_router(app_state.prometheus_enabled).with_state(app_state)
+    base_router().with_state(app_state)
+}
+
+/// Build the unauthenticated operational listener. It deliberately contains no
+/// process, incident or enforcement routes; those remain on the API listener.
+pub fn metrics_routes(app_state: Arc<AppState>) -> Router {
+    let mut router = Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz));
+
+    if app_state.prometheus_enabled {
+        router = router.route("/metrics/prometheus", get(prometheus_metrics));
+    }
+
+    router.with_state(app_state)
 }
 
 const CARGO_LOCK: &str = include_str!("../../../Cargo.lock");
@@ -2596,7 +2604,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prometheus_endpoint_respects_flag() {
+    async fn metrics_listener_hides_prometheus_when_disabled() {
         let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10, None));
         let metrics = Arc::new(Metrics::new());
         let app_state = Arc::new(AppState {
@@ -2617,7 +2625,7 @@ mod tests {
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         });
-        let router = super::all_routes(Arc::clone(&app_state));
+        let router = super::metrics_routes(Arc::clone(&app_state));
         let response = router
             .oneshot(
                 Request::builder()
@@ -2631,7 +2639,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prometheus_endpoint_returns_metrics_when_enabled() {
+    async fn metrics_listener_returns_prometheus_when_enabled() {
         let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10, None));
         let metrics = Arc::new(Metrics::new());
         metrics.events_total.fetch_add(42, Ordering::Relaxed);
@@ -2653,7 +2661,7 @@ mod tests {
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         });
-        let router = super::all_routes(Arc::clone(&app_state));
+        let router = super::metrics_routes(Arc::clone(&app_state));
         let response = router
             .oneshot(
                 Request::builder()
@@ -2749,6 +2757,87 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn kubernetes_api_routes_require_secret_backed_auth() {
+        let manifest = std::fs::read_to_string("../k8s/configmap.yaml")
+            .expect("cannot read k8s/configmap.yaml");
+        let document: serde_yaml::Value =
+            serde_yaml::from_str(&manifest).expect("configmap.yaml is not valid YAML");
+        let embedded_config = document["data"]["linnix.toml"]
+            .as_str()
+            .expect("configmap has no data['linnix.toml']");
+        let config: cognitod::config::Config =
+            toml::from_str(embedded_config).expect("embedded linnix.toml does not parse");
+
+        assert_eq!(config.api.listen_addr, "0.0.0.0:3000");
+        assert!(config.outputs.prometheus);
+
+        // The DaemonSet injects this value from Secret/linnix-api-token. The
+        // application router sees the resolved token, never the Secret itself.
+        let app_state = Arc::new(AppState {
+            context: Arc::new(ContextStore::new(Duration::from_secs(60), 10, None)),
+            metrics: Arc::new(Metrics::new()),
+            alerts: None,
+            insights: Arc::new(InsightStore::new(16, None)),
+            offline: Arc::new(OfflineGuard::new(false)),
+            transport: "perf",
+            probe_state: ProbeState::disabled(),
+            require_kernel_instrumentation: true,
+            enforcement: None,
+            reasoner: ReasonerConfig::default(),
+            prometheus_enabled: config.outputs.prometheus,
+            alert_history: Arc::new(AlertHistory::new(16)),
+            auth_token: Some("secret-from-kubernetes".to_string()),
+            incident_store: None,
+            k8s: None,
+            blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+        });
+
+        for request in [
+            Request::builder()
+                .uri("/processes")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .uri("/system")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .method("POST")
+                .uri("/actions/action-1/approve")
+                .body(Body::empty())
+                .unwrap(),
+        ] {
+            let response = super::all_routes(Arc::clone(&app_state))
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let metrics_response = super::metrics_routes(Arc::clone(&app_state))
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(metrics_response.status(), StatusCode::OK);
+
+        let sensitive_on_metrics = super::metrics_routes(app_state)
+            .oneshot(
+                Request::builder()
+                    .uri("/processes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sensitive_on_metrics.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -2936,7 +3025,7 @@ mod tests {
             blame_metrics: Arc::clone(&blame),
         });
 
-        let response = super::all_routes(app_state)
+        let response = super::metrics_routes(app_state)
             .oneshot(
                 Request::builder()
                     .uri("/metrics/prometheus")

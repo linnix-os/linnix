@@ -4,7 +4,8 @@ Base URL: `http://localhost:3000`
 
 ## Authentication
 
-Set the `LINNIX_API_TOKEN` environment variable to enable Bearer token authentication.
+Set `LINNIX_API_TOKEN` to authenticate the API. The daemon refuses to start a
+TCP API bound outside loopback without this token (or `api.auth_token`).
 
 ```bash
 # With auth enabled
@@ -39,7 +40,6 @@ curl -H "Authorization: Bearer <token>" http://localhost:3000/status
 | `/insights/recent` | GET | - |
 | `/insights/schema` | GET | - |
 | `/metrics` | GET | - |
-| `/metrics/prometheus` | GET | - |
 | `/metrics/system` | GET | - |
 | `/ppid/{ppid}` | GET | - |
 | `/processes` | GET | - |
@@ -119,11 +119,12 @@ Returns metrics in JSON format.
 curl http://localhost:3000/metrics | jq
 ```
 
-#### GET /metrics/prometheus
-Returns metrics in Prometheus text exposition format.
+#### GET /metrics/prometheus (operational listener)
+Returns metrics in Prometheus text exposition format from the separate
+operational listener, which defaults to `http://localhost:9090`.
 
 ```bash
-curl http://localhost:3000/metrics/prometheus
+curl http://localhost:9090/metrics/prometheus
 ```
 
 ---

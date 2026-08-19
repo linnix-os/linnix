@@ -9,7 +9,7 @@ data:
   linnix.toml: |
     [api]
     listen_addr = "0.0.0.0:3000"
-    # auth_token = "your-secret-token"  # IMPORTANT: Set this for production!
+    # LINNIX_API_TOKEN is injected from Secret/linnix-api-token by the DaemonSet.
 
     [runtime]
     offline = false
@@ -29,9 +29,10 @@ data:
     endpoint = "http://localhost:8090/v1/chat/completions"
 
     [outputs]
-    # Serves the Prometheus text exposition at /metrics/prometheus, including
-    # the per-pod stall attribution metrics the Grafana dashboard charts.
+    # Prometheus and kubelet probes use a separate, unauthenticated operational
+    # listener. It never exposes process, system, incident, or action routes.
     prometheus = true
+    metrics_listen_addr = "0.0.0.0:9090"
 
     [psi]
     # Seconds of sustained pressure before a stall is attributed to neighbours.

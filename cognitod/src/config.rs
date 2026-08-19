@@ -566,7 +566,7 @@ fn default_reasoner_timeout() -> u64 {
     30_000
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 #[allow(dead_code)]
 pub struct OutputConfig {
     #[serde(default)]
@@ -575,6 +575,25 @@ pub struct OutputConfig {
     pub pagerduty: bool,
     #[serde(default)]
     pub prometheus: bool,
+    /// Unauthenticated operational listener for Prometheus and probes. The
+    /// main API listener does not serve this endpoint.
+    #[serde(default = "default_metrics_listen_addr")]
+    pub metrics_listen_addr: String,
+}
+
+impl Default for OutputConfig {
+    fn default() -> Self {
+        Self {
+            slack: false,
+            pagerduty: false,
+            prometheus: false,
+            metrics_listen_addr: default_metrics_listen_addr(),
+        }
+    }
+}
+
+fn default_metrics_listen_addr() -> String {
+    "127.0.0.1:9090".to_string()
 }
 
 #[derive(Clone)]
@@ -841,6 +860,51 @@ offline = true
         assert!(
             cfg.outputs.prometheus,
             "the DaemonSet must serve /metrics/prometheus or the dashboard is empty"
+        );
+        assert_eq!(
+            cfg.outputs.metrics_listen_addr, "0.0.0.0:9090",
+            "Kubernetes must expose unauthenticated metrics on the dedicated surface"
+        );
+    }
+
+    #[test]
+    fn the_kubernetes_daemonset_uses_a_secret_for_the_public_api_token() {
+        let manifest = std::fs::read_to_string("../k8s/daemonset.yaml")
+            .expect("cannot read k8s/daemonset.yaml");
+        let doc: serde_yaml::Value =
+            serde_yaml::from_str(&manifest).expect("daemonset.yaml is not valid YAML");
+        let container = doc["spec"]["template"]["spec"]["containers"]
+            .as_sequence()
+            .and_then(|containers| {
+                containers
+                    .iter()
+                    .find(|container| container["name"].as_str() == Some("cognitod"))
+            })
+            .expect("DaemonSet has no cognitod container");
+        let token = container["env"]
+            .as_sequence()
+            .and_then(|environment| {
+                environment
+                    .iter()
+                    .find(|entry| entry["name"].as_str() == Some("LINNIX_API_TOKEN"))
+            })
+            .expect("DaemonSet must inject LINNIX_API_TOKEN");
+
+        assert_eq!(
+            token["valueFrom"]["secretKeyRef"]["name"].as_str(),
+            Some("linnix-api-token")
+        );
+        assert_eq!(
+            token["valueFrom"]["secretKeyRef"]["key"].as_str(),
+            Some("token")
+        );
+        assert_eq!(
+            container["livenessProbe"]["httpGet"]["port"].as_str(),
+            Some("metrics")
+        );
+        assert_eq!(
+            container["readinessProbe"]["httpGet"]["port"].as_str(),
+            Some("metrics")
         );
     }
 

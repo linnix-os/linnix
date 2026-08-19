@@ -41,15 +41,20 @@ Linnix uses **eBPF** + **PSI (Pressure Stall Information)** to answer this. PSI 
 Deploy Linnix as a DaemonSet to monitor your cluster.
 
 ```bash
-# Apply the manifests
+# Create the API token outside the repository, then apply the manifests.
+kubectl create secret generic linnix-api-token \
+  --namespace default \
+  --from-literal=token="$(openssl rand -base64 32)"
 kubectl apply -f k8s/
 ```
 
 **Access the API:**
 ```bash
+export LINNIX_API_TOKEN="$(kubectl get secret linnix-api-token \
+  -o jsonpath='{.data.token}' | base64 -d)"
 kubectl port-forward daemonset/linnix-agent 3000:3000
-# API available at http://localhost:3000
-# Stream events: curl http://localhost:3000/stream
+# API available at http://localhost:3000 (Bearer token required)
+# Stream events: curl -H "Authorization: Bearer $LINNIX_API_TOKEN" http://localhost:3000/stream
 ```
 
 ## Quickstart (Docker)
@@ -106,6 +111,9 @@ See [SAFETY.md](SAFETY.md) for our detailed safety model.
 Linnix exports the attribution as Prometheus counters, so the "who is stalling whom" view works in the Grafana you already run.
 
 ```bash
+kubectl create secret generic linnix-api-token \
+  --namespace default \
+  --from-literal=token="$(openssl rand -base64 32)"
 kubectl apply -f k8s/                       # scrape annotations included
 # Grafana → Dashboards → New → Import → Upload JSON file
 #   k8s/grafana/linnix-noisy-neighbor.json

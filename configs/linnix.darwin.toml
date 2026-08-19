@@ -4,6 +4,7 @@
 
 [api]
 listen_addr = "0.0.0.0:3000"  # Bind to all interfaces for macOS bridge network
+# Required for this non-loopback bind: set LINNIX_API_TOKEN in the environment.
 # auth_token = "your-secret-token"
 
 [runtime]
@@ -27,8 +28,9 @@ model = "linnix-3b-distilled"
 timeout_ms = 30000
 
 [outputs]
-# Serve the Prometheus text exposition at /metrics/prometheus
+# Serve Prometheus, health, and readiness on a separate operational listener.
 prometheus = true
+metrics_listen_addr = "127.0.0.1:9090"
 
 [probes]
 # eBPF probe configuration
