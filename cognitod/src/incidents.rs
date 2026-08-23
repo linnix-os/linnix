@@ -623,20 +623,48 @@ impl IncidentStore {
 
     /// Get recent incidents
     pub async fn recent(&self, limit: i64) -> Result<Vec<Incident>, sqlx::Error> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, timestamp, event_type, psi_cpu, psi_memory, cpu_percent, load_avg,
-                   action, target_pid, target_name, system_snapshot,
-                   llm_analysis, llm_analyzed_at, recovery_time_ms, psi_after,
-                   investigation
-            FROM incidents
-            ORDER BY timestamp DESC
-            LIMIT ?
-            "#,
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        self.recent_filtered(limit, None).await
+    }
+
+    /// Get recent incidents, optionally filtered by event type
+    pub async fn recent_filtered(
+        &self,
+        limit: i64,
+        event_type: Option<&str>,
+    ) -> Result<Vec<Incident>, sqlx::Error> {
+        let rows = if let Some(evt_type) = event_type {
+            sqlx::query(
+                r#"
+                SELECT id, timestamp, event_type, psi_cpu, psi_memory, cpu_percent, load_avg,
+                       action, target_pid, target_name, system_snapshot,
+                       llm_analysis, llm_analyzed_at, recovery_time_ms, psi_after,
+                       investigation
+                FROM incidents
+                WHERE event_type = ?
+                ORDER BY timestamp DESC
+                LIMIT ?
+                "#,
+            )
+            .bind(evt_type)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT id, timestamp, event_type, psi_cpu, psi_memory, cpu_percent, load_avg,
+                       action, target_pid, target_name, system_snapshot,
+                       llm_analysis, llm_analyzed_at, recovery_time_ms, psi_after,
+                       investigation
+                FROM incidents
+                ORDER BY timestamp DESC
+                LIMIT ?
+                "#,
+            )
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        };
 
         Ok(rows
             .into_iter()
@@ -730,10 +758,11 @@ impl IncidentStore {
             .await?;
         let total: i64 = total_row.get(0);
 
-        let cb_row =
-            sqlx::query("SELECT COUNT(*) FROM incidents WHERE event_type = 'circuit_breaker'")
-                .fetch_one(&self.pool)
-                .await?;
+        let cb_row = sqlx::query(
+            "SELECT COUNT(*) FROM incidents WHERE event_type = 'circuit_breaker' OR event_type LIKE 'circuit_breaker_%'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
         let circuit_breaker_count: i64 = cb_row.get(0);
 
         let avg_row = sqlx::query(

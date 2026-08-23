@@ -152,6 +152,49 @@ async fn the_stats_average_counts_only_incidents_that_recovered() {
 }
 
 #[tokio::test]
+async fn the_stats_count_circuit_breaker_event_families() {
+    let (_dir, store) = store().await;
+
+    let mut memory_breaker = incident();
+    memory_breaker.event_type = "circuit_breaker_memory".to_string();
+    let mut manual = incident();
+    manual.event_type = "manual_kill".to_string();
+
+    store.insert(&incident()).await.unwrap();
+    store.insert(&memory_breaker).await.unwrap();
+    store.insert(&manual).await.unwrap();
+
+    let stats = store.stats().await.unwrap();
+
+    assert_eq!(stats.total, 3);
+    assert_eq!(stats.circuit_breaker_triggers, 2);
+}
+
+#[tokio::test]
+async fn recent_incidents_can_be_filtered_by_event_type() {
+    let (_dir, store) = store().await;
+
+    let mut manual = incident();
+    manual.event_type = "manual_kill".to_string();
+    manual.timestamp += 1;
+    let mut warning = incident();
+    warning.event_type = "warning".to_string();
+    warning.timestamp += 2;
+
+    store.insert(&incident()).await.unwrap();
+    store.insert(&manual).await.unwrap();
+    store.insert(&warning).await.unwrap();
+
+    let filtered = store
+        .recent_filtered(10, Some("manual_kill"))
+        .await
+        .unwrap();
+
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].event_type, "manual_kill");
+}
+
+#[tokio::test]
 async fn the_average_stays_absent_until_something_recovers() {
     let (_dir, store) = store().await;
     let id = store.insert(&incident()).await.unwrap();
