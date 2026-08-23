@@ -12,8 +12,11 @@ pub use investigation::{Fact, IncidentInvestigation};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
-use std::path::Path;
+use sqlx::{
+    Row, SqlitePool,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+};
+use std::{collections::HashMap, path::Path};
 use tracing::{debug, info, warn};
 
 /// Represents a circuit breaker incident or system event
@@ -126,11 +129,13 @@ const REQUIRED_COLUMNS: &[RequiredColumn] = &[
 impl IncidentStore {
     /// Create a new incident store
     pub async fn new<P: AsRef<Path>>(db_path: P) -> Result<Self, sqlx::Error> {
-        let db_url = format!("sqlite://{}?mode=rwc", db_path.as_ref().display());
+        let options = SqliteConnectOptions::new()
+            .filename(db_path.as_ref())
+            .create_if_missing(true);
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(&db_url)
+            .connect_with(options)
             .await?;
 
         // Create schema
@@ -794,6 +799,36 @@ impl IncidentStore {
             feedback_entries: feedback_count as u64,
         })
     }
+
+    pub async fn analysis_counts(&self) -> Result<(u64, u64), sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT
+                COALESCE(SUM(CASE WHEN llm_analysis IS NOT NULL THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN llm_analysis IS NULL THEN 1 ELSE 0 END), 0)
+             FROM incidents",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let analyzed: i64 = row.get(0);
+        let pending: i64 = row.get(1);
+        Ok((analyzed as u64, pending as u64))
+    }
+
+    pub async fn counts_by_event_type(&self) -> Result<HashMap<String, u64>, sqlx::Error> {
+        let rows = sqlx::query("SELECT event_type, COUNT(*) FROM incidents GROUP BY event_type")
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let event_type: String = row.get(0);
+                let count: i64 = row.get(1);
+                (event_type, count as u64)
+            })
+            .collect())
+    }
 }
 
 async fn apply_required_column_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
@@ -830,4 +865,43 @@ pub struct IncidentStats {
     /// the second half of that picture.
     pub avg_recovery_time_ms: Option<u64>,
     pub feedback_entries: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn incident(event_type: &str) -> Incident {
+        Incident {
+            id: None,
+            timestamp: Utc::now().timestamp(),
+            event_type: event_type.to_string(),
+            psi_cpu: 12.5,
+            psi_memory: 3.0,
+            cpu_percent: 45.0,
+            load_avg: "1.0,0.8,0.6".to_string(),
+            action: "alert".to_string(),
+            target_pid: None,
+            target_name: None,
+            system_snapshot: None,
+            llm_analysis: None,
+            llm_analyzed_at: None,
+            investigation: None,
+            recovery_time_ms: None,
+            psi_after: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_path_with_uri_reserved_characters_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("incidents ?query#fragment.db");
+
+        let store = IncidentStore::new(&db_path).await.unwrap();
+        let id = store.insert(&incident("warning")).await.unwrap();
+        let stored = store.get(id).await.unwrap().unwrap();
+
+        assert_eq!(stored.event_type, "warning");
+        assert!(db_path.exists());
+    }
 }

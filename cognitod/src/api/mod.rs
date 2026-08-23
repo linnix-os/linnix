@@ -2,14 +2,18 @@ mod auth;
 
 use crate::runtime::probes::ProbeState;
 use axum::{
-    Router,
-    extract::{Path, Query, RawForm, State},
+    Extension, Router,
+    extract::{
+        Path, Query, RawForm, State,
+        connect_info::{ConnectInfo, Connected, IntoMakeServiceWithConnectInfo},
+    },
     http::{HeaderMap, StatusCode, header},
     response::{
         IntoResponse, Json, Response,
         sse::{Event, Sse},
     },
     routing::{get, post},
+    serve::IncomingStream,
 };
 use futures_util::stream::{BoxStream, Stream, StreamExt};
 use hmac::{Hmac, Mac};
@@ -1232,12 +1236,14 @@ pub async fn healthz(State(app_state): State<Arc<AppState>>) -> axum::Json<serde
     }))
 }
 
-/// True when the eBPF probes actually attached and events can flow.
+/// True when the primary eBPF perf pipeline attached and events can flow.
 ///
 /// `transport` is set to "perf" only after `init_ebpf` succeeds; it stays
-/// "userspace" when the object failed to load or verify.
+/// "userspace" when the object failed to load or verify. The rss tracepoint
+/// fallback can attach without a userspace consumer for its RSS_EVENTS map, so
+/// it remains degraded for readiness until it is wired into attribution.
 pub fn kernel_instrumentation_active(app_state: &AppState) -> bool {
-    app_state.transport != "userspace"
+    app_state.transport == "perf"
 }
 
 /// Readiness. Answers "is this instance doing its job?"
@@ -1862,6 +1868,138 @@ fn slack_router() -> Router<Arc<AppState>> {
     Router::new().route("/api/slack/interactions", post(handle_slack_interaction))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UdsPeerCredentials {
+    pid: libc::pid_t,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    verified: bool,
+}
+
+impl UdsPeerCredentials {
+    fn verified(pid: libc::pid_t, uid: libc::uid_t, gid: libc::gid_t) -> Self {
+        Self {
+            pid,
+            uid,
+            gid,
+            verified: true,
+        }
+    }
+
+    fn unverified() -> Self {
+        Self {
+            pid: -1,
+            uid: libc::uid_t::MAX,
+            gid: libc::gid_t::MAX,
+            verified: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn current_process() -> Self {
+        // Safe: these libc getters have no failure mode.
+        unsafe { Self::verified(libc::getpid(), libc::geteuid(), libc::getegid()) }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn extract_uds_peer_credentials(
+    stream: &tokio::net::UnixStream,
+) -> std::io::Result<UdsPeerCredentials> {
+    use std::mem::{MaybeUninit, size_of};
+    use std::os::fd::AsRawFd;
+
+    let mut cred = MaybeUninit::<libc::ucred>::uninit();
+    let mut len = size_of::<libc::ucred>() as libc::socklen_t;
+
+    // Safe: `cred` points to a valid writable buffer sized by `len`, and the
+    // kernel initialises it when getsockopt succeeds.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            cred.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    if len as usize != size_of::<libc::ucred>() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "SO_PEERCRED returned an unexpected credential length",
+        ));
+    }
+
+    // Safe: successful getsockopt with the exact ucred length initialised it.
+    let cred = unsafe { cred.assume_init() };
+    Ok(UdsPeerCredentials::verified(cred.pid, cred.uid, cred.gid))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn extract_uds_peer_credentials(
+    _stream: &tokio::net::UnixStream,
+) -> std::io::Result<UdsPeerCredentials> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "UDS peer credentials require SO_PEERCRED",
+    ))
+}
+
+#[cfg(unix)]
+impl Connected<IncomingStream<'_, tokio::net::UnixListener>> for UdsPeerCredentials {
+    fn connect_info(stream: IncomingStream<'_, tokio::net::UnixListener>) -> Self {
+        match extract_uds_peer_credentials(stream.io()) {
+            Ok(peer) => peer,
+            Err(err) => {
+                log::warn!("failed to extract UDS peer credentials: {err}");
+                UdsPeerCredentials::unverified()
+            }
+        }
+    }
+}
+
+fn uds_peer_allowed(
+    peer: UdsPeerCredentials,
+    daemon_uid: libc::uid_t,
+    daemon_gid: libc::gid_t,
+) -> bool {
+    peer.verified && (peer.uid == 0 || peer.uid == daemon_uid || peer.gid == daemon_gid)
+}
+
+fn uds_peer_authorized(peer: UdsPeerCredentials) -> bool {
+    // Safe: these libc getters have no failure mode.
+    let (daemon_uid, daemon_gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    uds_peer_allowed(peer, daemon_uid, daemon_gid)
+}
+
+async fn uds_peer_auth_middleware(
+    peer: Option<Extension<ConnectInfo<UdsPeerCredentials>>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let Some(Extension(ConnectInfo(peer))) = peer else {
+        return (StatusCode::UNAUTHORIZED, "UDS peer credentials required").into_response();
+    };
+
+    if !uds_peer_authorized(peer) {
+        log::warn!(
+            "rejected UDS peer pid={} uid={} gid={} verified={}",
+            peer.pid,
+            peer.uid,
+            peer.gid,
+            peer.verified
+        );
+        return (StatusCode::FORBIDDEN, "UDS peer not authorized").into_response();
+    }
+
+    next.run(request).await
+}
+
 /// Build routes for the TCP listener, which requires a bearer token when one
 /// is configured.
 pub fn all_routes(app_state: Arc<AppState>) -> Router {
@@ -1880,11 +2018,22 @@ pub fn all_routes(app_state: Arc<AppState>) -> Router {
 
 /// Build routes for the Unix domain socket listener.
 ///
-/// Same routes as `all_routes` — guaranteed, not maintained — but no auth
-/// middleware: UDS connections are trusted because local process identity is
-/// verified by socket credentials (`SO_PEERCRED`).
-pub fn uds_routes(app_state: Arc<AppState>) -> Router {
-    base_router().merge(slack_router()).with_state(app_state)
+/// Same routes as `all_routes` — guaranteed, not maintained — but bearer auth
+/// is replaced by UDS peer auth. Connections are trusted only after local
+/// process identity is verified by socket credentials (`SO_PEERCRED`). The peer
+/// is accepted when it is root, has the daemon's effective uid, or has the
+/// daemon's effective gid.
+fn uds_router(app_state: Arc<AppState>) -> Router {
+    base_router()
+        .merge(slack_router())
+        .layer(axum::middleware::from_fn(uds_peer_auth_middleware))
+        .with_state(app_state)
+}
+
+pub fn uds_routes(
+    app_state: Arc<AppState>,
+) -> IntoMakeServiceWithConnectInfo<Router, UdsPeerCredentials> {
+    uds_router(app_state).into_make_service_with_connect_info::<UdsPeerCredentials>()
 }
 
 /// Build the unauthenticated operational listener. It deliberately contains no
@@ -2160,20 +2309,20 @@ async fn get_incident_summary(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    let (analyzed, pending) = store
+        .analysis_counts()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let by_event_type = store
+        .counts_by_event_type()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
     let recent = store
         .recent(10)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let analyzed = recent.iter().filter(|i| i.llm_analysis.is_some()).count() as u64;
-    let pending = recent.len() as u64 - analyzed;
-
-    let mut by_event_type = std::collections::HashMap::new();
-    for incident in &recent {
-        *by_event_type
-            .entry(incident.event_type.clone())
-            .or_insert(0) += 1;
-    }
 
     Ok(Json(IncidentSummary {
         total: stats.total,
@@ -2536,7 +2685,9 @@ mod tests {
     use crate::insights::InsightStore;
     use crate::runtime::probes::{ProbeState, RssProbeMode};
     use crate::{PERCENT_MILLI_UNKNOWN, ProcessEvent};
+    use axum::Extension;
     use axum::body::{Body, to_bytes};
+    use axum::extract::connect_info::ConnectInfo;
     use axum::http::Request;
     use cognitod::k8s::{K8sMetadata, Priority};
     use cognitod::schema::{Insight, InsightReason, PodContribution};
@@ -3029,6 +3180,48 @@ mod tests {
         assert_eq!(v["ready"], false);
         assert_eq!(v["kernel_instrumentation"], "unavailable");
         assert!(v["reason"].as_str().unwrap().contains("userspace-only"));
+    }
+
+    #[tokio::test]
+    async fn readyz_503_for_unconsumed_tracepoint_fallback() {
+        let app_state = Arc::new(AppState {
+            context: Arc::new(ContextStore::new(Duration::from_secs(60), 10, None)),
+            metrics: Arc::new(Metrics::new()),
+            alerts: None,
+            insights: Arc::new(InsightStore::new(16, None)),
+            offline: Arc::new(OfflineGuard::new(false)),
+            transport: "tracepoint",
+            probe_state: ProbeState {
+                rss_probe: RssProbeMode::Tracepoint,
+                btf_available: false,
+            },
+            require_kernel_instrumentation: true,
+            enforcement: None,
+            reasoner: ReasonerConfig::default(),
+            prometheus_enabled: false,
+            alert_history: Arc::new(AlertHistory::new(16)),
+            auth_token: None,
+            slack_signing_secret: None,
+            incident_store: None,
+            k8s: None,
+            blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+        });
+        let app = all_routes(Arc::clone(&app_state));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["ready"], false);
+        assert_eq!(v["transport"], "tracepoint");
+        assert_eq!(v["kernel_instrumentation"], "unavailable");
     }
 
     #[tokio::test]
@@ -4270,6 +4463,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incident_summary_counts_all_incidents_not_just_recent_ten() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            cognitod::IncidentStore::new(dir.path().join("incidents.db"))
+                .await
+                .unwrap(),
+        );
+
+        for idx in 0..2 {
+            let id = store
+                .insert(&api_test_incident("manual_kill", 1_732_242_100 + idx))
+                .await
+                .unwrap();
+            store
+                .add_llm_analysis(
+                    id,
+                    &cognitod::incidents::AnalysisOutcome {
+                        raw_response: format!("analysis {idx}"),
+                        investigation: None,
+                        parse_error: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        for idx in 0..10 {
+            store
+                .insert(&api_test_incident(
+                    "circuit_breaker_cpu",
+                    1_732_242_200 + idx,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let app_state = app_state_with_incident_store(store);
+        let (status, json) = get_incidents_json(app_state, "/incidents/summary").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["total"], 12);
+        assert_eq!(json["analyzed"], 2);
+        assert_eq!(json["pending_analysis"], 10);
+        assert_eq!(json["by_event_type"]["manual_kill"], 2);
+        assert_eq!(json["by_event_type"]["circuit_breaker_cpu"], 10);
+
+        let recent = json["recent"].as_array().expect("recent is an array");
+        assert_eq!(recent.len(), 10);
+        assert!(
+            recent.iter().all(|incident| {
+                incident["event_type"]
+                    .as_str()
+                    .is_some_and(|event_type| event_type == "circuit_breaker_cpu")
+            }),
+            "the recent window may stay limited, but aggregate fields must be global"
+        );
+    }
+
+    #[tokio::test]
     async fn incidents_route_rejects_nonpositive_limits() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(
@@ -4572,12 +4824,73 @@ mod tests {
         );
     }
 
-    /// The one intended difference between the two listeners, pinned: same
-    /// route, same state, token required over TCP and not over the socket.
-    /// The route sets themselves no longer need a test — both listeners build
-    /// from `base_router`, so they cannot disagree.
+    fn different_uid(uid: libc::uid_t) -> libc::uid_t {
+        if uid == 1 { 2 } else { 1 }
+    }
+
+    fn different_gid(gid: libc::gid_t) -> libc::gid_t {
+        if gid == 1 { 2 } else { 1 }
+    }
+
+    fn unrelated_uds_peer() -> UdsPeerCredentials {
+        // Safe: these libc getters have no failure mode.
+        let (daemon_uid, daemon_gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        UdsPeerCredentials::verified(42, different_uid(daemon_uid), different_gid(daemon_gid))
+    }
+
+    #[test]
+    fn uds_peer_policy_accepts_root_daemon_uid_or_daemon_gid() {
+        assert!(uds_peer_allowed(
+            UdsPeerCredentials::verified(10, 0, 9_001),
+            1_000,
+            1_001,
+        ));
+        assert!(uds_peer_allowed(
+            UdsPeerCredentials::verified(10, 1_000, 9_001),
+            1_000,
+            1_001,
+        ));
+        assert!(uds_peer_allowed(
+            UdsPeerCredentials::verified(10, 9_001, 1_001),
+            1_000,
+            1_001,
+        ));
+    }
+
+    #[test]
+    fn uds_peer_policy_rejects_unverified_or_unrelated_peers() {
+        assert!(!uds_peer_allowed(
+            UdsPeerCredentials::unverified(),
+            1_000,
+            1_001,
+        ));
+        assert!(!uds_peer_allowed(
+            UdsPeerCredentials::verified(10, 2_000, 2_001),
+            1_000,
+            1_001,
+        ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test]
-    async fn the_socket_skips_the_auth_the_tcp_listener_enforces() {
+    async fn uds_peer_credentials_are_extracted_from_the_socket() {
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+        let peer = extract_uds_peer_credentials(&server).unwrap();
+        let current = UdsPeerCredentials::current_process();
+
+        assert!(peer.verified);
+        assert_eq!(peer.uid, current.uid);
+        assert_eq!(peer.gid, current.gid);
+        assert!(peer.pid > 0);
+
+        drop(client);
+    }
+
+    /// The route sets remain shared, but UDS now has its own local peer-auth
+    /// boundary: token auth is still TCP-only, while the socket requires
+    /// SO_PEERCRED-derived credentials.
+    #[tokio::test]
+    async fn the_socket_uses_peer_credentials_instead_of_bearer_auth() {
         let ctx = Arc::new(ContextStore::new(Duration::from_secs(60), 10, None));
         let metrics = Arc::new(Metrics::new());
         let app_state = Arc::new(AppState {
@@ -4617,14 +4930,86 @@ mod tests {
             "a configured token must be enforced on the TCP listener"
         );
 
-        let over_socket = super::uds_routes(app_state)
+        let over_socket_without_peer = super::uds_router(Arc::clone(&app_state))
+            .oneshot(unauthenticated())
+            .await
+            .unwrap();
+        assert_eq!(
+            over_socket_without_peer.status(),
+            StatusCode::UNAUTHORIZED,
+            "the UDS listener must fail closed when peer credentials are absent"
+        );
+
+        let over_socket = super::uds_router(app_state)
+            .layer(Extension(
+                ConnectInfo(UdsPeerCredentials::current_process()),
+            ))
             .oneshot(unauthenticated())
             .await
             .unwrap();
         assert_eq!(
             over_socket.status(),
             StatusCode::OK,
-            "the socket is authenticated by SO_PEERCRED, not by the token"
+            "the socket is authenticated by peer credentials, not by the bearer token"
         );
+    }
+
+    #[tokio::test]
+    async fn uds_rejects_action_approval_from_unrelated_peer() {
+        let enforcement = Arc::new(test_enforcement_queue(60));
+        let action_id = propose_test_action(&enforcement).await;
+        let app_state = minimal_app_state(
+            Some("secret123".to_string()),
+            None,
+            Some(Arc::clone(&enforcement)),
+        );
+
+        let response = super::uds_router(app_state)
+            .layer(Extension(ConnectInfo(unrelated_uds_peer())))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/actions/{action_id}/approve"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"approver":"uds-peer"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let action = enforcement.get_by_id(&action_id).await.unwrap();
+        assert_eq!(action.status, ActionStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn uds_accepts_action_approval_from_allowed_peer() {
+        let enforcement = Arc::new(test_enforcement_queue(60));
+        let action_id = propose_test_action(&enforcement).await;
+        let app_state = minimal_app_state(
+            Some("secret123".to_string()),
+            None,
+            Some(Arc::clone(&enforcement)),
+        );
+
+        let response = super::uds_router(app_state)
+            .layer(Extension(
+                ConnectInfo(UdsPeerCredentials::current_process()),
+            ))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/actions/{action_id}/approve"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"approver":"uds-peer"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let action = enforcement.get_by_id(&action_id).await.unwrap();
+        assert_eq!(action.status, ActionStatus::Approved);
+        assert_eq!(action.approved_by.as_deref(), Some("uds-peer"));
     }
 }

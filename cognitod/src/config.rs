@@ -517,7 +517,7 @@ impl Default for RulesFileConfig {
 }
 
 fn default_rules_file() -> String {
-    "/etc/linnix/rules.toml".to_string()
+    "/etc/linnix/rules.yaml".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1188,6 +1188,11 @@ timeout_ms = 30000
         assert_eq!(t.sample_interval(), std::time::Duration::from_secs(5));
         assert_eq!(t.retention(), std::time::Duration::from_secs(300));
         assert_eq!(t.min_eps_to_enable, 20);
+    }
+
+    #[test]
+    fn default_rules_file_matches_packaged_rules_asset() {
+        assert_eq!(Config::default().rules.path, "/etc/linnix/rules.yaml");
     }
 
     #[test]

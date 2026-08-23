@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -15,7 +15,7 @@ echo "📦 Installing git hooks..."
 # Create pre-commit hook
 cat > "$HOOKS_DIR/pre-commit" << 'EOF'
 #!/bin/bash
-set -e
+set -euo pipefail
 
 echo "🔍 Running pre-commit checks..."
 echo ""
@@ -26,9 +26,8 @@ if [ ! -f "Cargo.toml" ]; then
 fi
 
 echo "📝 Checking code formatting..."
-FMT_OUTPUT=$(cargo fmt --all -- --check 2>&1 | grep -v "^Warning:" | grep -v "^$" || true)
-if [ -n "$FMT_OUTPUT" ]; then
-    echo "$FMT_OUTPUT"
+if ! FMT_OUTPUT="$(cargo fmt --all -- --check 2>&1)"; then
+    printf '%s\n' "$FMT_OUTPUT" | grep -v "^Warning:" | grep -v "^$" || true
     echo "❌ Format check failed. Run: cargo fmt --all"
     exit 1
 fi

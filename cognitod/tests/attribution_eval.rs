@@ -562,6 +562,14 @@ fn scrape_victim_us(metrics: &BlameMetrics, pod: &str) -> u64 {
 /// Reads one pair counter back out of the Prometheus exposition, which is the
 /// only view of it a user ever gets.
 fn scrape_pair_seconds(metrics: &BlameMetrics, offender: &str, victim: &str) -> f64 {
+    try_scrape_pair_seconds(metrics, offender, victim).unwrap_or_else(|| {
+        let mut body = String::new();
+        metrics.render_prometheus(&mut body);
+        panic!("no counter for {} -> {} in:\n{}", offender, victim, body);
+    })
+}
+
+fn try_scrape_pair_seconds(metrics: &BlameMetrics, offender: &str, victim: &str) -> Option<f64> {
     let mut body = String::new();
     metrics.render_prometheus(&mut body);
 
@@ -576,7 +584,6 @@ fn scrape_pair_seconds(metrics: &BlameMetrics, offender: &str, victim: &str) -> 
         })
         .and_then(|line| line.rsplit(' ').next())
         .and_then(|value| value.parse().ok())
-        .unwrap_or_else(|| panic!("no counter for {} -> {} in:\n{}", offender, victim, body))
 }
 
 // --- Full loop: fixture cgroup tree through PsiMonitor -----------------------
@@ -690,6 +697,128 @@ async fn scan_loop_surfaces_a_stalling_pod_on_the_metrics_endpoint() {
         line
     );
     assert!(line.contains(r#"node="node-1""#), "line was: {}", line);
+}
+
+#[tokio::test]
+async fn scan_loop_sums_container_psi_deltas_before_thresholding_a_pod() {
+    use cognitod::context::ContextStore;
+    use cognitod::k8s::{K8sContext, K8sMetadata, Priority};
+    use cognitod::{PERCENT_MILLI_UNKNOWN, ProcessEvent, ProcessEventWire};
+
+    unsafe {
+        std::env::set_var("K8S_API_URL", "http://127.0.0.1:1");
+        std::env::set_var("K8S_TOKEN", "dummy");
+    }
+    let k8s_ctx = K8sContext::new().expect("K8sContext should build from env");
+
+    let container_a = "a".repeat(64);
+    let container_b = "b".repeat(64);
+    for (container_id, container_name) in [
+        (container_a.clone(), "server"),
+        (container_b.clone(), "sidecar"),
+    ] {
+        k8s_ctx.insert_metadata(
+            container_id,
+            K8sMetadata {
+                pod_name: "checkout-api".to_string(),
+                namespace: "prod".to_string(),
+                container_name: container_name.to_string(),
+                owner_kind: None,
+                owner_name: None,
+                priority: Priority::default(),
+                slo_tier: None,
+            },
+        );
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let pressure_file = |container_id: &str| {
+        let cgroup_dir = tmp.path().join("kubepods.slice").join(format!(
+            "kubepods-burstable-pod1.slice/cri-containerd-{}.scope",
+            container_id
+        ));
+        std::fs::create_dir_all(&cgroup_dir).unwrap();
+        cgroup_dir.join("cpu.pressure")
+    };
+    let pressure_a = pressure_file(&container_a);
+    let pressure_b = pressure_file(&container_b);
+
+    let write_pressure = |path: &std::path::Path, total: u64| {
+        std::fs::write(
+            path,
+            format!(
+                "some avg10=10.00 avg60=5.00 avg300=1.00 total={}\n\
+                 full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+                total
+            ),
+        )
+        .unwrap();
+    };
+    write_pressure(&pressure_a, 1_000_000);
+    write_pressure(&pressure_b, 1_000_000);
+
+    let metrics = Arc::new(BlameMetrics::new("node-1"));
+    let sink = Arc::new(AttributionSink::new(metrics.clone(), None, "node-1"));
+    let context = Arc::new(ContextStore::new(
+        Duration::from_secs(60),
+        1000,
+        Some(k8s_ctx.clone()),
+    ));
+
+    let mut offender = ProcessEvent::new(ProcessEventWire {
+        pid: 4242,
+        ppid: 1,
+        uid: 1000,
+        gid: 1000,
+        event_type: 0,
+        ts_ns: 1,
+        seq: 1,
+        comm: [0; 16],
+        exit_time_ns: 0,
+        cpu_pct_milli: PERCENT_MILLI_UNKNOWN,
+        mem_pct_milli: PERCENT_MILLI_UNKNOWN,
+        data: 0,
+        data2: 0,
+        aux: 0,
+        aux2: 0,
+    });
+    offender.set_cpu_percent(Some(90.0));
+    context.get_live_map().insert(
+        4242,
+        (
+            offender,
+            Some(Arc::new(K8sMetadata {
+                pod_name: "cpu-hog".to_string(),
+                namespace: "prod".to_string(),
+                container_name: "worker".to_string(),
+                owner_kind: None,
+                owner_name: None,
+                priority: Priority::default(),
+                slo_tier: None,
+            })),
+        ),
+    );
+
+    let monitor = cognitod::collectors::psi::PsiMonitor::new(k8s_ctx, context, None, 0, sink)
+        .with_cgroup_root(tmp.path())
+        .with_max_iterations(60);
+    let handle = tokio::spawn(monitor.run());
+
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    write_pressure(&pressure_a, 1_070_000);
+    write_pressure(&pressure_b, 1_080_000);
+
+    let seconds = poll_until(Duration::from_secs(30), || {
+        try_scrape_pair_seconds(&metrics, "cpu-hog", "checkout-api")
+    })
+    .await
+    .expect("pod-level attribution was not emitted for summed container PSI deltas");
+    handle.abort();
+
+    assert!(
+        (seconds - 0.150).abs() < 0.000_001,
+        "expected 150ms of attributed stall from the two containers, got {seconds:.6}s"
+    );
 }
 
 /// Retries `check` on a short interval until it yields a value or the deadline

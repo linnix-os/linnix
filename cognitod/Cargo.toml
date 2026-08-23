@@ -87,6 +87,8 @@ priority = "optional"
 assets = [
     ["target/release/cognitod", "usr/bin/", "755"],
     ["target/release/linnix-cli", "usr/bin/", "755"],
+    ["target/bpfel-unknown-none/release/linnix-ai-ebpf-ebpf", "usr/local/share/linnix/", "644"],
+    ["target/bpfel-unknown-none/release/rss_trace", "usr/local/share/linnix/", "644"],
     ["../configs/linnix.toml", "etc/linnix/", "644"],
     ["../configs/rules.yaml", "etc/linnix/", "644"],
     ["../configs/systemd/linnix-cognitod.service", "lib/systemd/system/cognitod.service", "644"],
@@ -110,6 +112,8 @@ start = false
 assets = [
     { source = "target/release/cognitod", dest = "/usr/bin/cognitod", mode = "755" },
     { source = "target/release/linnix-cli", dest = "/usr/bin/linnix-cli", mode = "755" },
+    { source = "target/bpfel-unknown-none/release/linnix-ai-ebpf-ebpf", dest = "/usr/local/share/linnix/linnix-ai-ebpf-ebpf", mode = "644" },
+    { source = "target/bpfel-unknown-none/release/rss_trace", dest = "/usr/local/share/linnix/rss_trace", mode = "644" },
     { source = "../configs/linnix.toml", dest = "/etc/linnix/linnix.toml", mode = "644", config = true },
     { source = "../configs/rules.yaml", dest = "/etc/linnix/rules.yaml", mode = "644", config = true },
     { source = "../configs/systemd/linnix-cognitod.service", dest = "/usr/lib/systemd/system/cognitod.service", mode = "644" },

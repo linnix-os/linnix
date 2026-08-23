@@ -133,6 +133,18 @@ fn validate_api_auth(listen_addr: &str, auth_token: Option<&str>) -> anyhow::Res
     Ok(())
 }
 
+fn circuit_breaker_auto_approve(cb_cfg: &config::CircuitBreakerConfig) -> bool {
+    cb_cfg.mode == "enforce" && !cb_cfg.require_human_approval
+}
+
+fn circuit_breaker_incident_action(auto_approve: bool) -> &'static str {
+    if auto_approve {
+        "approved_kill"
+    } else {
+        "pending_approval"
+    }
+}
+
 fn attach_kprobe_internal(bpf: &mut Ebpf, program: &str, symbol: &str) -> anyhow::Result<()> {
     let probe: &mut KProbe = bpf
         .program_mut(program)
@@ -325,10 +337,10 @@ fn init_ebpf(
 
     attach_tracepoint_internal(&mut bpf, "handle_exit", "sched", "sched_process_exit")?;
 
-    attach_kprobe_internal(&mut bpf, "trace_tcp_send", "tcp_sendmsg")?;
-    attach_kprobe_internal(&mut bpf, "trace_tcp_recv", "tcp_recvmsg")?;
-    attach_kprobe_internal(&mut bpf, "trace_vfs_read", "vfs_read")?;
-    attach_kprobe_internal(&mut bpf, "trace_vfs_write", "vfs_write")?;
+    attach_kprobe_optional(&mut bpf, "trace_tcp_send", "tcp_sendmsg");
+    attach_kprobe_optional(&mut bpf, "trace_tcp_recv", "tcp_recvmsg");
+    attach_kprobe_optional(&mut bpf, "trace_vfs_read", "vfs_read");
+    attach_kprobe_optional(&mut bpf, "trace_vfs_write", "vfs_write");
 
     attach_kprobe_optional(&mut bpf, "trace_udp_send", "udp_sendmsg");
     attach_kprobe_optional(&mut bpf, "trace_udp_recv", "udp_recvmsg");
@@ -1018,19 +1030,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
-    // 🔁 Periodically update process stats (conditional on activity)
+    // 🔁 Periodically update process stats for breaker/offender selection.
     let ctx_clone = Arc::clone(&context);
-    let metrics_clone = Arc::clone(&metrics);
     tokio::spawn(async move {
         loop {
-            // Same [telemetry] knobs as the snapshot loop above; these two were
-            // hardcoded to the same pair of values.
-            let eps = metrics_clone.events_per_sec();
-            let is_active = eps >= min_eps_to_enable;
-
-            if is_active {
-                ctx_clone.update_process_stats();
-            }
+            ctx_clone.update_process_stats();
 
             sleep(sample_interval).await;
         }
@@ -1095,6 +1099,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             metrics_clone.inc_circuit_breaker_cpu_trip();
                             breach_started_at = None;
 
+                            ctx_clone.update_process_stats();
                             let mut top_cpu_procs = ctx_clone.top_cpu_processes(1);
                             if top_cpu_procs.is_empty() {
                                 top_cpu_procs = ctx_clone.top_cpu_processes_systemwide(1);
@@ -1105,6 +1110,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     "CPU thrashing sustained {}s: CPU={:.1}% PSI={:.1}%",
                                     duration, snapshot.cpu_percent, snapshot.psi_cpu_some_avg10
                                 );
+                                let auto_approve = circuit_breaker_auto_approve(&cb_cfg);
+                                let incident_action = circuit_breaker_incident_action(auto_approve);
 
                                 match queue_clone
                                     .propose_auto(
@@ -1115,19 +1122,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         reason.clone(),
                                         "circuit_breaker".to_string(),
                                         None,
-                                        if cb_cfg.mode == "monitor" {
-                                            false // Force manual approval in monitor mode
-                                        } else {
-                                            !cb_cfg.require_human_approval
-                                        },
+                                        auto_approve,
                                     )
                                     .await
                                 {
                                     Ok(action_id) => {
-                                        warn!(
-                                            "[circuit_breaker] AUTO-KILLED {}({}): {}",
-                                            proc.comm, proc.pid, reason
-                                        );
+                                        if auto_approve {
+                                            warn!(
+                                                "[circuit_breaker] KILL APPROVED {}({}) action_id={}: {}",
+                                                proc.comm, proc.pid, action_id, reason
+                                            );
+                                        } else {
+                                            warn!(
+                                                "[circuit_breaker] KILL PROPOSED {}({}) action_id={} pending approval: {}",
+                                                proc.comm, proc.pid, action_id, reason
+                                            );
+                                        }
 
                                         if let Some(store) = incident_store_clone.as_ref() {
                                             let incident = cognitod::Incident {
@@ -1143,7 +1153,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                     snapshot.load_avg[1],
                                                     snapshot.load_avg[2]
                                                 ),
-                                                action: "auto_kill".to_string(),
+                                                action: incident_action.to_string(),
                                                 target_pid: Some(proc.pid as i32),
                                                 target_name: Some(proc.comm.clone()),
                                                 system_snapshot: serde_json::to_string(&snapshot)
@@ -1412,7 +1422,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
-    // ── Unix domain socket listener (bypasses token auth) ──
+    // ── Unix domain socket listener (peer-credential auth) ──
     let uds_path = std::env::var("LINNIX_UDS_PATH")
         .ok()
         .or_else(|| config.api.unix_socket.clone());
@@ -1440,7 +1450,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                 let uds_api = api::uds_routes(app_state.clone());
                 info!(
-                    "[cognitod] UDS server on {} (no auth — local connections only)",
+                    "[cognitod] UDS server on {} (SO_PEERCRED peer auth)",
                     socket_path
                 );
                 tokio::spawn(async move {
@@ -1494,6 +1504,39 @@ mod tests {
         assert!(validate_api_auth("[::]:3000", None).is_err());
         assert!(validate_api_auth("127.0.0.1:3000", None).is_ok());
         assert!(validate_api_auth("0.0.0.0:3000", Some("token-from-secret")).is_ok());
+    }
+
+    #[test]
+    fn circuit_breaker_monitor_mode_never_auto_approves() {
+        let mut cfg = config::CircuitBreakerConfig {
+            mode: "monitor".to_string(),
+            require_human_approval: false,
+            ..Default::default()
+        };
+
+        assert!(!circuit_breaker_auto_approve(&cfg));
+        assert_eq!(
+            circuit_breaker_incident_action(circuit_breaker_auto_approve(&cfg)),
+            "pending_approval"
+        );
+
+        cfg.require_human_approval = true;
+        assert!(!circuit_breaker_auto_approve(&cfg));
+    }
+
+    #[test]
+    fn circuit_breaker_enforce_mode_without_human_approval_records_approval_not_execution() {
+        let cfg = config::CircuitBreakerConfig {
+            mode: "enforce".to_string(),
+            require_human_approval: false,
+            ..Default::default()
+        };
+
+        assert!(circuit_breaker_auto_approve(&cfg));
+        assert_eq!(
+            circuit_breaker_incident_action(circuit_breaker_auto_approve(&cfg)),
+            "approved_kill"
+        );
     }
 
     #[test]
