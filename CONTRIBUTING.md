@@ -27,6 +27,7 @@ cargo nextest run --workspace
 
 Recommended toolchain versions:
 - Rust stable (check `rust-toolchain.toml` if present)
+- `cargo-deny` 0.20.2 or newer (required for current CVSS 4.0 advisories)
 - `clang`/`llvm` ≥ 14 for eBPF builds
 - Linux kernel 5.12+ (x86_64) / 5.18+ (arm64) with BTF data for local testing
 

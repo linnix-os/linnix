@@ -2,7 +2,7 @@
 # Linnix Full Test Suite
 # Runs all tests and validates documentation against code
 
-set -e
+set -euo pipefail
 
 # Colors
 RED='\033[0;31m'
@@ -98,7 +98,7 @@ run_step "4.1" "Doc Validator" \
 # Check for broken links in markdown (if markdown-link-check is installed)
 if command -v markdown-link-check &> /dev/null; then
     run_step "4.2" "Markdown Link Check" \
-        "find . -name '*.md' -not -path './target/*' | head -10 | xargs -I{} markdown-link-check {} 2>&1 | tail -20"
+        "find . -name '*.md' -not -path './target/*' -print0 | xargs -0 -r -n 1 markdown-link-check 2>&1 | tail -20"
 else
     echo -e "${YELLOW}[4.2] Markdown Link Check - Skipped (markdown-link-check not installed)${NC}"
     echo ""
