@@ -1997,6 +1997,19 @@ fn default_limit() -> i64 {
     10
 }
 
+const MAX_INCIDENT_LIMIT: i64 = 1_000;
+
+fn normalize_incident_limit(limit: i64) -> Result<i64, (StatusCode, String)> {
+    if limit < 1 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "limit must be a positive integer".to_string(),
+        ));
+    }
+
+    Ok(limit.min(MAX_INCIDENT_LIMIT))
+}
+
 /// GET /incidents - List recent incidents
 async fn get_incidents(
     Query(params): Query<IncidentQueryParams>,
@@ -2009,22 +2022,18 @@ async fn get_incidents(
         )
     })?;
 
+    let limit = normalize_incident_limit(params.limit)?;
+    let event_type = params
+        .event_type
+        .as_deref()
+        .filter(|value| !value.is_empty());
+
     let incidents = store
-        .recent(params.limit)
+        .recent_filtered(limit, event_type, params.analyzed)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Filter by analyzed status if requested
-    let filtered = if let Some(analyzed) = params.analyzed {
-        incidents
-            .into_iter()
-            .filter(|i| analyzed == i.llm_analysis.is_some())
-            .collect()
-    } else {
-        incidents
-    };
-
-    Ok(Json(filtered))
+    Ok(Json(incidents))
 }
 
 /// GET /incidents/:id - Get incident by ID
@@ -2606,6 +2615,70 @@ mod tests {
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         })
+    }
+
+    fn app_state_with_incident_store(store: Arc<cognitod::IncidentStore>) -> Arc<AppState> {
+        Arc::new(AppState {
+            context: Arc::new(ContextStore::new(Duration::from_secs(60), 10, None)),
+            metrics: Arc::new(Metrics::new()),
+            alerts: None,
+            insights: Arc::new(InsightStore::new(16, None)),
+            offline: Arc::new(OfflineGuard::new(false)),
+            transport: "perf",
+            probe_state: ProbeState::disabled(),
+            require_kernel_instrumentation: true,
+            enforcement: None,
+            reasoner: ReasonerConfig::default(),
+            prometheus_enabled: false,
+            alert_history: Arc::new(AlertHistory::new(16)),
+            auth_token: None,
+            slack_signing_secret: None,
+            incident_store: Some(store),
+            k8s: None,
+            blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+        })
+    }
+
+    fn api_test_incident(event_type: &str, timestamp: i64) -> cognitod::Incident {
+        cognitod::Incident {
+            id: None,
+            timestamp,
+            event_type: event_type.to_string(),
+            psi_cpu: 75.21,
+            psi_memory: 12.34,
+            cpu_percent: 96.3,
+            load_avg: "26.00,24.20,21.30".to_string(),
+            action: "auto_kill".to_string(),
+            target_pid: Some(472_693),
+            target_name: Some("aggressive-stress.sh".to_string()),
+            system_snapshot: None,
+            llm_analysis: None,
+            llm_analyzed_at: None,
+            investigation: None,
+            recovery_time_ms: None,
+            psi_after: None,
+        }
+    }
+
+    async fn get_incidents_json(
+        state: Arc<AppState>,
+        uri: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = super::all_routes(state)
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = if body.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null)
+        };
+
+        (status, json)
     }
 
     fn current_epoch_secs() -> u64 {
@@ -4037,6 +4110,141 @@ mod tests {
             reopened["attributions"].as_array().unwrap().len(),
             1,
             "an event link must stay event-specific when reopened: {link}"
+        );
+    }
+
+    #[tokio::test]
+    async fn incidents_route_filters_by_event_type_before_returning_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            cognitod::IncidentStore::new(dir.path().join("incidents.db"))
+                .await
+                .unwrap(),
+        );
+
+        for (event_type, timestamp) in [
+            ("circuit_breaker_cpu", 1_732_242_135),
+            ("manual_kill", 1_732_242_136),
+            ("circuit_breaker_memory", 1_732_242_137),
+        ] {
+            store
+                .insert(&api_test_incident(event_type, timestamp))
+                .await
+                .unwrap();
+        }
+
+        let app_state = app_state_with_incident_store(Arc::clone(&store));
+        let (status, json) =
+            get_incidents_json(app_state, "/incidents?event_type=manual_kill&limit=10").await;
+
+        assert_eq!(status, StatusCode::OK);
+        let incidents = json.as_array().expect("incidents response is an array");
+        assert_eq!(incidents.len(), 1, "event_type filter must be applied");
+        assert_eq!(incidents[0]["event_type"], "manual_kill");
+    }
+
+    #[tokio::test]
+    async fn incidents_route_applies_analyzed_filter_before_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            cognitod::IncidentStore::new(dir.path().join("incidents.db"))
+                .await
+                .unwrap(),
+        );
+
+        let analyzed_id = store
+            .insert(&api_test_incident("circuit_breaker_cpu", 1_732_242_100))
+            .await
+            .unwrap();
+        store
+            .add_llm_analysis(
+                analyzed_id,
+                &cognitod::incidents::AnalysisOutcome {
+                    raw_response: "older analyzed incident".to_string(),
+                    investigation: None,
+                    parse_error: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        for offset in 1..=20 {
+            store
+                .insert(&api_test_incident(
+                    "circuit_breaker_cpu",
+                    1_732_242_100 + offset,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let app_state = app_state_with_incident_store(store);
+        let (status, json) =
+            get_incidents_json(app_state, "/incidents?analyzed=true&limit=10").await;
+
+        assert_eq!(status, StatusCode::OK);
+        let incidents = json.as_array().expect("incidents response is an array");
+        assert_eq!(
+            incidents.len(),
+            1,
+            "analyzed filtering must happen before applying the result limit"
+        );
+        assert_eq!(incidents[0]["llm_analysis"], "older analyzed incident");
+    }
+
+    #[tokio::test]
+    async fn incidents_route_rejects_nonpositive_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            cognitod::IncidentStore::new(dir.path().join("incidents.db"))
+                .await
+                .unwrap(),
+        );
+        let app_state = app_state_with_incident_store(store);
+
+        for uri in ["/incidents?limit=-1", "/incidents?limit=0"] {
+            let response = super::all_routes(Arc::clone(&app_state))
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{uri} must not reach SQLite as an unbounded limit"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn incidents_route_clamps_huge_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            cognitod::IncidentStore::new(dir.path().join("incidents.db"))
+                .await
+                .unwrap(),
+        );
+
+        for idx in 0..(MAX_INCIDENT_LIMIT + 1) {
+            store
+                .insert(&api_test_incident(
+                    "circuit_breaker_cpu",
+                    1_732_242_135 + idx,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let app_state = app_state_with_incident_store(store);
+        let (status, json) = get_incidents_json(app_state, "/incidents?limit=999999").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json.as_array()
+                .expect("incidents response is an array")
+                .len(),
+            MAX_INCIDENT_LIMIT as usize,
+            "oversized limits must be bounded before SQLite sees them"
         );
     }
 
