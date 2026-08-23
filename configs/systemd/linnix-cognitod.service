@@ -10,11 +10,11 @@ Documentation=https://github.com/linnix-os/linnix
 [Service]
 Type=simple
 EnvironmentFile=-/etc/linnix/linnix.env
-ExecStart=/usr/local/bin/cognitod --config /etc/linnix/linnix.toml --handler rules:/etc/linnix/rules.toml
+ExecStart=/usr/bin/cognitod --config /etc/linnix/linnix.toml --handler rules:/etc/linnix/rules.yaml
 
 # Environment variables
 Environment=LINNIX_BPF_PATH=/usr/local/share/linnix/linnix-ai-ebpf-ebpf
-Environment=LINNIX_RSS_TRACE_BPF_PATH=/usr/local/share/linnix/rss_trace.o
+Environment=LINNIX_RSS_TRACE_BPF_PATH=/usr/local/share/linnix/rss_trace
 Environment=LINNIX_KERNEL_BTF=/sys/kernel/btf/vmlinux
 Environment=LLM_ENDPOINT=http://127.0.0.1:8090/v1/chat/completions
 Environment=LLM_MODEL=linnix-qwen-v1
