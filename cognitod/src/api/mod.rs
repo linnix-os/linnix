@@ -1010,7 +1010,7 @@ pub async fn get_insights(
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     if !app_state.reasoner.enabled || app_state.reasoner.endpoint.trim().is_empty() {
-        log::warn!("[insights] reasoner disabled or missing endpoint");
+        log::debug!("[insights] reasoner disabled or missing endpoint");
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     let ctx = &app_state.context;
