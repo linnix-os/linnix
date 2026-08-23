@@ -1507,6 +1507,8 @@ pub struct MetricsResponse {
     subscribers: usize,
     queue_depth: usize,
     dropped_events_total: u64,
+    listener_queue_depth: usize,
+    listener_queue_drops: u64,
     alerts_active: usize,
     uptime_seconds: u64,
     events_per_sec: u64,
@@ -1532,6 +1534,8 @@ pub async fn prometheus_metrics(State(app_state): State<Arc<AppState>>) -> Respo
 
     let events_total = metrics.events_total.load(Ordering::Relaxed);
     let dropped_total = metrics.dropped_events_total.load(Ordering::Relaxed);
+    let listener_queue_depth = metrics.listener_queue_depth();
+    let listener_queue_drops = metrics.listener_queue_drops();
     let alerts_emitted = metrics.alerts_emitted();
     let rb_overflows = metrics.rb_overflows();
     let rate_limited = metrics.rate_limited_events();
@@ -1613,6 +1617,24 @@ pub async fn prometheus_metrics(State(app_state): State<Arc<AppState>>) -> Respo
     );
     let _ = writeln!(body, "# TYPE linnix_rate_limited_total counter");
     let _ = writeln!(body, "linnix_rate_limited_total {}", rate_limited);
+
+    let _ = writeln!(
+        body,
+        "# HELP linnix_listener_queue_depth Current BPF listener event queue depth."
+    );
+    let _ = writeln!(body, "# TYPE linnix_listener_queue_depth gauge");
+    let _ = writeln!(body, "linnix_listener_queue_depth {}", listener_queue_depth);
+
+    let _ = writeln!(
+        body,
+        "# HELP linnix_listener_queue_dropped_total Events dropped because the BPF listener queue was full."
+    );
+    let _ = writeln!(body, "# TYPE linnix_listener_queue_dropped_total counter");
+    let _ = writeln!(
+        body,
+        "linnix_listener_queue_dropped_total {}",
+        listener_queue_drops
+    );
 
     let _ = writeln!(
         body,
@@ -1722,6 +1744,8 @@ pub async fn metrics_handler(State(app_state): State<Arc<AppState>>) -> Json<Met
         subscribers: metrics.subscribers.load(Ordering::Relaxed),
         queue_depth: app_state.context.queue_depth(),
         dropped_events_total: metrics.dropped_events_total.load(Ordering::Relaxed),
+        listener_queue_depth: metrics.listener_queue_depth(),
+        listener_queue_drops: metrics.listener_queue_drops(),
         alerts_active: metrics.alerts_active.load(Ordering::Relaxed),
         uptime_seconds: metrics.uptime_seconds(),
         events_per_sec: metrics.events_per_sec(),
