@@ -1017,6 +1017,10 @@ pub async fn get_insights(
     if !app_state.offline.check("insights") {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
+    if !app_state.reasoner.enabled || app_state.reasoner.endpoint.trim().is_empty() {
+        log::debug!("[insights] reasoner disabled or missing endpoint");
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     let ctx = &app_state.context;
 
     // Update system snapshot on-demand for insights (critical for LLM analysis)
@@ -2538,7 +2542,7 @@ mod tests {
     use cognitod::schema::{Insight, InsightReason, PodContribution};
     use futures_util::StreamExt;
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tower::ServiceExt;
 
     #[derive(Debug)]
@@ -2686,6 +2690,79 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs()
+    }
+
+    #[tokio::test]
+    async fn insights_returns_503_without_llm_call_when_reasoner_disabled() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let saw_request = Arc::new(AtomicBool::new(false));
+        let saw_request_from_server = Arc::clone(&saw_request);
+        let server = tokio::spawn(async move {
+            if let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_millis(200), listener.accept()).await
+            {
+                saw_request_from_server.store(true, Ordering::SeqCst);
+                let body = r#"{"choices":[{"message":{"content":"unexpected"}}]}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let mut app_state = minimal_app_state(None, None, None);
+        Arc::get_mut(&mut app_state).unwrap().reasoner = ReasonerConfig {
+            enabled: false,
+            endpoint,
+            ..ReasonerConfig::default()
+        };
+
+        let response = super::all_routes(app_state)
+            .oneshot(
+                Request::builder()
+                    .uri("/insights")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        server.await.unwrap();
+        assert!(
+            !saw_request.load(Ordering::SeqCst),
+            "disabled reasoner should not receive outbound /insights request"
+        );
+    }
+
+    #[tokio::test]
+    async fn insights_returns_503_when_reasoner_endpoint_is_empty() {
+        let mut app_state = minimal_app_state(None, None, None);
+        Arc::get_mut(&mut app_state).unwrap().reasoner = ReasonerConfig {
+            enabled: true,
+            endpoint: "  ".to_string(),
+            ..ReasonerConfig::default()
+        };
+
+        let response = super::all_routes(app_state)
+            .oneshot(
+                Request::builder()
+                    .uri("/insights")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     fn process_event_with_ts(ts_ns: u64) -> ProcessEvent {
