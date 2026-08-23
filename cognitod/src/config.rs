@@ -435,6 +435,8 @@ pub struct RuntimeConfig {
     pub rss_cap_mb: u64,
     #[serde(default = "default_events_rate_cap")]
     pub events_rate_cap: u64,
+    #[serde(default = "default_event_queue_capacity")]
+    pub event_queue_capacity: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -444,6 +446,7 @@ impl Default for RuntimeConfig {
             cpu_target_pct: default_cpu_target_pct(),
             rss_cap_mb: default_rss_cap_mb(),
             events_rate_cap: default_events_rate_cap(),
+            event_queue_capacity: default_event_queue_capacity(),
         }
     }
 }
@@ -459,6 +462,9 @@ fn default_rss_cap_mb() -> u64 {
 }
 fn default_events_rate_cap() -> u64 {
     100_000
+}
+fn default_event_queue_capacity() -> usize {
+    4096
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -780,6 +786,7 @@ offline = true
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(cfg.runtime.offline);
+        assert_eq!(cfg.runtime.event_queue_capacity, 4096);
         assert_eq!(cfg.api.listen_addr, "127.0.0.1:3000");
         assert!(cfg.api.auth_token.is_none());
     }
