@@ -1317,34 +1317,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tokio::spawn(async move {
             loop {
                 for action in queue_clone.get_all().await {
-                    if action.status == cognitod::enforcement::ActionStatus::Approved {
-                        match action.action {
-                            cognitod::enforcement::ActionType::KillProcess { pid, signal } => {
-                                info!("[enforcement] EXECUTING KILL pid={} signal={}", pid, signal);
-                                let sent = unsafe { libc::kill(pid as i32, signal) };
-                                if sent == 0 {
-                                    let _ = queue_clone.complete(&action.id).await;
-                                } else {
-                                    // The process was already gone, or the
-                                    // signal was refused. Marking this executed
-                                    // would let a later fall in pressure be
-                                    // credited to a kill that never landed.
-                                    let err = std::io::Error::last_os_error();
-                                    warn!(
-                                        "[enforcement] kill pid={} signal={} failed: {}",
-                                        pid, signal, err
-                                    );
-                                    // `reject` is the operator's path and only
-                                    // applies to pending proposals; this action
-                                    // is Approved, so rejecting it fails and
-                                    // leaves it to be retried every second
-                                    // against a pid that may be reused.
-                                    let _ = queue_clone
-                                        .fail(&action.id, format!("kill failed: {err}"))
-                                        .await;
-                                }
-                            }
-                        }
+                    if action.status == cognitod::enforcement::ActionStatus::Approved
+                        && let Err(err) = queue_clone.execute_approved(&action.id).await
+                    {
+                        warn!("[enforcement] action {} failed: {}", action.id, err);
                     }
                 }
                 sleep(Duration::from_secs(1)).await;

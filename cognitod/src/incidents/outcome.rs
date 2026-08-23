@@ -416,7 +416,7 @@ mod tests {
     async fn an_action_that_never_executes_is_never_credited() {
         use crate::enforcement::{ActionType, EnforcementQueue};
 
-        let queue = Arc::new(EnforcementQueue::new(5));
+        let queue = Arc::new(EnforcementQueue::new_for_test(5));
         // The default posture: proposed, awaiting a human.
         let id = queue
             .propose_auto(
@@ -446,7 +446,7 @@ mod tests {
     async fn a_rejected_action_stops_the_wait_immediately() {
         use crate::enforcement::{ActionType, EnforcementQueue};
 
-        let queue = Arc::new(EnforcementQueue::new(3_600));
+        let queue = Arc::new(EnforcementQueue::new_for_test(3_600));
         let id = queue
             .propose_auto(
                 ActionType::KillProcess {
@@ -474,7 +474,7 @@ mod tests {
     async fn a_pending_action_is_never_measured_however_calm_the_machine_gets() {
         use crate::enforcement::{ActionType, EnforcementQueue};
 
-        let queue = Arc::new(EnforcementQueue::new(5));
+        let queue = Arc::new(EnforcementQueue::new_for_test(5));
         let id = queue
             .propose_auto(
                 ActionType::KillProcess {
@@ -518,7 +518,7 @@ mod tests {
         // only scans once a second. Exiting on the proposal's expiry would
         // abandon an action that is about to really run, leaving a real kill
         // permanently unverifiable.
-        let queue = Arc::new(EnforcementQueue::new(2));
+        let queue = Arc::new(EnforcementQueue::new_for_test(2));
         let id = queue
             .propose_auto(
                 ActionType::KillProcess {
@@ -555,7 +555,7 @@ mod tests {
     async fn a_kill_that_failed_is_never_treated_as_executed() {
         use crate::enforcement::{ActionType, EnforcementQueue};
 
-        let queue = Arc::new(EnforcementQueue::new(60));
+        let queue = Arc::new(EnforcementQueue::new_for_test(60));
         let id = queue
             .propose_auto(
                 ActionType::KillProcess {
@@ -588,7 +588,7 @@ mod tests {
     async fn an_approved_action_the_executor_never_runs_does_not_wait_forever() {
         use crate::enforcement::{ActionType, EnforcementQueue};
 
-        let queue = Arc::new(EnforcementQueue::new(3_600));
+        let queue = Arc::new(EnforcementQueue::new_for_test(3_600));
         let id = queue
             .propose_auto(
                 ActionType::KillProcess {
@@ -620,7 +620,7 @@ mod tests {
         // within the action's life, and that incident must still get an
         // outcome — borrowing the watch duration as the execution deadline
         // would abandon it at two minutes, permanently.
-        let queue = Arc::new(EnforcementQueue::new(300));
+        let queue = Arc::new(EnforcementQueue::new_for_test(300));
         let id = queue
             .propose_auto(
                 ActionType::KillProcess {
@@ -668,7 +668,7 @@ mod tests {
     async fn an_overlapping_execution_invalidates_the_measurement() {
         use crate::enforcement::{ActionType, EnforcementQueue};
 
-        let queue = Arc::new(EnforcementQueue::new(60));
+        let queue = Arc::new(EnforcementQueue::new_for_test(60));
         let propose = |queue: Arc<EnforcementQueue>| async move {
             queue
                 .propose_auto(
@@ -738,7 +738,7 @@ mod tests {
     async fn recovery_is_timed_from_the_kill_and_counted_once() {
         use crate::enforcement::{ActionType, EnforcementQueue};
 
-        let queue = Arc::new(EnforcementQueue::new(60));
+        let queue = Arc::new(EnforcementQueue::new_for_test(60));
         let id = queue
             .propose_auto(
                 ActionType::KillProcess {
@@ -796,7 +796,7 @@ mod tests {
     async fn an_executed_action_is_measured() {
         use crate::enforcement::{ActionType, EnforcementQueue};
 
-        let queue = Arc::new(EnforcementQueue::new(3_600));
+        let queue = Arc::new(EnforcementQueue::new_for_test(3_600));
         let id = queue
             .propose_auto(
                 ActionType::KillProcess {
@@ -833,7 +833,7 @@ mod tests {
     async fn an_executed_action_with_unreadable_pressure_records_nothing() {
         use crate::enforcement::{ActionType, EnforcementQueue};
 
-        let queue = Arc::new(EnforcementQueue::new(3_600));
+        let queue = Arc::new(EnforcementQueue::new_for_test(3_600));
         let id = queue
             .propose_auto(
                 ActionType::KillProcess {
@@ -870,7 +870,7 @@ mod tests {
     async fn an_executed_action_starts_the_watch() {
         use crate::enforcement::{ActionType, EnforcementQueue};
 
-        let queue = Arc::new(EnforcementQueue::new(3_600));
+        let queue = Arc::new(EnforcementQueue::new_for_test(3_600));
         let id = queue
             .propose_auto(
                 ActionType::KillProcess {
