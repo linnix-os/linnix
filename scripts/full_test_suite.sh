@@ -2,7 +2,7 @@
 # Linnix Full Test Suite
 # Runs all tests and validates documentation against code
 
-set -e
+set -euo pipefail
 
 # Colors
 RED='\033[0;31m'

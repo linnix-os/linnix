@@ -118,3 +118,7 @@ jobs:
           python-version: '3.11'
       - name: Validate documentation against code
         run: python3 scripts/validate_docs.py --workspace .
+      - name: Validate package assets
+        run: python3 scripts/validate_package_assets.py
+      - name: Run Python regression tests
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
