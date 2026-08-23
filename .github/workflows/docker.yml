@@ -35,10 +35,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p _workflow/ssh .ssh
-          printf '%s\n' 'docker-context-secret-sentinel' > _workflow/ssh/docker-context-secret-check.pem
+          printf '%s\n' 'docker-context-secret-sentinel' > _workflow/ssh/docker-context-secret-check
           printf '%s\n' 'docker-context-secret-sentinel' > docker-context-secret-check.key
-          printf '%s\n' 'docker-context-secret-sentinel' > .ssh/docker-context-secret-check.key
-          trap 'rm -f _workflow/ssh/docker-context-secret-check.pem docker-context-secret-check.key .ssh/docker-context-secret-check.key' EXIT
+          printf '%s\n' 'docker-context-secret-sentinel' > .ssh/docker-context-secret-check
+          trap 'rm -f _workflow/ssh/docker-context-secret-check docker-context-secret-check.key .ssh/docker-context-secret-check' EXIT
 
           mapfile -t secret_candidates < <(
             find . \
