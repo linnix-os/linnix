@@ -1997,21 +1997,11 @@ async fn get_incidents(
         .filter(|value| !value.is_empty());
 
     let incidents = store
-        .recent_filtered(limit, event_type)
+        .recent_filtered(limit, event_type, params.analyzed)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Filter by analyzed status if requested
-    let filtered = if let Some(analyzed) = params.analyzed {
-        incidents
-            .into_iter()
-            .filter(|i| analyzed == i.llm_analysis.is_some())
-            .collect()
-    } else {
-        incidents
-    };
-
-    Ok(Json(filtered))
+    Ok(Json(incidents))
 }
 
 /// GET /incidents/:id - Get incident by ID
@@ -4065,6 +4055,55 @@ mod tests {
         let incidents = json.as_array().expect("incidents response is an array");
         assert_eq!(incidents.len(), 1, "event_type filter must be applied");
         assert_eq!(incidents[0]["event_type"], "manual_kill");
+    }
+
+    #[tokio::test]
+    async fn incidents_route_applies_analyzed_filter_before_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            cognitod::IncidentStore::new(dir.path().join("incidents.db"))
+                .await
+                .unwrap(),
+        );
+
+        let analyzed_id = store
+            .insert(&api_test_incident("circuit_breaker_cpu", 1_732_242_100))
+            .await
+            .unwrap();
+        store
+            .add_llm_analysis(
+                analyzed_id,
+                &cognitod::incidents::AnalysisOutcome {
+                    raw_response: "older analyzed incident".to_string(),
+                    investigation: None,
+                    parse_error: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        for offset in 1..=20 {
+            store
+                .insert(&api_test_incident(
+                    "circuit_breaker_cpu",
+                    1_732_242_100 + offset,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let app_state = app_state_with_incident_store(store);
+        let (status, json) =
+            get_incidents_json(app_state, "/incidents?analyzed=true&limit=10").await;
+
+        assert_eq!(status, StatusCode::OK);
+        let incidents = json.as_array().expect("incidents response is an array");
+        assert_eq!(
+            incidents.len(),
+            1,
+            "analyzed filtering must happen before applying the result limit"
+        );
+        assert_eq!(incidents[0]["llm_analysis"], "older analyzed incident");
     }
 
     #[tokio::test]

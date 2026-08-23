@@ -159,14 +159,20 @@ async fn the_stats_count_circuit_breaker_event_families() {
     memory_breaker.event_type = "circuit_breaker_memory".to_string();
     let mut manual = incident();
     manual.event_type = "manual_kill".to_string();
+    let mut wildcard_spoof = incident();
+    wildcard_spoof.event_type = "circuitXbreakerYcpu".to_string();
+    let mut case_spoof = incident();
+    case_spoof.event_type = "CIRCUIT_BREAKER_CPU".to_string();
 
     store.insert(&incident()).await.unwrap();
     store.insert(&memory_breaker).await.unwrap();
     store.insert(&manual).await.unwrap();
+    store.insert(&wildcard_spoof).await.unwrap();
+    store.insert(&case_spoof).await.unwrap();
 
     let stats = store.stats().await.unwrap();
 
-    assert_eq!(stats.total, 3);
+    assert_eq!(stats.total, 5);
     assert_eq!(stats.circuit_breaker_triggers, 2);
 }
 
@@ -186,7 +192,7 @@ async fn recent_incidents_can_be_filtered_by_event_type() {
     store.insert(&warning).await.unwrap();
 
     let filtered = store
-        .recent_filtered(10, Some("manual_kill"))
+        .recent_filtered(10, Some("manual_kill"), None)
         .await
         .unwrap();
 
