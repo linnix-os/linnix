@@ -401,14 +401,15 @@ mod tests {
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         loop {
+            let notified = notify.notified();
             if seen.lock().unwrap().len() == 6 {
                 break;
             }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "worker did not process the synthetic burst"
-            );
-            notify.notified().await;
+            let now = tokio::time::Instant::now();
+            assert!(now < deadline, "worker did not process the synthetic burst");
+            tokio::time::timeout(deadline - now, notified)
+                .await
+                .expect("worker did not process the synthetic burst");
         }
 
         assert_eq!(*seen.lock().unwrap(), vec![0, 1, 2, 3, 4, 5]);
