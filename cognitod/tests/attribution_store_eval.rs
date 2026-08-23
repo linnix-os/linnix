@@ -8,7 +8,7 @@
 
 use cognitod::collectors::psi::BlameAttribution;
 use cognitod::incidents::IncidentStore;
-use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::{Row, sqlite::SqlitePoolOptions};
 
 fn attribution(offender: &str, blame: f64, attributed_us: u64) -> BlameAttribution {
     BlameAttribution {
@@ -32,6 +32,28 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+async fn table_columns(pool: &sqlx::SqlitePool, table: &str) -> Vec<String> {
+    let escaped_table = table.replace('"', "\"\"");
+    sqlx::query(&format!("PRAGMA table_info(\"{escaped_table}\")"))
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get("name"))
+        .collect()
+}
+
+async fn index_names(pool: &sqlx::SqlitePool, table: &str) -> Vec<String> {
+    let escaped_table = table.replace('"', "\"\"");
+    sqlx::query(&format!("PRAGMA index_list(\"{escaped_table}\")"))
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get("name"))
+        .collect()
 }
 
 #[tokio::test]
@@ -149,6 +171,134 @@ async fn upgrading_an_old_database_backfills_the_offender_share() {
         .insert_stall_attribution(&attribution("late-arrival", 1.0, 100_000))
         .await
         .expect("insert should succeed after migration");
+}
+
+#[tokio::test]
+async fn upgrading_an_old_database_creates_required_columns_and_indexes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("incidents.db");
+    let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+    {
+        let pool = SqlitePoolOptions::new().connect(&db_url).await.unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE incidents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                psi_cpu REAL NOT NULL,
+                psi_memory REAL NOT NULL,
+                cpu_percent REAL NOT NULL,
+                load_avg TEXT NOT NULL,
+                action TEXT NOT NULL,
+                target_pid INTEGER,
+                target_name TEXT,
+                system_snapshot TEXT,
+                llm_analysis TEXT,
+                llm_analyzed_at INTEGER,
+                recovery_time_ms INTEGER,
+                psi_after REAL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE stall_attributions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                victim_pod TEXT NOT NULL,
+                victim_namespace TEXT NOT NULL,
+                offender_pod TEXT NOT NULL,
+                offender_namespace TEXT NOT NULL,
+                stall_us INTEGER NOT NULL,
+                blame_score REAL NOT NULL,
+                timestamp INTEGER NOT NULL,
+                CPU_SHARE REAL DEFAULT 0.0
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+    }
+
+    let store = IncidentStore::new(&db_path)
+        .await
+        .expect("an old but valid schema should upgrade");
+    drop(store);
+
+    let pool = SqlitePoolOptions::new().connect(&db_url).await.unwrap();
+    let incident_columns = table_columns(&pool, "incidents").await;
+    assert!(
+        incident_columns
+            .iter()
+            .any(|column| column == "investigation"),
+        "incident migration must add investigation column"
+    );
+
+    let attribution_columns = table_columns(&pool, "stall_attributions").await;
+    for expected in [
+        "cpu_share",
+        "fork_count",
+        "short_job_count",
+        "attributed_stall_us",
+        "event_id",
+    ] {
+        assert!(
+            attribution_columns
+                .iter()
+                .any(|column| column.eq_ignore_ascii_case(expected)),
+            "stall_attributions migration must add {expected}"
+        );
+    }
+
+    let indexes = index_names(&pool, "stall_attributions").await;
+    assert!(
+        indexes.iter().any(|index| index == "idx_attr_event"),
+        "event_id index must exist after migration"
+    );
+    pool.close().await;
+
+    IncidentStore::new(&db_path)
+        .await
+        .expect("migrations must be idempotent once columns already exist");
+}
+
+#[tokio::test]
+async fn malformed_historical_schema_fails_instead_of_masking_migration_drift() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("incidents.db");
+    let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+    {
+        let pool = SqlitePoolOptions::new().connect(&db_url).await.unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE stall_attributions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                victim_pod TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+    }
+
+    let err = match IncidentStore::new(&db_path).await {
+        Ok(_) => panic!("schema drift must fail loudly"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.to_string().contains("stall_us") || err.to_string().contains("no such column"),
+        "unexpected migration error: {err}"
+    );
 }
 
 #[tokio::test]
