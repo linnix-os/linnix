@@ -90,6 +90,9 @@ assets = [
     ["../configs/linnix.toml", "etc/linnix/", "644"],
     ["../configs/rules.yaml", "etc/linnix/", "644"],
     ["../configs/systemd/linnix-cognitod.service", "lib/systemd/system/cognitod.service", "644"],
+    ["../docker-compose.yml", "usr/share/linnix/", "644"],
+    ["../configs/linnix.toml", "usr/share/linnix/configs/", "644"],
+    ["../configs/rules.yaml", "usr/share/linnix/configs/", "644"],
     ["../setup-llm.sh", "usr/share/linnix/", "755"],
     ["../README.md", "usr/share/doc/cognitod/", "644"],
 ]
@@ -110,6 +113,9 @@ assets = [
     { source = "../configs/linnix.toml", dest = "/etc/linnix/linnix.toml", mode = "644", config = true },
     { source = "../configs/rules.yaml", dest = "/etc/linnix/rules.yaml", mode = "644", config = true },
     { source = "../configs/systemd/linnix-cognitod.service", dest = "/usr/lib/systemd/system/cognitod.service", mode = "644" },
+    { source = "../docker-compose.yml", dest = "/usr/share/linnix/docker-compose.yml", mode = "644" },
+    { source = "../configs/linnix.toml", dest = "/usr/share/linnix/configs/linnix.toml", mode = "644" },
+    { source = "../configs/rules.yaml", dest = "/usr/share/linnix/configs/rules.yaml", mode = "644" },
     { source = "../setup-llm.sh", dest = "/usr/share/linnix/setup-llm.sh", mode = "755" },
     { source = "../README.md", dest = "/usr/share/doc/cognitod/README.md", mode = "644" },
 ]

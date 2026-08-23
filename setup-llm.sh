@@ -19,6 +19,11 @@ BLUE='\033[0;34m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+# Compose command detected during prerequisite checks. Keep this as an array so
+# the v2 plugin form (`docker compose`) is executed without word-splitting.
+COMPOSE_CMD=()
+COMPOSE_DISPLAY=""
+
 # Helper functions
 print_header() {
     echo -e "${BLUE}"
@@ -62,7 +67,13 @@ check_prerequisites() {
     fi
     
     # Check for Docker Compose
-    if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null; then
+    if docker compose version &> /dev/null; then
+        COMPOSE_CMD=(docker compose)
+        COMPOSE_DISPLAY="docker compose"
+    elif command -v docker-compose &> /dev/null && docker-compose --version &> /dev/null; then
+        COMPOSE_CMD=(docker-compose)
+        COMPOSE_DISPLAY="docker-compose"
+    else
         print_error "Docker Compose is required but not installed."
         echo "Please install Docker Compose: https://docs.docker.com/compose/install/"
         exit 1
@@ -141,11 +152,11 @@ start_services() {
     
     # Pull latest images first
     print_info "Pulling latest Docker images..."
-    docker-compose pull
+    "${COMPOSE_CMD[@]}" --profile ai pull
     
     # Start services
     print_info "Starting Docker containers..."
-    docker-compose up -d
+    "${COMPOSE_CMD[@]}" --profile ai up -d
     
     print_step "Services started successfully"
 }
@@ -163,7 +174,7 @@ wait_for_services() {
         fi
         if [ $i -eq 30 ]; then
             print_error "Cognitod failed to start after 5 minutes"
-            echo "Check logs with: docker-compose logs cognitod"
+            echo "Check logs with: ${COMPOSE_DISPLAY} --profile ai logs cognitod"
             exit 1
         fi
         sleep 10
@@ -189,13 +200,13 @@ wait_for_services() {
     # Check dashboard
     print_info "Checking web dashboard..."
     for i in {1..10}; do
-        if curl -sf http://localhost:8080 &>/dev/null; then
+        if curl -sf http://localhost:3000/ &>/dev/null; then
             print_step "Web dashboard is ready"
             break
         fi
         if [ $i -eq 10 ]; then
             print_error "Web dashboard failed to start"
-            echo "Check logs with: docker-compose logs dashboard"
+            echo "Check logs with: ${COMPOSE_DISPLAY} --profile ai logs cognitod"
         fi
         sleep 5
     done
@@ -206,7 +217,7 @@ wait_for_services() {
 # Show service status
 show_status() {
     print_info "Service status:"
-    docker-compose ps
+    "${COMPOSE_CMD[@]}" --profile ai ps
     echo
     
     print_info "Container resource usage:"
@@ -220,7 +231,7 @@ show_success() {
     echo -e "${GREEN}Your eBPF monitoring with AI is now running!${NC}"
     echo
     echo -e "${BLUE}📊 Access Points:${NC}"
-    echo "  • Web Dashboard:    http://localhost:8080"
+    echo "  • Web Dashboard:    http://localhost:3000"
     echo "  • API Endpoints:    http://localhost:3000"
     echo "  • AI Model Server:  http://localhost:8090"
     echo
@@ -237,10 +248,10 @@ show_success() {
     echo "  • Performance metrics"
     echo
     echo -e "${BLUE}🛠️ Management Commands:${NC}"
-    echo "  • View logs:        docker-compose logs -f"
-    echo "  • Stop services:    docker-compose down"
-    echo "  • Restart:          docker-compose restart"
-    echo "  • Update:           git pull && docker-compose pull && docker-compose up -d"
+    echo "  • View logs:        ${COMPOSE_DISPLAY} --profile ai logs -f"
+    echo "  • Stop services:    ${COMPOSE_DISPLAY} --profile ai down"
+    echo "  • Restart:          ${COMPOSE_DISPLAY} --profile ai restart"
+    echo "  • Update:           git pull && ${COMPOSE_DISPLAY} --profile ai pull && ${COMPOSE_DISPLAY} --profile ai up -d"
     echo
     echo -e "${BLUE}📚 Documentation:${NC}"
     echo "  • GitHub:           https://github.com/linnix-os/linnix"
@@ -253,7 +264,7 @@ show_success() {
     echo "  • Dashboard updates in real-time"
     echo "  • All data stays local - no external API calls"
     echo
-    print_step "Setup completed successfully! Open http://localhost:8080 to get started."
+    print_step "Setup completed successfully! Open http://localhost:3000 to get started."
 }
 
 # Cleanup on exit
@@ -265,7 +276,7 @@ cleanup() {
         echo "Common issues:"
         echo "  • Docker not running: sudo systemctl start docker"
         echo "  • Permission issues: sudo usermod -aG docker \$USER (then logout/login)"
-        echo "  • Port conflicts: Check if ports 3000, 8080, 8090 are available"
+        echo "  • Port conflicts: Check if ports 3000 and 8090 are available"
         echo "  • Download issues: Check internet connection and try again"
         echo
         echo "For help:"
