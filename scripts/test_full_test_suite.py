@@ -35,6 +35,20 @@ fi
 exit 0
 """,
         )
+        self.markdown_log = self.repo / "markdown-checks.log"
+        self._write_executable(
+            self.fake_bin / "markdown-link-check",
+            """#!/bin/bash
+set -u
+
+printf '%s\n' "$1" >> "$FAKE_MARKDOWN_LOG"
+status="${FAKE_MARKDOWN_STATUS:-0}"
+if [ "$status" -ne 0 ]; then
+    echo "simulated markdown-link-check failure: $1" >&2
+fi
+exit "$status"
+""",
+        )
         (self.repo / "scripts" / "validate_docs.py").write_text(
             "raise SystemExit(0)\n", encoding="utf-8"
         )
@@ -47,10 +61,15 @@ exit 0
         (self.repo / "cognitod" / "src" / "config.rs").write_text(
             "pub struct ApiConfig {}\n", encoding="utf-8"
         )
+        docs_dir = self.repo / "docs"
+        docs_dir.mkdir()
+        for index in range(12):
+            (docs_dir / f"doc-{index}.md").write_text("# Test\n", encoding="utf-8")
 
         self.suite = suite
         self.env = os.environ.copy()
         self.env["PATH"] = f"{self.fake_bin}:/usr/bin:/bin"
+        self.env["FAKE_MARKDOWN_LOG"] = str(self.markdown_log)
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -60,10 +79,13 @@ exit 0
         path.write_text(content, encoding="utf-8")
         path.chmod(0o755)
 
-    def _run_suite(self, failure_match: str | None = None) -> subprocess.CompletedProcess[str]:
+    def _run_suite(
+        self, failure_match: str | None = None, **env_overrides: str
+    ) -> subprocess.CompletedProcess[str]:
         env = self.env.copy()
         if failure_match is not None:
             env["FAKE_CARGO_FAIL_MATCH"] = failure_match
+        env.update(env_overrides)
         return subprocess.run(
             [str(self.suite)],
             cwd=self.repo,
@@ -79,6 +101,8 @@ exit 0
 
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("All tests passed", result.stdout)
+        checked_files = self.markdown_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(checked_files), 12)
 
     def test_piped_cargo_failures_fail_the_suite(self) -> None:
         commands = (
@@ -96,6 +120,12 @@ exit 0
 
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn("Some tests failed", result.stdout)
+
+    def test_markdown_link_failure_fails_the_suite(self) -> None:
+        result = self._run_suite(FAKE_MARKDOWN_STATUS="23")
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Some tests failed", result.stdout)
 
 
 if __name__ == "__main__":
