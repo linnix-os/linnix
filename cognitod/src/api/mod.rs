@@ -48,6 +48,14 @@ type HmacSha256 = Hmac<Sha256>;
 const SLACK_SIGNATURE_HEADER: &str = "x-slack-signature";
 const SLACK_TIMESTAMP_HEADER: &str = "x-slack-request-timestamp";
 const SLACK_SIGNATURE_TOLERANCE: Duration = Duration::from_secs(5 * 60);
+const INSIGHT_HTML_CSP: &str = concat!(
+    "default-src 'none'; ",
+    "script-src 'none'; ",
+    "style-src 'unsafe-inline'; ",
+    "base-uri 'none'; ",
+    "form-action 'none'; ",
+    "frame-ancestors 'none'"
+);
 
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -2226,20 +2234,43 @@ fn verify_slack_signature(
         .map_err(|_| SlackSignatureError::InvalidSignature)
 }
 
-async fn get_insight_by_id(
-    Path(id): Path<String>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
-    State(app): State<Arc<AppState>>,
-) -> Response {
-    let record = app.insights.get_by_id(&id);
+fn escape_html(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
 
-    match record {
-        Some(rec) => {
-            // Check if HTML format is requested
-            if params.get("format") == Some(&"html".to_string()) {
-                let insight = &rec.insight;
-                let html = format!(
-                    r#"<!DOCTYPE html>
+fn render_insight_html(id: &str, insight: &cognitod::schema::Insight) -> String {
+    let escaped_id = escape_html(id);
+    let escaped_reason = escape_html(insight.reason_code.as_str());
+    let escaped_summary = escape_html(&insight.summary);
+    let escaped_next_step = escape_html(&insight.suggested_next_step);
+    let pod_rows = insight
+        .top_pods
+        .iter()
+        .map(|p| {
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{:.1}%</td><td>{:.1}%</td></tr>",
+                escape_html(&p.namespace),
+                escape_html(&p.pod),
+                p.cpu_usage,
+                p.psi_contribution
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        r#"<!DOCTYPE html>
 <html>
 <head>
     <title>Incident {}</title>
@@ -2290,25 +2321,39 @@ async fn get_insight_by_id(
     </div>
 </body>
 </html>"#,
-                    id,
-                    insight.reason_code.as_str(),
-                    insight.confidence * 100.0,
-                    id,
-                    insight.summary,
-                    insight
-                        .top_pods
-                        .iter()
-                        .map(|p| format!(
-                            "<tr><td>{}</td><td>{}</td><td>{:.1}%</td><td>{:.1}%</td></tr>",
-                            p.namespace, p.pod, p.cpu_usage, p.psi_contribution
-                        ))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    insight.suggested_next_step,
-                    id
-                );
+        escaped_id,
+        escaped_reason,
+        insight.confidence * 100.0,
+        escaped_id,
+        escaped_summary,
+        pod_rows,
+        escaped_next_step,
+        escaped_id
+    )
+}
 
-                (StatusCode::OK, [("content-type", "text/html")], html).into_response()
+async fn get_insight_by_id(
+    Path(id): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    State(app): State<Arc<AppState>>,
+) -> Response {
+    let record = app.insights.get_by_id(&id);
+
+    match record {
+        Some(rec) => {
+            // Check if HTML format is requested
+            if params.get("format") == Some(&"html".to_string()) {
+                let html = render_insight_html(&id, &rec.insight);
+
+                (
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                        (header::CONTENT_SECURITY_POLICY, INSIGHT_HTML_CSP),
+                    ],
+                    html,
+                )
+                    .into_response()
             } else {
                 // Default: JSON
                 Json(rec).into_response()
@@ -2448,6 +2493,8 @@ mod tests {
     use crate::{PERCENT_MILLI_UNKNOWN, ProcessEvent};
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
+    use cognitod::k8s::{K8sMetadata, Priority};
+    use cognitod::schema::{Insight, InsightReason, PodContribution};
     use futures_util::StreamExt;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
@@ -2976,6 +3023,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn insight_html_escapes_untrusted_fields_and_sets_csp() {
+        let app_state = minimal_app_state(None, None, None);
+        app_state.insights.record(Insight {
+            reason_code: InsightReason::ForkStorm,
+            summary: r#"model <script>alert("summary")</script> & <b>bold</b>"#.to_string(),
+            confidence: 0.91,
+            id: "insight-xss".to_string(),
+            top_pods: vec![PodContribution {
+                namespace: "prod<script>alert('namespace')</script>".to_string(),
+                pod: "api<script>alert('pod')</script>".to_string(),
+                cpu_usage: 42.5,
+                psi_contribution: 7.5,
+            }],
+            suggested_next_step: r#"Run <script>alert("step")</script>"#.to_string(),
+            primary_process: Some("worker<script>alert('process')</script>".to_string()),
+            k8s: Some(K8sMetadata {
+                namespace: "kube<script>alert('namespace')</script>".to_string(),
+                pod_name: "pod<script>alert('pod')</script>".to_string(),
+                container_name: "container".to_string(),
+                owner_kind: None,
+                owner_name: None,
+                priority: Priority::Medium,
+                slo_tier: None,
+            }),
+        });
+
+        let response = super::all_routes(Arc::clone(&app_state))
+            .oneshot(
+                Request::builder()
+                    .uri("/insights/insight-xss?format=html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .and_then(|value| value.to_str().ok()),
+            Some(INSIGHT_HTML_CSP)
+        );
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert!(content_type.starts_with("text/html"), "{content_type}");
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            !body_text.contains("<script>"),
+            "attacker-controlled script tags must be escaped: {body_text}"
+        );
+        assert!(body_text.contains(
+            "model &lt;script&gt;alert(&quot;summary&quot;)&lt;/script&gt; &amp; &lt;b&gt;bold&lt;/b&gt;"
+        ));
+        assert!(body_text.contains("prod&lt;script&gt;alert(&#39;namespace&#39;)&lt;/script&gt;"));
+        assert!(body_text.contains("api&lt;script&gt;alert(&#39;pod&#39;)&lt;/script&gt;"));
+        assert!(body_text.contains("Run &lt;script&gt;alert(&quot;step&quot;)&lt;/script&gt;"));
     }
 
     #[tokio::test]
