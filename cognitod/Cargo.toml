@@ -43,6 +43,9 @@ chrono = "0.4"
 tracing = "0.1"
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
 sha2 = "0.10.9"
+hmac = "0.12.1"
+hex = "0.4.3"
+serde_urlencoded = "0.7.1"
 walkdir = "2.5.0"
 memmap2 = "0.9"
 nix = { version = "0.29", features = ["time"] }

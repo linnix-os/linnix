@@ -74,6 +74,15 @@ fn configured_auth_token(
         .or_else(|| config_token.filter(|token| !token.trim().is_empty()))
 }
 
+fn configured_slack_signing_secret(
+    env_secret: Option<String>,
+    config_secret: Option<String>,
+) -> Option<String> {
+    env_secret
+        .filter(|secret| !secret.trim().is_empty())
+        .or_else(|| config_secret.filter(|secret| !secret.trim().is_empty()))
+}
+
 fn listener_host(listen_addr: &str) -> anyhow::Result<&str> {
     let listen_addr = listen_addr.trim();
 
@@ -1365,6 +1374,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         std::env::var("LINNIX_API_TOKEN").ok(),
         config.api.auth_token.clone(),
     );
+    let slack_signing_secret = configured_slack_signing_secret(
+        std::env::var("LINNIX_SLACK_SIGNING_SECRET").ok(),
+        config
+            .notifications
+            .as_ref()
+            .and_then(|notifications| notifications.slack.as_ref())
+            .and_then(|slack| slack.signing_secret.clone()),
+    );
 
     let app_state = Arc::new(AppState {
         context: Arc::clone(&context),
@@ -1379,6 +1396,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         prometheus_enabled: config.outputs.prometheus,
         alert_history: Arc::clone(&alert_history),
         auth_token: auth_token.clone(),
+        slack_signing_secret,
         enforcement: enforcement_queue.clone(),
         incident_store: incident_store.clone(),
         k8s: k8s_context.clone(),

@@ -166,6 +166,9 @@ pub struct AppriseConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlackConfig {
     pub webhook_url: String,
+    /// Slack app signing secret used to verify interactive callback requests.
+    #[serde(default)]
+    pub signing_secret: Option<String>,
     #[serde(default)]
     pub channel: Option<String>,
     #[serde(default = "default_dashboard_url")]
@@ -984,6 +987,24 @@ auth_token = "secret123"
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.api.listen_addr, "0.0.0.0:8080");
         assert_eq!(cfg.api.auth_token, Some("secret123".to_string()));
+    }
+
+    #[test]
+    fn parse_slack_signing_secret() {
+        let toml = r#"[notifications.slack]
+webhook_url = "https://hooks.slack.com/services/T/B/secret"
+signing_secret = "slack-signing-secret"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let slack = cfg.notifications.unwrap().slack.unwrap();
+        assert_eq!(
+            slack.webhook_url,
+            "https://hooks.slack.com/services/T/B/secret"
+        );
+        assert_eq!(
+            slack.signing_secret.as_deref(),
+            Some("slack-signing-secret")
+        );
     }
 
     #[test]

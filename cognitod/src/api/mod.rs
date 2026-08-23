@@ -3,8 +3,8 @@ mod auth;
 use crate::runtime::probes::ProbeState;
 use axum::{
     Router,
-    extract::{Form, Path, Query, State},
-    http::{StatusCode, header},
+    extract::{Path, Query, RawForm, State},
+    http::{HeaderMap, StatusCode, header},
     response::{
         IntoResponse, Json, Response,
         sse::{Event, Sse},
@@ -12,11 +12,13 @@ use axum::{
     routing::{get, post},
 };
 use futures_util::stream::{BoxStream, Stream, StreamExt};
+use hmac::{Hmac, Mac};
 use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{json, to_string};
+use sha2::Sha256;
 use std::collections::VecDeque;
 use std::fmt::Write as FmtWrite;
 use std::fs;
@@ -40,6 +42,12 @@ use cognitod::{Incident, IncidentStats, IncidentStore};
 use linnix_ai_ebpf_common::EventType;
 use sysinfo::{Pid, System};
 use tokio::sync::broadcast;
+
+type HmacSha256 = Hmac<Sha256>;
+
+const SLACK_SIGNATURE_HEADER: &str = "x-slack-signature";
+const SLACK_TIMESTAMP_HEADER: &str = "x-slack-request-timestamp";
+const SLACK_SIGNATURE_TOLERANCE: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1751,6 +1759,7 @@ pub struct AppState {
     pub prometheus_enabled: bool,
     pub alert_history: Arc<AlertHistory>,
     pub auth_token: Option<String>,
+    pub slack_signing_secret: Option<String>,
     pub enforcement: Option<Arc<crate::enforcement::EnforcementQueue>>,
     pub incident_store: Option<Arc<IncidentStore>>,
     pub k8s: Option<Arc<cognitod::k8s::K8sContext>>,
@@ -1786,7 +1795,6 @@ fn base_router() -> Router<Arc<AppState>> {
         .route("/insights/{id}", get(get_insight_by_id))
         .route("/insights/{id}/feedback", post(submit_feedback))
         .route("/api/feedback", post(submit_feedback_api))
-        .route("/api/slack/interactions", post(handle_slack_interaction))
         .route("/incidents", get(get_incidents))
         .route("/incidents/summary", get(get_incident_summary))
         .route("/incidents/stats", get(get_incident_stats))
@@ -1803,6 +1811,13 @@ fn base_router() -> Router<Arc<AppState>> {
         .route("/actions/{id}/reject", axum::routing::post(reject_action))
 }
 
+/// Slack callbacks are authenticated by Slack's request signature rather than
+/// the API bearer token. This lets Slack reach the callback directly while the
+/// handler still fails closed before processing any action.
+fn slack_router() -> Router<Arc<AppState>> {
+    Router::new().route("/api/slack/interactions", post(handle_slack_interaction))
+}
+
 /// Build routes for the TCP listener, which requires a bearer token when one
 /// is configured.
 pub fn all_routes(app_state: Arc<AppState>) -> Router {
@@ -1816,7 +1831,7 @@ pub fn all_routes(app_state: Arc<AppState>) -> Router {
         ));
     }
 
-    router.with_state(app_state)
+    router.merge(slack_router()).with_state(app_state)
 }
 
 /// Build routes for the Unix domain socket listener.
@@ -1825,7 +1840,7 @@ pub fn all_routes(app_state: Arc<AppState>) -> Router {
 /// middleware: UDS connections are trusted because local process identity is
 /// verified by socket credentials (`SO_PEERCRED`).
 pub fn uds_routes(app_state: Arc<AppState>) -> Router {
-    base_router().with_state(app_state)
+    base_router().merge(slack_router()).with_state(app_state)
 }
 
 /// Build the unauthenticated operational listener. It deliberately contains no
@@ -2132,6 +2147,85 @@ struct SlackPayload {
     actions: Vec<SlackAction>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SlackSignatureError {
+    MissingSecret,
+    MissingTimestamp,
+    InvalidTimestamp,
+    StaleTimestamp,
+    MissingSignature,
+    InvalidSignature,
+}
+
+impl SlackSignatureError {
+    fn log_label(&self) -> &'static str {
+        match self {
+            Self::MissingSecret => "signing secret is not configured",
+            Self::MissingTimestamp => "missing request timestamp",
+            Self::InvalidTimestamp => "invalid request timestamp",
+            Self::StaleTimestamp => "stale request timestamp",
+            Self::MissingSignature => "missing signature",
+            Self::InvalidSignature => "invalid signature",
+        }
+    }
+}
+
+#[cfg(test)]
+fn slack_signature(secret: &str, timestamp: &str, body: &[u8]) -> String {
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(format!("v0:{timestamp}:").as_bytes());
+    mac.update(body);
+    format!("v0={}", hex::encode(mac.finalize().into_bytes()))
+}
+
+fn verify_slack_signature(
+    signing_secret: Option<&str>,
+    headers: &HeaderMap,
+    body: &[u8],
+    now: SystemTime,
+) -> Result<(), SlackSignatureError> {
+    let secret = signing_secret
+        .filter(|secret| !secret.trim().is_empty())
+        .ok_or(SlackSignatureError::MissingSecret)?;
+    let timestamp = headers
+        .get(SLACK_TIMESTAMP_HEADER)
+        .ok_or(SlackSignatureError::MissingTimestamp)?
+        .to_str()
+        .map_err(|_| SlackSignatureError::InvalidTimestamp)?;
+    let timestamp_secs = timestamp
+        .parse::<u64>()
+        .map_err(|_| SlackSignatureError::InvalidTimestamp)?;
+    let request_time = UNIX_EPOCH
+        .checked_add(Duration::from_secs(timestamp_secs))
+        .ok_or(SlackSignatureError::InvalidTimestamp)?;
+    let age = now
+        .duration_since(request_time)
+        .or_else(|_| request_time.duration_since(now))
+        .map_err(|_| SlackSignatureError::InvalidTimestamp)?;
+    if age > SLACK_SIGNATURE_TOLERANCE {
+        return Err(SlackSignatureError::StaleTimestamp);
+    }
+
+    let signature = headers
+        .get(SLACK_SIGNATURE_HEADER)
+        .ok_or(SlackSignatureError::MissingSignature)?
+        .to_str()
+        .map_err(|_| SlackSignatureError::InvalidSignature)?;
+    let signature_hex = signature
+        .strip_prefix("v0=")
+        .ok_or(SlackSignatureError::InvalidSignature)?;
+    let signature_bytes =
+        hex::decode(signature_hex).map_err(|_| SlackSignatureError::InvalidSignature)?;
+
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(format!("v0:{timestamp}:").as_bytes());
+    mac.update(body);
+    mac.verify_slice(&signature_bytes)
+        .map_err(|_| SlackSignatureError::InvalidSignature)
+}
+
 async fn get_insight_by_id(
     Path(id): Path<String>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -2255,8 +2349,27 @@ async fn submit_feedback(
 
 async fn handle_slack_interaction(
     State(state): State<Arc<AppState>>,
-    Form(form): Form<SlackInteractionPayload>,
+    headers: HeaderMap,
+    RawForm(raw_form): RawForm,
 ) -> impl IntoResponse {
+    if let Err(err) = verify_slack_signature(
+        state.slack_signing_secret.as_deref(),
+        &headers,
+        &raw_form,
+        SystemTime::now(),
+    ) {
+        log::warn!("Rejected Slack interaction: {}", err.log_label());
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+
+    let form: SlackInteractionPayload = match serde_urlencoded::from_bytes(&raw_form) {
+        Ok(form) => form,
+        Err(e) => {
+            log::warn!("Failed to parse Slack form body: {}", e);
+            return (StatusCode::BAD_REQUEST, "Invalid form body").into_response();
+        }
+    };
+
     let payload: SlackPayload = match serde_json::from_str(&form.payload) {
         Ok(p) => p,
         Err(e) => {
@@ -2325,6 +2438,7 @@ async fn handle_slack_interaction(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::enforcement::{ActionStatus, ActionType, EnforcementQueue};
     use crate::insights::InsightStore;
     use crate::runtime::probes::{ProbeState, RssProbeMode};
     use crate::{PERCENT_MILLI_UNKNOWN, ProcessEvent};
@@ -2334,6 +2448,86 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use tower::ServiceExt;
+
+    fn minimal_app_state(
+        auth_token: Option<String>,
+        slack_signing_secret: Option<String>,
+        enforcement: Option<Arc<EnforcementQueue>>,
+    ) -> Arc<AppState> {
+        Arc::new(AppState {
+            context: Arc::new(ContextStore::new(Duration::from_secs(60), 10, None)),
+            metrics: Arc::new(Metrics::new()),
+            alerts: None,
+            insights: Arc::new(InsightStore::new(16, None)),
+            offline: Arc::new(OfflineGuard::new(false)),
+            transport: "perf",
+            probe_state: ProbeState::disabled(),
+            require_kernel_instrumentation: true,
+            enforcement,
+            reasoner: ReasonerConfig::default(),
+            prometheus_enabled: false,
+            alert_history: Arc::new(AlertHistory::new(16)),
+            auth_token,
+            slack_signing_secret,
+            incident_store: None,
+            k8s: None,
+            blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+        })
+    }
+
+    fn current_epoch_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    fn slack_action_form_body(action_id: &str, value: String) -> String {
+        let payload = serde_json::json!({
+            "actions": [{
+                "action_id": action_id,
+                "value": value
+            }]
+        })
+        .to_string();
+        serde_urlencoded::to_string([("payload", payload)]).unwrap()
+    }
+
+    fn slack_request(body: String) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/api/slack/interactions")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    fn signed_slack_request(body: String, secret: &str, timestamp: u64) -> Request<Body> {
+        let signature = slack_signature(secret, &timestamp.to_string(), body.as_bytes());
+        Request::builder()
+            .method("POST")
+            .uri("/api/slack/interactions")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(SLACK_TIMESTAMP_HEADER, timestamp.to_string())
+            .header(SLACK_SIGNATURE_HEADER, signature)
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    async fn propose_test_action(enforcement: &EnforcementQueue) -> String {
+        enforcement
+            .propose(
+                ActionType::KillProcess {
+                    pid: 999_999,
+                    signal: 9,
+                },
+                "high CPU usage".to_string(),
+                "test".to_string(),
+                None,
+            )
+            .await
+            .unwrap()
+    }
 
     fn stored_attribution(
         cpu_share: f64,
@@ -2470,6 +2664,7 @@ mod tests {
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
             auth_token: None,
+            slack_signing_secret: None,
             incident_store: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
@@ -2538,6 +2733,7 @@ mod tests {
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
             auth_token: None,
+            slack_signing_secret: None,
             incident_store: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
@@ -2588,6 +2784,7 @@ mod tests {
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
             auth_token: None,
+            slack_signing_secret: None,
             incident_store: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
@@ -2621,6 +2818,7 @@ mod tests {
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
             auth_token: None,
+            slack_signing_secret: None,
             incident_store: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
@@ -2657,6 +2855,7 @@ mod tests {
             prometheus_enabled: true,
             alert_history: Arc::new(AlertHistory::new(16)),
             auth_token: None,
+            slack_signing_secret: None,
             incident_store: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
@@ -2707,6 +2906,7 @@ mod tests {
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
             auth_token: None,
+            slack_signing_secret: None,
             incident_store: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
@@ -2743,6 +2943,7 @@ mod tests {
             alert_history: Arc::new(AlertHistory::new(16)),
             incident_store: None,
             auth_token: Some("secret123".to_string()),
+            slack_signing_secret: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         });
@@ -2790,6 +2991,7 @@ mod tests {
             prometheus_enabled: config.outputs.prometheus,
             alert_history: Arc::new(AlertHistory::new(16)),
             auth_token: Some("secret-from-kubernetes".to_string()),
+            slack_signing_secret: None,
             incident_store: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
@@ -2859,6 +3061,7 @@ mod tests {
             alert_history: Arc::new(AlertHistory::new(16)),
             incident_store: None,
             auth_token: Some("secret123".to_string()),
+            slack_signing_secret: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         });
@@ -2895,6 +3098,7 @@ mod tests {
             alert_history: Arc::new(AlertHistory::new(16)),
             incident_store: None,
             auth_token: Some("secret123".to_string()),
+            slack_signing_secret: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         });
@@ -2931,6 +3135,7 @@ mod tests {
             alert_history: Arc::new(AlertHistory::new(16)),
             incident_store: None,
             auth_token: Some("secret123".to_string()),
+            slack_signing_secret: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         });
@@ -2946,6 +3151,114 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn valid_slack_signature_bypasses_bearer_auth_and_approves_action() {
+        let enforcement = Arc::new(EnforcementQueue::new(300));
+        let action_id = propose_test_action(&enforcement).await;
+        let app_state = minimal_app_state(
+            Some("api-secret".to_string()),
+            Some("slack-secret".to_string()),
+            Some(Arc::clone(&enforcement)),
+        );
+        let body = slack_action_form_body("approve_action", format!("approve:{action_id}"));
+
+        let response = super::all_routes(Arc::clone(&app_state))
+            .oneshot(signed_slack_request(
+                body,
+                "slack-secret",
+                current_epoch_secs(),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let action = enforcement.get_by_id(&action_id).await.unwrap();
+        assert_eq!(action.status, ActionStatus::Approved);
+        assert_eq!(action.approved_by.as_deref(), Some("slack_user"));
+        assert_eq!(app_state.metrics.slack_approved(), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_slack_signature_is_rejected_before_action_processing() {
+        let enforcement = Arc::new(EnforcementQueue::new(300));
+        let action_id = propose_test_action(&enforcement).await;
+        let app_state = minimal_app_state(
+            Some("api-secret".to_string()),
+            Some("slack-secret".to_string()),
+            Some(Arc::clone(&enforcement)),
+        );
+        let body = slack_action_form_body("approve_action", format!("approve:{action_id}"));
+
+        let response = super::all_routes(app_state)
+            .oneshot(slack_request(body))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let action = enforcement.get_by_id(&action_id).await.unwrap();
+        assert_eq!(action.status, ActionStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn invalid_slack_signature_is_rejected_before_action_processing() {
+        let enforcement = Arc::new(EnforcementQueue::new(300));
+        let action_id = propose_test_action(&enforcement).await;
+        let app_state = minimal_app_state(
+            Some("api-secret".to_string()),
+            Some("slack-secret".to_string()),
+            Some(Arc::clone(&enforcement)),
+        );
+        let original_body = slack_action_form_body("approve_action", "approve:other".to_string());
+        let tampered_body =
+            slack_action_form_body("approve_action", format!("approve:{action_id}"));
+        let timestamp = current_epoch_secs();
+        let signature = slack_signature(
+            "slack-secret",
+            &timestamp.to_string(),
+            original_body.as_bytes(),
+        );
+
+        let response = super::all_routes(app_state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/slack/interactions")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header(SLACK_TIMESTAMP_HEADER, timestamp.to_string())
+                    .header(SLACK_SIGNATURE_HEADER, signature)
+                    .body(Body::from(tampered_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let action = enforcement.get_by_id(&action_id).await.unwrap();
+        assert_eq!(action.status, ActionStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn stale_slack_signature_is_rejected_before_action_processing() {
+        let enforcement = Arc::new(EnforcementQueue::new(300));
+        let action_id = propose_test_action(&enforcement).await;
+        let app_state = minimal_app_state(
+            Some("api-secret".to_string()),
+            Some("slack-secret".to_string()),
+            Some(Arc::clone(&enforcement)),
+        );
+        let body = slack_action_form_body("approve_action", format!("approve:{action_id}"));
+        let stale_timestamp = current_epoch_secs() - SLACK_SIGNATURE_TOLERANCE.as_secs() - 1;
+
+        let response = super::all_routes(app_state)
+            .oneshot(signed_slack_request(body, "slack-secret", stale_timestamp))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let action = enforcement.get_by_id(&action_id).await.unwrap();
+        assert_eq!(action.status, ActionStatus::Pending);
     }
 
     /// The exposed `/metrics/prometheus` text, byte for byte, for a known
@@ -3020,6 +3333,7 @@ mod tests {
             prometheus_enabled: true,
             alert_history: Arc::new(AlertHistory::new(16)),
             auth_token: None,
+            slack_signing_secret: None,
             incident_store: None,
             k8s: None,
             blame_metrics: Arc::clone(&blame),
@@ -3302,6 +3616,7 @@ mod tests {
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
             auth_token: None,
+            slack_signing_secret: None,
             incident_store: Some(Arc::clone(&store)),
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
@@ -3414,6 +3729,7 @@ mod tests {
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
             auth_token: None,
+            slack_signing_secret: None,
             incident_store: Some(Arc::clone(&store)),
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
@@ -3545,6 +3861,7 @@ mod tests {
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
             auth_token: None,
+            slack_signing_secret: None,
             incident_store: Some(Arc::clone(&store)),
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
@@ -3690,6 +4007,7 @@ mod tests {
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
             auth_token: None,
+            slack_signing_secret: None,
             incident_store: Some(Arc::clone(&store)),
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
@@ -3738,6 +4056,7 @@ mod tests {
             alert_history: Arc::new(AlertHistory::new(16)),
             incident_store: None,
             auth_token: Some("secret123".to_string()),
+            slack_signing_secret: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         });

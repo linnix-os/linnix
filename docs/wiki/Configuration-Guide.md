@@ -54,6 +54,11 @@ enabled = true
 #     "mailto://user:pass@smtp.gmail.com"
 # ]
 # min_severity = "medium"  # Options: info, low, medium, high (default: info)
+#
+# [notifications.slack]
+# webhook_url = "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK"
+# signing_secret = "YOUR-SLACK-SIGNING-SECRET"  # Or set LINNIX_SLACK_SIGNING_SECRET.
+# dashboard_base_url = "http://localhost:3000"
 ```
 
 ## Section Reference
