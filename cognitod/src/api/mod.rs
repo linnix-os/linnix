@@ -426,12 +426,20 @@ struct ProcessesQuery {
 }
 
 fn calculate_age_sec(ts_ns: u64) -> Option<u64> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_nanos() as u64;
-    if ts_ns > 0 && now > ts_ns {
-        Some((now - ts_ns) / 1_000_000_000)
+    let now_ns = monotonic_now_ns()?;
+    calculate_age_sec_at(ts_ns, now_ns)
+}
+
+fn monotonic_now_ns() -> Option<u64> {
+    use nix::time::{ClockId, clock_gettime};
+
+    let ts = clock_gettime(ClockId::CLOCK_MONOTONIC).ok()?;
+    Some((ts.tv_sec() as u64) * 1_000_000_000 + ts.tv_nsec() as u64)
+}
+
+fn calculate_age_sec_at(ts_ns: u64, now_ns: u64) -> Option<u64> {
+    if ts_ns > 0 && now_ns > ts_ns {
+        Some((now_ns - ts_ns) / 1_000_000_000)
     } else {
         None
     }
@@ -2581,6 +2589,60 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs()
+    }
+
+    fn process_event_with_ts(ts_ns: u64) -> ProcessEvent {
+        let mut comm = [0; 16];
+        comm[..4].copy_from_slice(b"live");
+        ProcessEvent::new(ProcessEventWire {
+            pid: 1234,
+            ppid: 1,
+            uid: 1000,
+            gid: 1000,
+            event_type: EventType::Exec as u32,
+            ts_ns,
+            seq: 0,
+            comm,
+            exit_time_ns: 0,
+            cpu_pct_milli: PERCENT_MILLI_UNKNOWN,
+            mem_pct_milli: PERCENT_MILLI_UNKNOWN,
+            data: 0,
+            data2: 0,
+            aux: 0,
+            aux2: 0,
+        })
+    }
+
+    #[test]
+    fn age_sec_uses_monotonic_timestamp_delta() {
+        let now_ns = 90 * 24 * 60 * 60 * 1_000_000_000u64;
+        let started_ns = now_ns - 37 * 1_000_000_000;
+
+        assert_eq!(calculate_age_sec_at(started_ns, now_ns), Some(37));
+    }
+
+    #[test]
+    fn age_sec_rejects_zero_and_future_monotonic_timestamps() {
+        let now_ns = 90 * 24 * 60 * 60 * 1_000_000_000u64;
+
+        assert_eq!(calculate_age_sec_at(0, now_ns), None);
+        assert_eq!(calculate_age_sec_at(now_ns + 1, now_ns), None);
+    }
+
+    #[test]
+    fn process_info_reports_sane_age_for_live_monotonic_timestamp() {
+        let app_state = minimal_app_state(None, None, None);
+        let started_ns =
+            monotonic_now_ns().expect("CLOCK_MONOTONIC is available") - 2 * 1_000_000_000;
+        let event = process_event_with_ts(started_ns);
+
+        let info = ProcessInfo::from_event(&event, &app_state);
+
+        let age_sec = info.age_sec.expect("live process age should be present");
+        assert!(
+            (2..10).contains(&age_sec),
+            "age_sec should stay close to the injected monotonic delta, got {age_sec}"
+        );
     }
 
     fn slack_action_form_body(action_id: &str, value: String) -> String {
