@@ -23,6 +23,8 @@ pub struct Metrics {
     lineage_hits: AtomicU64,
     lineage_misses: AtomicU64,
     drops_by_type: [AtomicU64; EVENT_TYPE_SLOTS],
+    listener_queue_depth: AtomicUsize,
+    listener_queue_drops: AtomicU64,
     alerts_emitted_total: AtomicU64,
     perf_poll_errors: AtomicU64,
     active_rules: AtomicUsize,
@@ -66,6 +68,8 @@ impl Metrics {
             lineage_hits: AtomicU64::new(0),
             lineage_misses: AtomicU64::new(0),
             drops_by_type: std::array::from_fn(|_| AtomicU64::new(0)),
+            listener_queue_depth: AtomicUsize::new(0),
+            listener_queue_drops: AtomicU64::new(0),
             alerts_emitted_total: AtomicU64::new(0),
             perf_poll_errors: AtomicU64::new(0),
             active_rules: AtomicUsize::new(0),
@@ -157,6 +161,25 @@ impl Metrics {
         (0..self.drops_by_type.len())
             .map(|idx| (idx as u32, self.drops_by_type[idx].load(Ordering::Relaxed)))
             .collect()
+    }
+
+    pub fn set_listener_queue_depth(&self, depth: usize) {
+        self.listener_queue_depth.store(depth, Ordering::Relaxed);
+    }
+
+    pub fn listener_queue_depth(&self) -> usize {
+        self.listener_queue_depth.load(Ordering::Relaxed)
+    }
+
+    pub fn record_listener_queue_drop(&self, event_type: u32) {
+        let idx = Self::event_index(event_type);
+        self.drops_by_type[idx].fetch_add(1, Ordering::Relaxed);
+        self.dropped_events_total.fetch_add(1, Ordering::Relaxed);
+        self.listener_queue_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn listener_queue_drops(&self) -> u64 {
+        self.listener_queue_drops.load(Ordering::Relaxed)
     }
 
     pub fn inc_alerts_emitted(&self) {

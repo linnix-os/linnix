@@ -84,6 +84,45 @@ pub struct IncidentStore {
     pool: SqlitePool,
 }
 
+struct RequiredColumn {
+    table: &'static str,
+    column: &'static str,
+    ddl: &'static str,
+}
+
+const REQUIRED_COLUMNS: &[RequiredColumn] = &[
+    RequiredColumn {
+        table: "stall_attributions",
+        column: "cpu_share",
+        ddl: "ALTER TABLE stall_attributions ADD COLUMN cpu_share REAL DEFAULT 0.0",
+    },
+    RequiredColumn {
+        table: "stall_attributions",
+        column: "fork_count",
+        ddl: "ALTER TABLE stall_attributions ADD COLUMN fork_count INTEGER DEFAULT 0",
+    },
+    RequiredColumn {
+        table: "stall_attributions",
+        column: "short_job_count",
+        ddl: "ALTER TABLE stall_attributions ADD COLUMN short_job_count INTEGER DEFAULT 0",
+    },
+    RequiredColumn {
+        table: "stall_attributions",
+        column: "attributed_stall_us",
+        ddl: "ALTER TABLE stall_attributions ADD COLUMN attributed_stall_us INTEGER",
+    },
+    RequiredColumn {
+        table: "stall_attributions",
+        column: "event_id",
+        ddl: "ALTER TABLE stall_attributions ADD COLUMN event_id TEXT",
+    },
+    RequiredColumn {
+        table: "incidents",
+        column: "investigation",
+        ddl: "ALTER TABLE incidents ADD COLUMN investigation TEXT",
+    },
+];
+
 impl IncidentStore {
     /// Create a new incident store
     pub async fn new<P: AsRef<Path>>(db_path: P) -> Result<Self, sqlx::Error> {
@@ -159,43 +198,15 @@ impl IncidentStore {
         .execute(&pool)
         .await?;
 
-        // Manual migration for existing databases
-        // We ignore errors because the columns might already exist
-        let _ = sqlx::query("ALTER TABLE stall_attributions ADD COLUMN cpu_share REAL DEFAULT 0.0")
-            .execute(&pool)
-            .await;
-        let _ =
-            sqlx::query("ALTER TABLE stall_attributions ADD COLUMN fork_count INTEGER DEFAULT 0")
-                .execute(&pool)
-                .await;
-        let _ = sqlx::query(
-            "ALTER TABLE stall_attributions ADD COLUMN short_job_count INTEGER DEFAULT 0",
-        )
-        .execute(&pool)
-        .await;
-        let _ =
-            sqlx::query("ALTER TABLE stall_attributions ADD COLUMN attributed_stall_us INTEGER")
-                .execute(&pool)
-                .await;
+        apply_required_column_migrations(&pool).await?;
+
         // No backfill: an id cannot be reconstructed for rows written before
         // the monitor emitted one, and grouping them by `(timestamp, stall_us)`
         // to synthesise one would bake today's ambiguity into permanent data.
         // They stay NULL and consumers keep the existing fallback.
-        let _ = sqlx::query("ALTER TABLE stall_attributions ADD COLUMN event_id TEXT")
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_attr_event ON stall_attributions(event_id)")
             .execute(&pool)
-            .await;
-        let _ = sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_attr_event ON stall_attributions(event_id)",
-        )
-        .execute(&pool)
-        .await;
-
-        // The grounded investigation lives beside the raw reply rather than
-        // replacing it: `llm_analysis` keeps meaning exactly what it always
-        // did, so no reader has to tell prose and JSON apart by inspection.
-        let _ = sqlx::query("ALTER TABLE incidents ADD COLUMN investigation TEXT")
-            .execute(&pool)
-            .await;
+            .await?;
 
         // Rows written before the column existed stored only the victim's
         // total stall, repeated against every offender. The share each was
@@ -234,13 +245,11 @@ impl IncidentStore {
             "#,
         )
         .execute(&pool)
-        .await;
-        if let Ok(result) = backfilled
-            && result.rows_affected() > 0
-        {
+        .await?;
+        if backfilled.rows_affected() > 0 {
             info!(
                 "Backfilled attributed stall for {} historical attribution rows",
-                result.rows_affected()
+                backfilled.rows_affected()
             );
         }
 
@@ -623,20 +632,49 @@ impl IncidentStore {
 
     /// Get recent incidents
     pub async fn recent(&self, limit: i64) -> Result<Vec<Incident>, sqlx::Error> {
-        let rows = sqlx::query(
+        self.recent_filtered(limit, None, None).await
+    }
+
+    /// Get recent incidents, optionally filtered by event type and analysis state
+    pub async fn recent_filtered(
+        &self,
+        limit: i64,
+        event_type: Option<&str>,
+        analyzed: Option<bool>,
+    ) -> Result<Vec<Incident>, sqlx::Error> {
+        let mut sql = String::from(
             r#"
             SELECT id, timestamp, event_type, psi_cpu, psi_memory, cpu_percent, load_avg,
                    action, target_pid, target_name, system_snapshot,
                    llm_analysis, llm_analyzed_at, recovery_time_ms, psi_after,
                    investigation
             FROM incidents
-            ORDER BY timestamp DESC
-            LIMIT ?
             "#,
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        );
+        let mut filters = Vec::new();
+
+        if event_type.is_some() {
+            filters.push("event_type = ?");
+        }
+        if let Some(analyzed) = analyzed {
+            filters.push(if analyzed {
+                "llm_analysis IS NOT NULL"
+            } else {
+                "llm_analysis IS NULL"
+            });
+        }
+        if !filters.is_empty() {
+            sql.push_str("WHERE ");
+            sql.push_str(&filters.join(" AND "));
+            sql.push('\n');
+        }
+        sql.push_str("ORDER BY timestamp DESC LIMIT ?");
+
+        let mut query = sqlx::query(&sql);
+        if let Some(evt_type) = event_type {
+            query = query.bind(evt_type);
+        }
+        let rows = query.bind(limit).fetch_all(&self.pool).await?;
 
         Ok(rows
             .into_iter()
@@ -730,10 +768,11 @@ impl IncidentStore {
             .await?;
         let total: i64 = total_row.get(0);
 
-        let cb_row =
-            sqlx::query("SELECT COUNT(*) FROM incidents WHERE event_type = 'circuit_breaker'")
-                .fetch_one(&self.pool)
-                .await?;
+        let cb_row = sqlx::query(
+            "SELECT COUNT(*) FROM incidents WHERE event_type = 'circuit_breaker' OR event_type GLOB 'circuit_breaker_*'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
         let circuit_breaker_count: i64 = cb_row.get(0);
 
         let avg_row = sqlx::query(
@@ -755,6 +794,26 @@ impl IncidentStore {
             feedback_entries: feedback_count as u64,
         })
     }
+}
+
+async fn apply_required_column_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    for migration in REQUIRED_COLUMNS {
+        if !column_exists(pool, migration.table, migration.column).await? {
+            sqlx::query(migration.ddl).execute(pool).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn column_exists(pool: &SqlitePool, table: &str, column: &str) -> Result<bool, sqlx::Error> {
+    let escaped_table = table.replace('"', "\"\"");
+    let rows = sqlx::query(&format!("PRAGMA table_info(\"{escaped_table}\")"))
+        .fetch_all(pool)
+        .await?;
+
+    Ok(rows
+        .iter()
+        .any(|row| row.get::<String, _>("name").eq_ignore_ascii_case(column)))
 }
 
 /// Statistics about stored incidents

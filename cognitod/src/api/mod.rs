@@ -426,12 +426,20 @@ struct ProcessesQuery {
 }
 
 fn calculate_age_sec(ts_ns: u64) -> Option<u64> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_nanos() as u64;
-    if ts_ns > 0 && now > ts_ns {
-        Some((now - ts_ns) / 1_000_000_000)
+    let now_ns = monotonic_now_ns()?;
+    calculate_age_sec_at(ts_ns, now_ns)
+}
+
+fn monotonic_now_ns() -> Option<u64> {
+    use nix::time::{ClockId, clock_gettime};
+
+    let ts = clock_gettime(ClockId::CLOCK_MONOTONIC).ok()?;
+    Some((ts.tv_sec() as u64) * 1_000_000_000 + ts.tv_nsec() as u64)
+}
+
+fn calculate_age_sec_at(ts_ns: u64, now_ns: u64) -> Option<u64> {
+    if ts_ns > 0 && now_ns > ts_ns {
+        Some((now_ns - ts_ns) / 1_000_000_000)
     } else {
         None
     }
@@ -1511,6 +1519,8 @@ pub struct MetricsResponse {
     subscribers: usize,
     queue_depth: usize,
     dropped_events_total: u64,
+    listener_queue_depth: usize,
+    listener_queue_drops: u64,
     alerts_active: usize,
     uptime_seconds: u64,
     events_per_sec: u64,
@@ -1536,6 +1546,8 @@ pub async fn prometheus_metrics(State(app_state): State<Arc<AppState>>) -> Respo
 
     let events_total = metrics.events_total.load(Ordering::Relaxed);
     let dropped_total = metrics.dropped_events_total.load(Ordering::Relaxed);
+    let listener_queue_depth = metrics.listener_queue_depth();
+    let listener_queue_drops = metrics.listener_queue_drops();
     let alerts_emitted = metrics.alerts_emitted();
     let rb_overflows = metrics.rb_overflows();
     let rate_limited = metrics.rate_limited_events();
@@ -1617,6 +1629,24 @@ pub async fn prometheus_metrics(State(app_state): State<Arc<AppState>>) -> Respo
     );
     let _ = writeln!(body, "# TYPE linnix_rate_limited_total counter");
     let _ = writeln!(body, "linnix_rate_limited_total {}", rate_limited);
+
+    let _ = writeln!(
+        body,
+        "# HELP linnix_listener_queue_depth Current BPF listener event queue depth."
+    );
+    let _ = writeln!(body, "# TYPE linnix_listener_queue_depth gauge");
+    let _ = writeln!(body, "linnix_listener_queue_depth {}", listener_queue_depth);
+
+    let _ = writeln!(
+        body,
+        "# HELP linnix_listener_queue_dropped_total Events dropped because the BPF listener queue was full."
+    );
+    let _ = writeln!(body, "# TYPE linnix_listener_queue_dropped_total counter");
+    let _ = writeln!(
+        body,
+        "linnix_listener_queue_dropped_total {}",
+        listener_queue_drops
+    );
 
     let _ = writeln!(
         body,
@@ -1726,6 +1756,8 @@ pub async fn metrics_handler(State(app_state): State<Arc<AppState>>) -> Json<Met
         subscribers: metrics.subscribers.load(Ordering::Relaxed),
         queue_depth: app_state.context.queue_depth(),
         dropped_events_total: metrics.dropped_events_total.load(Ordering::Relaxed),
+        listener_queue_depth: metrics.listener_queue_depth(),
+        listener_queue_drops: metrics.listener_queue_drops(),
         alerts_active: metrics.alerts_active.load(Ordering::Relaxed),
         uptime_seconds: metrics.uptime_seconds(),
         events_per_sec: metrics.events_per_sec(),
@@ -1969,6 +2001,19 @@ fn default_limit() -> i64 {
     10
 }
 
+const MAX_INCIDENT_LIMIT: i64 = 1_000;
+
+fn normalize_incident_limit(limit: i64) -> Result<i64, (StatusCode, String)> {
+    if limit < 1 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "limit must be a positive integer".to_string(),
+        ));
+    }
+
+    Ok(limit.min(MAX_INCIDENT_LIMIT))
+}
+
 /// GET /incidents - List recent incidents
 async fn get_incidents(
     Query(params): Query<IncidentQueryParams>,
@@ -1981,22 +2026,18 @@ async fn get_incidents(
         )
     })?;
 
+    let limit = normalize_incident_limit(params.limit)?;
+    let event_type = params
+        .event_type
+        .as_deref()
+        .filter(|value| !value.is_empty());
+
     let incidents = store
-        .recent(params.limit)
+        .recent_filtered(limit, event_type, params.analyzed)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Filter by analyzed status if requested
-    let filtered = if let Some(analyzed) = params.analyzed {
-        incidents
-            .into_iter()
-            .filter(|i| analyzed == i.llm_analysis.is_some())
-            .collect()
-    } else {
-        incidents
-    };
-
-    Ok(Json(filtered))
+    Ok(Json(incidents))
 }
 
 /// GET /incidents/:id - Get incident by ID
@@ -2580,6 +2621,70 @@ mod tests {
         })
     }
 
+    fn app_state_with_incident_store(store: Arc<cognitod::IncidentStore>) -> Arc<AppState> {
+        Arc::new(AppState {
+            context: Arc::new(ContextStore::new(Duration::from_secs(60), 10, None)),
+            metrics: Arc::new(Metrics::new()),
+            alerts: None,
+            insights: Arc::new(InsightStore::new(16, None)),
+            offline: Arc::new(OfflineGuard::new(false)),
+            transport: "perf",
+            probe_state: ProbeState::disabled(),
+            require_kernel_instrumentation: true,
+            enforcement: None,
+            reasoner: ReasonerConfig::default(),
+            prometheus_enabled: false,
+            alert_history: Arc::new(AlertHistory::new(16)),
+            auth_token: None,
+            slack_signing_secret: None,
+            incident_store: Some(store),
+            k8s: None,
+            blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+        })
+    }
+
+    fn api_test_incident(event_type: &str, timestamp: i64) -> cognitod::Incident {
+        cognitod::Incident {
+            id: None,
+            timestamp,
+            event_type: event_type.to_string(),
+            psi_cpu: 75.21,
+            psi_memory: 12.34,
+            cpu_percent: 96.3,
+            load_avg: "26.00,24.20,21.30".to_string(),
+            action: "auto_kill".to_string(),
+            target_pid: Some(472_693),
+            target_name: Some("aggressive-stress.sh".to_string()),
+            system_snapshot: None,
+            llm_analysis: None,
+            llm_analyzed_at: None,
+            investigation: None,
+            recovery_time_ms: None,
+            psi_after: None,
+        }
+    }
+
+    async fn get_incidents_json(
+        state: Arc<AppState>,
+        uri: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = super::all_routes(state)
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = if body.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null)
+        };
+
+        (status, json)
+    }
+
     fn current_epoch_secs() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2658,6 +2763,60 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    fn process_event_with_ts(ts_ns: u64) -> ProcessEvent {
+        let mut comm = [0; 16];
+        comm[..4].copy_from_slice(b"live");
+        ProcessEvent::new(ProcessEventWire {
+            pid: 1234,
+            ppid: 1,
+            uid: 1000,
+            gid: 1000,
+            event_type: EventType::Exec as u32,
+            ts_ns,
+            seq: 0,
+            comm,
+            exit_time_ns: 0,
+            cpu_pct_milli: PERCENT_MILLI_UNKNOWN,
+            mem_pct_milli: PERCENT_MILLI_UNKNOWN,
+            data: 0,
+            data2: 0,
+            aux: 0,
+            aux2: 0,
+        })
+    }
+
+    #[test]
+    fn age_sec_uses_monotonic_timestamp_delta() {
+        let now_ns = 90 * 24 * 60 * 60 * 1_000_000_000u64;
+        let started_ns = now_ns - 37 * 1_000_000_000;
+
+        assert_eq!(calculate_age_sec_at(started_ns, now_ns), Some(37));
+    }
+
+    #[test]
+    fn age_sec_rejects_zero_and_future_monotonic_timestamps() {
+        let now_ns = 90 * 24 * 60 * 60 * 1_000_000_000u64;
+
+        assert_eq!(calculate_age_sec_at(0, now_ns), None);
+        assert_eq!(calculate_age_sec_at(now_ns + 1, now_ns), None);
+    }
+
+    #[test]
+    fn process_info_reports_sane_age_for_live_monotonic_timestamp() {
+        let app_state = minimal_app_state(None, None, None);
+        let started_ns =
+            monotonic_now_ns().expect("CLOCK_MONOTONIC is available") - 2 * 1_000_000_000;
+        let event = process_event_with_ts(started_ns);
+
+        let info = ProcessInfo::from_event(&event, &app_state);
+
+        let age_sec = info.age_sec.expect("live process age should be present");
+        assert!(
+            (2..10).contains(&age_sec),
+            "age_sec should stay close to the injected monotonic delta, got {age_sec}"
+        );
     }
 
     fn slack_action_form_body(action_id: &str, value: String) -> String {
@@ -4028,6 +4187,141 @@ mod tests {
             reopened["attributions"].as_array().unwrap().len(),
             1,
             "an event link must stay event-specific when reopened: {link}"
+        );
+    }
+
+    #[tokio::test]
+    async fn incidents_route_filters_by_event_type_before_returning_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            cognitod::IncidentStore::new(dir.path().join("incidents.db"))
+                .await
+                .unwrap(),
+        );
+
+        for (event_type, timestamp) in [
+            ("circuit_breaker_cpu", 1_732_242_135),
+            ("manual_kill", 1_732_242_136),
+            ("circuit_breaker_memory", 1_732_242_137),
+        ] {
+            store
+                .insert(&api_test_incident(event_type, timestamp))
+                .await
+                .unwrap();
+        }
+
+        let app_state = app_state_with_incident_store(Arc::clone(&store));
+        let (status, json) =
+            get_incidents_json(app_state, "/incidents?event_type=manual_kill&limit=10").await;
+
+        assert_eq!(status, StatusCode::OK);
+        let incidents = json.as_array().expect("incidents response is an array");
+        assert_eq!(incidents.len(), 1, "event_type filter must be applied");
+        assert_eq!(incidents[0]["event_type"], "manual_kill");
+    }
+
+    #[tokio::test]
+    async fn incidents_route_applies_analyzed_filter_before_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            cognitod::IncidentStore::new(dir.path().join("incidents.db"))
+                .await
+                .unwrap(),
+        );
+
+        let analyzed_id = store
+            .insert(&api_test_incident("circuit_breaker_cpu", 1_732_242_100))
+            .await
+            .unwrap();
+        store
+            .add_llm_analysis(
+                analyzed_id,
+                &cognitod::incidents::AnalysisOutcome {
+                    raw_response: "older analyzed incident".to_string(),
+                    investigation: None,
+                    parse_error: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        for offset in 1..=20 {
+            store
+                .insert(&api_test_incident(
+                    "circuit_breaker_cpu",
+                    1_732_242_100 + offset,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let app_state = app_state_with_incident_store(store);
+        let (status, json) =
+            get_incidents_json(app_state, "/incidents?analyzed=true&limit=10").await;
+
+        assert_eq!(status, StatusCode::OK);
+        let incidents = json.as_array().expect("incidents response is an array");
+        assert_eq!(
+            incidents.len(),
+            1,
+            "analyzed filtering must happen before applying the result limit"
+        );
+        assert_eq!(incidents[0]["llm_analysis"], "older analyzed incident");
+    }
+
+    #[tokio::test]
+    async fn incidents_route_rejects_nonpositive_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            cognitod::IncidentStore::new(dir.path().join("incidents.db"))
+                .await
+                .unwrap(),
+        );
+        let app_state = app_state_with_incident_store(store);
+
+        for uri in ["/incidents?limit=-1", "/incidents?limit=0"] {
+            let response = super::all_routes(Arc::clone(&app_state))
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{uri} must not reach SQLite as an unbounded limit"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn incidents_route_clamps_huge_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            cognitod::IncidentStore::new(dir.path().join("incidents.db"))
+                .await
+                .unwrap(),
+        );
+
+        for idx in 0..(MAX_INCIDENT_LIMIT + 1) {
+            store
+                .insert(&api_test_incident(
+                    "circuit_breaker_cpu",
+                    1_732_242_135 + idx,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let app_state = app_state_with_incident_store(store);
+        let (status, json) = get_incidents_json(app_state, "/incidents?limit=999999").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json.as_array()
+                .expect("incidents response is an array")
+                .len(),
+            MAX_INCIDENT_LIMIT as usize,
+            "oversized limits must be bounded before SQLite sees them"
         );
     }
 

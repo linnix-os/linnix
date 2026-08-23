@@ -22,6 +22,12 @@ linnix_ringbuf_overflows_total 1
 # HELP linnix_rate_limited_total Events skipped due to configured rate caps.
 # TYPE linnix_rate_limited_total counter
 linnix_rate_limited_total 0
+# HELP linnix_listener_queue_depth Current BPF listener event queue depth.
+# TYPE linnix_listener_queue_depth gauge
+linnix_listener_queue_depth 0
+# HELP linnix_listener_queue_dropped_total Events dropped because the BPF listener queue was full.
+# TYPE linnix_listener_queue_dropped_total counter
+linnix_listener_queue_dropped_total 0
 # HELP linnix_perf_poll_errors_total Perf buffer polling errors.
 # TYPE linnix_perf_poll_errors_total counter
 linnix_perf_poll_errors_total 1
