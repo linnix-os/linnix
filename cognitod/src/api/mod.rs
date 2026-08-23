@@ -2438,7 +2438,11 @@ async fn handle_slack_interaction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::enforcement::{ActionStatus, ActionType, EnforcementQueue};
+    use crate::enforcement::{
+        ActionStatus, ActionType, EnforcementQueue, ProcessCgroupIdentity, ProcessIdentity,
+        ProcessIdentityError, ProcessIdentityProvider, ProcessNamespaceIdentity, SignalHandle,
+        SignalSender,
+    };
     use crate::insights::InsightStore;
     use crate::runtime::probes::{ProbeState, RssProbeMode};
     use crate::{PERCENT_MILLI_UNKNOWN, ProcessEvent};
@@ -2448,6 +2452,56 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use tower::ServiceExt;
+
+    #[derive(Debug)]
+    struct ApiTestIdentityProvider;
+
+    impl ProcessIdentityProvider for ApiTestIdentityProvider {
+        fn identity_for_pid(&self, pid: u32) -> Result<ProcessIdentity, ProcessIdentityError> {
+            Ok(ProcessIdentity {
+                pid,
+                start_time_ticks: 42,
+                stat_comm: "api-test-process".to_string(),
+                cgroups: vec![ProcessCgroupIdentity {
+                    hierarchy: 0,
+                    controllers: vec![],
+                    pathname: "/api-test.slice".to_string(),
+                }],
+                pid_namespaces: vec![ProcessNamespaceIdentity {
+                    namespace_type: "pid".to_string(),
+                    device_id: 1,
+                    inode: 2,
+                }],
+                captured_at_ms: 0,
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct ApiTestSignalSender;
+
+    impl SignalSender for ApiTestSignalSender {
+        fn open_handle(&self, _pid: u32) -> Result<Box<dyn SignalHandle>, std::io::Error> {
+            Ok(Box::new(ApiTestSignalHandle))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ApiTestSignalHandle;
+
+    impl SignalHandle for ApiTestSignalHandle {
+        fn send_signal(&self, _signal: i32) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+    }
+
+    fn test_enforcement_queue(ttl_secs: u64) -> EnforcementQueue {
+        EnforcementQueue::new_with_components(
+            ttl_secs,
+            Arc::new(ApiTestIdentityProvider),
+            Arc::new(ApiTestSignalSender),
+        )
+    }
 
     fn minimal_app_state(
         auth_token: Option<String>,
@@ -3155,7 +3209,7 @@ mod tests {
 
     #[tokio::test]
     async fn valid_slack_signature_bypasses_bearer_auth_and_approves_action() {
-        let enforcement = Arc::new(EnforcementQueue::new(300));
+        let enforcement = Arc::new(test_enforcement_queue(300));
         let action_id = propose_test_action(&enforcement).await;
         let app_state = minimal_app_state(
             Some("api-secret".to_string()),
@@ -3182,7 +3236,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_slack_signature_is_rejected_before_action_processing() {
-        let enforcement = Arc::new(EnforcementQueue::new(300));
+        let enforcement = Arc::new(test_enforcement_queue(300));
         let action_id = propose_test_action(&enforcement).await;
         let app_state = minimal_app_state(
             Some("api-secret".to_string()),
@@ -3203,7 +3257,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_slack_signature_is_rejected_before_action_processing() {
-        let enforcement = Arc::new(EnforcementQueue::new(300));
+        let enforcement = Arc::new(test_enforcement_queue(300));
         let action_id = propose_test_action(&enforcement).await;
         let app_state = minimal_app_state(
             Some("api-secret".to_string()),
@@ -3241,7 +3295,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_slack_signature_is_rejected_before_action_processing() {
-        let enforcement = Arc::new(EnforcementQueue::new(300));
+        let enforcement = Arc::new(test_enforcement_queue(300));
         let action_id = propose_test_action(&enforcement).await;
         let app_state = minimal_app_state(
             Some("api-secret".to_string()),
