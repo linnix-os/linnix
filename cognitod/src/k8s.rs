@@ -48,13 +48,37 @@ pub struct K8sContext {
     pub node_name: String,
 }
 
+enum K8sTlsConfig {
+    SystemRoots,
+    CustomCa(Vec<u8>),
+    InsecureSkipVerify,
+}
+
+fn env_flag_is_true(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| flag_value_is_true(&value))
+}
+
+fn flag_value_is_true(value: &str) -> bool {
+    value.eq_ignore_ascii_case("true")
+}
+
+fn manual_tls_config_from_env() -> Option<K8sTlsConfig> {
+    if let Ok(ca_path) = std::env::var("K8S_CA_CERT_PATH") {
+        std::fs::read(ca_path).ok().map(K8sTlsConfig::CustomCa)
+    } else if env_flag_is_true("K8S_INSECURE_SKIP_VERIFY") {
+        Some(K8sTlsConfig::InsecureSkipVerify)
+    } else {
+        Some(K8sTlsConfig::SystemRoots)
+    }
+}
+
 impl K8sContext {
     pub fn new() -> Option<Arc<Self>> {
-        let (api_url, token, ca_cert) = if let (Ok(url), Ok(t)) =
+        let (api_url, token, tls_config) = if let (Ok(url), Ok(t)) =
             (std::env::var("K8S_API_URL"), std::env::var("K8S_TOKEN"))
         {
             // Local/Manual mode
-            (url, t, None)
+            (url, t, manual_tls_config_from_env()?)
         } else {
             // In-cluster mode
             let host = std::env::var("KUBERNETES_SERVICE_HOST").ok()?;
@@ -63,7 +87,7 @@ impl K8sContext {
             let t = std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/token")
                 .ok()?;
             let ca = std::fs::read("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt").ok()?;
-            (url, t, Some(ca))
+            (url, t, K8sTlsConfig::CustomCa(ca))
         };
 
         // Try to get node name from env (downward API) or hostname
@@ -73,11 +97,17 @@ impl K8sContext {
             .unwrap_or_else(|| "localhost".to_string());
 
         let mut builder = Client::builder();
-        if let Some(ca) = ca_cert {
-            builder = builder.add_root_certificate(reqwest::Certificate::from_pem(&ca).ok()?);
-        } else {
-            // In local mode, we might be using self-signed certs (like kind)
-            builder = builder.danger_accept_invalid_certs(true);
+        match tls_config {
+            K8sTlsConfig::SystemRoots => {}
+            K8sTlsConfig::CustomCa(ca) => {
+                builder = builder.add_root_certificate(reqwest::Certificate::from_pem(&ca).ok()?);
+            }
+            K8sTlsConfig::InsecureSkipVerify => {
+                warn!(
+                    "[k8s] K8S_INSECURE_SKIP_VERIFY=true set; accepting invalid Kubernetes API certificates"
+                );
+                builder = builder.danger_accept_invalid_certs(true);
+            }
         }
 
         let client = builder.build().ok()?;
@@ -302,5 +332,14 @@ mod tests {
             "\"medium\""
         );
         assert_eq!(serde_json::to_string(&Priority::Low).unwrap(), "\"low\"");
+    }
+
+    #[test]
+    fn insecure_skip_verify_requires_literal_true() {
+        assert!(flag_value_is_true("true"));
+        assert!(flag_value_is_true("TRUE"));
+        assert!(!flag_value_is_true("1"));
+        assert!(!flag_value_is_true("yes"));
+        assert!(!flag_value_is_true(""));
     }
 }

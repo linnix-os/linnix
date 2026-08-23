@@ -165,12 +165,22 @@ pub struct PsiMonitor {
     context: Arc<ContextStore>,
     incident_store: Option<Arc<crate::incidents::IncidentStore>>,
     sink: Arc<AttributionSink>,
+    /// Container-level histories keyed by container id. PSI counters are
+    /// emitted by container cgroups; pod-level stall windows are derived by
+    /// summing same-scan container deltas after each container cursor advances.
     history: HashMap<String, VecDeque<PsiSnapshot>>,
     pressure_start_time: HashMap<String, Instant>,
     sustained_pressure_duration: Duration,
     cgroup_root: PathBuf,
     /// When set, `run` stops after this many scans instead of looping forever.
     max_iterations: Option<u64>,
+}
+
+struct PodPsiDelta {
+    pod_name: String,
+    namespace: String,
+    delta_stall_us: u64,
+    has_previous_sample: bool,
 }
 
 impl PsiMonitor {
@@ -216,6 +226,8 @@ impl PsiMonitor {
             let psi_files = find_psi_files(&base_path);
             debug!("[psi] scanning {} cgroups", psi_files.len());
 
+            let mut pod_deltas: HashMap<String, PodPsiDelta> = HashMap::new();
+
             for path in psi_files {
                 if let Some(container_id) = extract_container_id(&path)
                     && let Some(meta) = self.k8s_ctx.get_metadata(&container_id)
@@ -223,6 +235,14 @@ impl PsiMonitor {
                     && let Ok(snapshot) = parse_psi_file(&content)
                 {
                     let key = format!("{}/{}", meta.namespace, meta.pod_name);
+                    let pod_delta = pod_deltas
+                        .entry(key.clone())
+                        .or_insert_with(|| PodPsiDelta {
+                            pod_name: meta.pod_name.clone(),
+                            namespace: meta.namespace.clone(),
+                            delta_stall_us: 0,
+                            has_previous_sample: false,
+                        });
 
                     self.sink.metrics().record_victim_pressure(
                         &meta.namespace,
@@ -231,8 +251,11 @@ impl PsiMonitor {
                         snapshot.some_total,
                     );
 
-                    // Get or create history for this pod
-                    let hist = self.history.entry(key.clone()).or_default();
+                    // Get or create history for this container. Pod-level
+                    // deltas are aggregated after every container's own
+                    // cursor has been advanced, so sibling containers never
+                    // compare their cumulative counters against each other.
+                    let hist = self.history.entry(container_id).or_default();
 
                     // Calculate delta if we have previous snapshot
                     let delta_stall_opt = hist
@@ -247,97 +270,108 @@ impl PsiMonitor {
                         hist.pop_front();
                     }
 
-                    // Process delta outside of history borrow
-                    if let Some(delta_stall) = delta_stall_opt
-                        && delta_stall > 0
-                    {
-                        info!(
-                            "[psi] {}/{} delta_stall_us={}",
-                            meta.namespace, meta.pod_name, delta_stall
-                        );
+                    if let Some(delta_stall) = delta_stall_opt {
+                        pod_delta.has_previous_sample = true;
+                        pod_delta.delta_stall_us =
+                            pod_delta.delta_stall_us.saturating_add(delta_stall);
+                    }
+                }
+            }
 
-                        // If stall exceeds threshold, check for sustained pressure
-                        if delta_stall >= STALL_THRESHOLD_US {
-                            let now = Instant::now();
-                            let start_time =
-                                *self.pressure_start_time.entry(key.clone()).or_insert(now);
+            for (key, pod_delta) in pod_deltas {
+                if let Some(delta_stall) = pod_delta
+                    .has_previous_sample
+                    .then_some(pod_delta.delta_stall_us)
+                    && delta_stall > 0
+                {
+                    info!(
+                        "[psi] {}/{} delta_stall_us={}",
+                        pod_delta.namespace, pod_delta.pod_name, delta_stall
+                    );
 
-                            // Check if pressure is sustained for > configured duration
-                            if now.duration_since(start_time) >= self.sustained_pressure_duration {
+                    // If stall exceeds threshold, check for sustained pressure
+                    if delta_stall >= STALL_THRESHOLD_US {
+                        let now = Instant::now();
+                        let start_time =
+                            *self.pressure_start_time.entry(key.clone()).or_insert(now);
+
+                        // Check if pressure is sustained for > configured duration
+                        if now.duration_since(start_time) >= self.sustained_pressure_duration {
+                            info!(
+                                "[psi] Sustained pressure detected for {}/{} (>{:?})",
+                                pod_delta.namespace,
+                                pod_delta.pod_name,
+                                self.sustained_pressure_duration
+                            );
+
+                            // Collect metrics
+                            let consumers = self.get_concurrent_cpu_consumers();
+                            let (fork_counts, short_job_counts) = self
+                                .context
+                                .get_pod_activity_window(self.sustained_pressure_duration);
+
+                            let stall_event = StallEvent {
+                                event_id: uuid::Uuid::new_v4().to_string(),
+                                victim_pod: pod_delta.pod_name.clone(),
+                                victim_namespace: pod_delta.namespace.clone(),
+                                stall_delta_us: delta_stall,
+                                timestamp: now,
+                                concurrent_consumers: consumers.clone(),
+                                fork_counts,
+                                short_job_counts,
+                            };
+
+                            info!(
+                                "[psi] StallEvent: {}/{} stalled {}us with {} concurrent consumers",
+                                stall_event.victim_namespace,
+                                stall_event.victim_pod,
+                                stall_event.stall_delta_us,
+                                consumers.len()
+                            );
+
+                            // Calculate blame attributions
+                            let attributions = calculate_blame_attributions(&stall_event);
+
+                            // Log top 3 attributions
+                            for (i, attr) in attributions.iter().take(3).enumerate() {
                                 info!(
-                                    "[psi] Sustained pressure detected for {}/{} (>{:?})",
-                                    meta.namespace, meta.pod_name, self.sustained_pressure_duration
+                                    "[psi]   blame {}: {}/{} score={:.3} (cpu={:.2}, forks={}, short={})",
+                                    i + 1,
+                                    attr.offender_namespace,
+                                    attr.offender_pod,
+                                    attr.blame_score,
+                                    attr.cpu_share,
+                                    attr.fork_count,
+                                    attr.short_job_count
                                 );
+                            }
 
-                                // Collect metrics
-                                let consumers = self.get_concurrent_cpu_consumers();
-                                let (fork_counts, short_job_counts) = self
-                                    .context
-                                    .get_pod_activity_window(self.sustained_pressure_duration);
+                            // Structured events, alerts and metrics all
+                            // leave through here.
+                            self.sink.emit(&attributions);
 
-                                let stall_event = StallEvent {
-                                    event_id: uuid::Uuid::new_v4().to_string(),
-                                    victim_pod: meta.pod_name.clone(),
-                                    victim_namespace: meta.namespace.clone(),
-                                    stall_delta_us: delta_stall,
-                                    timestamp: now,
-                                    concurrent_consumers: consumers.clone(),
-                                    fork_counts,
-                                    short_job_counts,
-                                };
-
-                                info!(
-                                    "[psi] StallEvent: {}/{} stalled {}us with {} concurrent consumers",
-                                    stall_event.victim_namespace,
-                                    stall_event.victim_pod,
-                                    stall_event.stall_delta_us,
-                                    consumers.len()
-                                );
-
-                                // Calculate blame attributions
-                                let attributions = calculate_blame_attributions(&stall_event);
-
-                                // Log top 3 attributions
-                                for (i, attr) in attributions.iter().take(3).enumerate() {
-                                    info!(
-                                        "[psi]   blame {}: {}/{} score={:.3} (cpu={:.2}, forks={}, short={})",
-                                        i + 1,
-                                        attr.offender_namespace,
-                                        attr.offender_pod,
-                                        attr.blame_score,
-                                        attr.cpu_share,
-                                        attr.fork_count,
-                                        attr.short_job_count
-                                    );
-                                }
-
-                                // Structured events, alerts and metrics all
-                                // leave through here.
-                                self.sink.emit(&attributions);
-
-                                // Persist to database if available
-                                if let Some(ref store) = self.incident_store {
-                                    for attr in &attributions {
-                                        if let Err(e) = store.insert_stall_attribution(attr).await {
-                                            warn!("[psi] Failed to persist attribution: {}", e);
-                                        }
+                            // Persist to database if available
+                            if let Some(ref store) = self.incident_store {
+                                for attr in &attributions {
+                                    if let Err(e) = store.insert_stall_attribution(attr).await {
+                                        warn!("[psi] Failed to persist attribution: {}", e);
                                     }
                                 }
-
-                                // Reset start time to avoid spamming every second after 15s
-                                // Or keep it to report continuous pressure?
-                                // Let's reset to require another 15s block, or just update start time?
-                                // For now, let's just update start time to now to report every 15s if it continues.
-                                self.pressure_start_time.insert(key.clone(), now);
                             }
-                        } else {
-                            // Pressure dropped, reset timer
-                            self.pressure_start_time.remove(&key);
+
+                            // Reset start time to avoid spamming every second after 15s
+                            // Or keep it to report continuous pressure?
+                            // Let's reset to require another 15s block, or just update start time?
+                            // For now, let's just update start time to now to report every 15s if it continues.
+                            self.pressure_start_time.insert(key.clone(), now);
                         }
                     } else {
-                        // No pressure, reset timer
+                        // Pressure dropped, reset timer
                         self.pressure_start_time.remove(&key);
                     }
+                } else {
+                    // No pressure, reset timer
+                    self.pressure_start_time.remove(&key);
                 }
             }
 
