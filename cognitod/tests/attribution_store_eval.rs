@@ -215,7 +215,8 @@ async fn upgrading_an_old_database_creates_required_columns_and_indexes() {
                 offender_namespace TEXT NOT NULL,
                 stall_us INTEGER NOT NULL,
                 blame_score REAL NOT NULL,
-                timestamp INTEGER NOT NULL
+                timestamp INTEGER NOT NULL,
+                CPU_SHARE REAL DEFAULT 0.0
             )
             "#,
         )
@@ -248,7 +249,9 @@ async fn upgrading_an_old_database_creates_required_columns_and_indexes() {
         "event_id",
     ] {
         assert!(
-            attribution_columns.iter().any(|column| column == expected),
+            attribution_columns
+                .iter()
+                .any(|column| column.eq_ignore_ascii_case(expected)),
             "stall_attributions migration must add {expected}"
         );
     }

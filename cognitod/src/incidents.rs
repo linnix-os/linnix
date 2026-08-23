@@ -783,7 +783,7 @@ async fn column_exists(pool: &SqlitePool, table: &str, column: &str) -> Result<b
 
     Ok(rows
         .iter()
-        .any(|row| row.get::<String, _>("name") == column))
+        .any(|row| row.get::<String, _>("name").eq_ignore_ascii_case(column)))
 }
 
 /// Statistics about stored incidents
