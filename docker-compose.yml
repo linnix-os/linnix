@@ -61,6 +61,7 @@ services:
       - RUST_LOG=info
       - LINNIX_CONFIG=/etc/linnix/linnix.toml
       - LINNIX_API_TOKEN=${LINNIX_API_TOKEN:-}
+      - LINNIX_SLACK_SIGNING_SECRET=${LINNIX_SLACK_SIGNING_SECRET:-}
 
     # Demo mode: Run all demo scenarios on startup
     # Uncomment the line below to enable demo mode
