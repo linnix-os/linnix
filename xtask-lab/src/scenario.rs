@@ -147,6 +147,7 @@ impl ScenarioManifest {
             },
             victim: self.victim.clone(),
             victim_stall_us: self.victim_stall_us,
+            cell: None,
             candidates,
             pod_graph: Vec::new(),
             diagnosis: None,

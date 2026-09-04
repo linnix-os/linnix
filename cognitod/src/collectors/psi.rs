@@ -8,8 +8,9 @@ use tokio::time::sleep;
 use walkdir::WalkDir;
 
 use crate::attribution::AttributionSink;
+use crate::config::EpisodeCaptureConfig;
 use crate::context::ContextStore;
-use crate::episode::{CandidateWindow, PodRef};
+use crate::episode::{CandidateWindow, Episode, PodRef};
 use crate::k8s::K8sContext;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -441,6 +442,15 @@ pub struct PsiMonitor {
     cgroup_root: PathBuf,
     /// When set, `run` stops after this many scans instead of looping forever.
     max_iterations: Option<u64>,
+    /// When set, every `StallEvent` is also written to disk as a `VmCapture`
+    /// episode -- the Phase 3 kernel/topology matrix's capture path. `None`
+    /// on every real customer fleet; only a matrix VM's config turns this on.
+    episode_capture: Option<EpisodeCaptureConfig>,
+    /// The kernel/topology cell stamped onto each captured episode. Detected
+    /// once at construction, since none of it changes while the daemon runs;
+    /// only computed when `episode_capture` is set, to keep the common path
+    /// free of the `k3s --version` subprocess call.
+    cell: Option<crate::episode::Cell>,
 }
 
 struct PodPsiDelta {
@@ -487,6 +497,8 @@ impl PsiMonitor {
             history_capacity: compute_history_capacity(sustained_pressure_seconds),
             cgroup_root: PathBuf::from("/sys/fs/cgroup"),
             max_iterations: None,
+            episode_capture: None,
+            cell: None,
         }
     }
 
@@ -494,6 +506,18 @@ impl PsiMonitor {
     /// loop can be driven against a fixture tree rather than the live kernel.
     pub fn with_cgroup_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.cgroup_root = root.into();
+        self
+    }
+
+    /// Turns on episode capture: every `StallEvent` from here on is also
+    /// written to `config.output_dir` as a `VmCapture` episode. No-op (aside
+    /// from detecting the cell once) when `config.enabled` is false, so a
+    /// caller can pass `config.episode_capture` unconditionally.
+    pub fn with_episode_capture(mut self, config: EpisodeCaptureConfig) -> Self {
+        if config.enabled {
+            self.cell = Some(crate::cell::detect_cell());
+            self.episode_capture = Some(config);
+        }
         self
     }
 
@@ -840,6 +864,10 @@ impl PsiMonitor {
                             // leave through here.
                             self.sink.emit(&attributions);
 
+                            if let Some(capture) = &self.episode_capture {
+                                self.write_episode_capture(capture, &stall_event);
+                            }
+
                             // Persist to database if available
                             if let Some(ref store) = self.incident_store {
                                 for attr in &attributions {
@@ -888,6 +916,33 @@ impl PsiMonitor {
             }
 
             sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    /// Writes `stall_event` to `capture.output_dir` as a `VmCapture` episode,
+    /// one JSON file per stall event named `<episode_id>.json`. Best-effort:
+    /// a write failure is logged, never propagated, since the scan loop must
+    /// keep attributing stalls whether or not the matrix's capture disk is
+    /// healthy.
+    fn write_episode_capture(&self, capture: &EpisodeCaptureConfig, stall_event: &StallEvent) {
+        let episode = Episode::from_capture(stall_event, self.cell.clone());
+        let path = Path::new(&capture.output_dir).join(format!("{}.json", episode.episode_id));
+
+        if let Err(e) = std::fs::create_dir_all(&capture.output_dir) {
+            warn!(
+                "[psi] failed to create episode capture dir {}: {e}",
+                capture.output_dir
+            );
+            return;
+        }
+
+        match serde_json::to_vec_pretty(&episode) {
+            Ok(bytes) => {
+                if let Err(e) = std::fs::write(&path, bytes) {
+                    warn!("[psi] failed to write captured episode {path:?}: {e}");
+                }
+            }
+            Err(e) => warn!("[psi] failed to serialize captured episode: {e}"),
         }
     }
 

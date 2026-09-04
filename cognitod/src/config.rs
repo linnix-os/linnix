@@ -213,6 +213,8 @@ pub struct Config {
     #[serde(default)]
     pub psi: PsiConfig,
     #[serde(default)]
+    pub episode_capture: EpisodeCaptureConfig,
+    #[serde(default)]
     pub telemetry: TelemetrySettings,
     /// Top-level sections/keys no field matches. Captured so `--check-config`
     /// can name them; a typo'd `[reasner]` is otherwise indistinguishable from
@@ -661,6 +663,32 @@ impl Default for PsiConfig {
 
 fn default_psi_sustained_pressure_seconds() -> u64 {
     15
+}
+
+/// Off by default: writing an episode to disk for every stall event is only
+/// wanted on a Phase 3 kernel/topology matrix VM, never a real customer
+/// fleet, where it would mean an unbounded write path nobody asked for.
+#[derive(Debug, Deserialize, Clone)]
+pub struct EpisodeCaptureConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Directory episode JSON files are written to, one file per stall
+    /// event, named `<episode_id>.json`.
+    #[serde(default = "default_episode_capture_output_dir")]
+    pub output_dir: String,
+}
+
+impl Default for EpisodeCaptureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            output_dir: default_episode_capture_output_dir(),
+        }
+    }
+}
+
+fn default_episode_capture_output_dir() -> String {
+    "/var/lib/linnix/episodes".to_string()
 }
 
 fn default_attribution_threshold_ms() -> u64 {
