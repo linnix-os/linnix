@@ -4115,6 +4115,13 @@ name = "xtask"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+]
+
+[[package]]
+name = "xtask-lab"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "cognitod",
  "serde",
  "serde_json",

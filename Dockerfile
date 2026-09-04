@@ -31,6 +31,7 @@ COPY cognitod/Cargo.toml ./cognitod/
 COPY linnix-cli/Cargo.toml ./linnix-cli/
 COPY linnix-reasoner/Cargo.toml ./linnix-reasoner/
 COPY xtask/Cargo.toml ./xtask/
+COPY xtask-lab/Cargo.toml ./xtask-lab/
 
 # Copy only workspace source trees needed for target discovery and build.
 COPY cognitod/src ./cognitod/src
@@ -39,6 +40,7 @@ COPY linnix-ai-ebpf/linnix-ai-ebpf-ebpf/src ./linnix-ai-ebpf/linnix-ai-ebpf-ebpf
 COPY linnix-cli/src ./linnix-cli/src
 COPY linnix-reasoner/src ./linnix-reasoner/src
 COPY xtask/src ./xtask/src
+COPY xtask-lab/src ./xtask-lab/src
 
 # Build eBPF programs.
 # Use the xtask entrypoint so this shares one build path (and one set of
@@ -63,6 +65,7 @@ COPY cognitod/Cargo.toml ./cognitod/
 COPY linnix-cli/Cargo.toml ./linnix-cli/
 COPY linnix-reasoner/Cargo.toml ./linnix-reasoner/
 COPY xtask/Cargo.toml ./xtask/
+COPY xtask-lab/Cargo.toml ./xtask-lab/
 
 # Copy only workspace source trees needed for target discovery and build.
 COPY cognitod/src ./cognitod/src
@@ -71,6 +74,7 @@ COPY linnix-ai-ebpf/linnix-ai-ebpf-ebpf/src ./linnix-ai-ebpf/linnix-ai-ebpf-ebpf
 COPY linnix-cli/src ./linnix-cli/src
 COPY linnix-reasoner/src ./linnix-reasoner/src
 COPY xtask/src ./xtask/src
+COPY xtask-lab/src ./xtask-lab/src
 
 # Build release binaries with demo feature
 RUN cargo build --release -p cognitod

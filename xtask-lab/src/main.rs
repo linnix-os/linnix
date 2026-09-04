@@ -1,4 +1,13 @@
-//! `cargo xtask lab` -- the Incident Lab CLI.
+//! `cargo lab` -- the Incident Lab CLI.
+//!
+//! A separate binary from `xtask` on purpose: `xtask build-ebpf` runs under
+//! the pinned eBPF nightly toolchain in CI, and `cargo xtask <cmd>` compiles
+//! the whole `xtask` binary before dispatching -- so if this command lived
+//! there, that nightly (older than `cognitod`'s MSRV-adjacent language
+//! features -- let-chains, `is_multiple_of`) would have to compile all of
+//! `cognitod` and fail before `build-ebpf` ever got a chance to override the
+//! toolchain for its own subprocess. Splitting the crate keeps `xtask`
+//! dependency-light and lets this one link against `cognitod` freely.
 //!
 //! `replay` and `score` are in-process only: they read episode JSON, run it
 //! back through `calculate_blame_attributions`, and compare the result
@@ -9,7 +18,7 @@
 //! only fills in `diagnosis.summary`/`suggested_next_step`.
 //!
 //! `run` (materializing episodes from scenario manifests) and the CI
-//! regression gate are later Incident Lab slices; this module only owns
+//! regression gate are later Incident Lab slices; this binary only owns
 //! `replay` and `score` against episodes that already exist on disk.
 
 use std::path::{Path, PathBuf};
@@ -20,6 +29,27 @@ use cognitod::collectors::psi::calculate_blame_attributions;
 use cognitod::episode::Episode;
 use cognitod::schema::InsightReason;
 use serde::Serialize;
+
+fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+
+    match args.get(1).map(String::as_str) {
+        Some("replay") => {
+            let path = args
+                .get(2)
+                .context("usage: cargo lab replay <episode.json>")?;
+            run_replay(&PathBuf::from(path))
+        }
+        Some("score") => {
+            let path = args
+                .get(2)
+                .context("usage: cargo lab score <episode.json|dir>")?;
+            run_score(&PathBuf::from(path))
+        }
+        Some(other) => bail!("unknown lab subcommand: {other}"),
+        None => bail!("usage: cargo lab <replay|score> <path>"),
+    }
+}
 
 /// What replay predicted for one episode: the top-ranked offender and reason,
 /// or nothing if no offender cleared the reporting bar.
@@ -145,14 +175,14 @@ fn load_episodes_from_dir(dir: &Path) -> Result<Vec<Episode>> {
     paths.iter().map(|p| load_episode(p)).collect()
 }
 
-pub fn run_replay(path: &Path) -> Result<()> {
+fn run_replay(path: &Path) -> Result<()> {
     let episode = load_episode(path)?;
     let prediction = replay(&episode);
     println!("{}", serde_json::to_string_pretty(&prediction)?);
     Ok(())
 }
 
-pub fn run_score(path: &Path) -> Result<()> {
+fn run_score(path: &Path) -> Result<()> {
     let episodes = if path.is_dir() {
         load_episodes_from_dir(path)?
     } else {

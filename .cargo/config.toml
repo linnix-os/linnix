@@ -1,5 +1,9 @@
 [alias]
 xtask = "run --package xtask --"
+# The Incident Lab CLI lives in its own crate, not xtask itself -- see the
+# module doc in xtask-lab/src/main.rs for why (xtask must stay buildable
+# under the pinned eBPF nightly toolchain, which cognitod is not).
+lab = "run --package xtask-lab --"
 
 # Applies to `cargo xtask build-ebpf`, which runs from the workspace root.
 # Cargo reads .cargo/config.toml from the invocation CWD upward, so the config
