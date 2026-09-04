@@ -337,6 +337,19 @@ fn onset_offset_ms(now: Instant, start: Instant) -> i64 {
 /// the victim (its own retained signal series), and one per offender still
 /// tracked in `consumer_busy_since`. Free-standing and pure so it can be
 /// tested without driving the scan loop.
+/// An offender candidate's identity plus the three signals
+/// `Episode::to_stall_event` reads back via `candidate_signal` -- an episode
+/// captured from a real `StallEvent` must replay to the same attribution,
+/// and that equality only holds if these land in the candidate's window
+/// rather than the empty windows this used to leave behind.
+struct OffenderSignal {
+    pod: PodRef,
+    onset_ms: Option<i64>,
+    cpu_percent: f32,
+    fork_count: Option<u64>,
+    short_job_count: Option<u64>,
+}
+
 fn build_candidate_windows(
     victim: PodRef,
     victim_owner_kind: Option<String>,
@@ -344,7 +357,7 @@ fn build_candidate_windows(
     victim_pre_window: BTreeMap<String, Vec<f64>>,
     victim_onset_ms: Option<i64>,
     sample_interval_ms: u64,
-    offenders: &[(PodRef, Option<i64>)],
+    offenders: &[OffenderSignal],
 ) -> Vec<CandidateWindow> {
     let mut candidates = Vec::with_capacity(1 + offenders.len());
     candidates.push(CandidateWindow {
@@ -356,15 +369,23 @@ fn build_candidate_windows(
         sample_interval_ms,
         first_deviation_offset_ms: victim_onset_ms,
     });
-    for (pod, onset_ms) in offenders.iter().take(MAX_CANDIDATE_OFFENDERS) {
+    for offender in offenders.iter().take(MAX_CANDIDATE_OFFENDERS) {
+        let mut pre_window: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+        pre_window.insert("cpu_percent".to_string(), vec![offender.cpu_percent as f64]);
+        if let Some(fork_count) = offender.fork_count {
+            pre_window.insert("fork_count".to_string(), vec![fork_count as f64]);
+        }
+        if let Some(short_job_count) = offender.short_job_count {
+            pre_window.insert("short_job_count".to_string(), vec![short_job_count as f64]);
+        }
         candidates.push(CandidateWindow {
-            pod: pod.clone(),
+            pod: offender.pod.clone(),
             owner_kind: None,
             owner_name: None,
-            pre_window: BTreeMap::new(),
+            pre_window,
             post_window: BTreeMap::new(),
             sample_interval_ms,
-            first_deviation_offset_ms: *onset_ms,
+            first_deviation_offset_ms: offender.onset_ms,
         });
     }
     candidates
@@ -780,22 +801,68 @@ impl PsiMonitor {
                                     .unwrap_or_default(),
                             );
 
-                            let offenders: Vec<(PodRef, Option<i64>)> = consumers
-                                .iter()
-                                .filter(|c| format!("{}/{}", c.namespace, c.pod) != key)
-                                .map(|c| {
-                                    let consumer_key = format!("{}/{}", c.namespace, c.pod);
-                                    let onset_ms = self
-                                        .consumer_busy_since
-                                        .get(&consumer_key)
-                                        .map(|start| onset_offset_ms(now, *start));
+                            // Union of everything `calculate_blame_attributions` treats
+                            // as a candidate offender -- CPU consumers, forkers, and
+                            // short-job spawners -- not just the CPU consumer list.
+                            // A pod that forks hard without being a top CPU consumer
+                            // (a fork-storm scenario) is blamed live from
+                            // `event.fork_counts` alone; leaving it out here would
+                            // silently drop it from the captured episode entirely.
+                            let mut offender_cpu: HashMap<String, (PodRef, f32)> = HashMap::new();
+                            for c in &consumers {
+                                let consumer_key = format!("{}/{}", c.namespace, c.pod);
+                                if consumer_key == key {
+                                    continue;
+                                }
+                                let entry = offender_cpu.entry(consumer_key).or_insert_with(|| {
                                     (
                                         PodRef {
                                             namespace: c.namespace.clone(),
                                             pod: c.pod.clone(),
                                         },
-                                        onset_ms,
+                                        0.0,
                                     )
+                                });
+                                entry.1 += c.cpu_percent;
+                            }
+                            let mut offender_keys: std::collections::BTreeSet<String> =
+                                offender_cpu.keys().cloned().collect();
+                            offender_keys
+                                .extend(fork_counts.keys().filter(|k| **k != key).cloned());
+                            offender_keys
+                                .extend(short_job_counts.keys().filter(|k| **k != key).cloned());
+
+                            let offenders: Vec<OffenderSignal> = offender_keys
+                                .into_iter()
+                                .map(|offender_key| {
+                                    let (pod, cpu_percent) = offender_cpu
+                                        .get(&offender_key)
+                                        .cloned()
+                                        .unwrap_or_else(|| {
+                                            let (ns, pod_name) = offender_key
+                                                .split_once('/')
+                                                .unwrap_or(("", offender_key.as_str()));
+                                            (
+                                                PodRef {
+                                                    namespace: ns.to_string(),
+                                                    pod: pod_name.to_string(),
+                                                },
+                                                0.0,
+                                            )
+                                        });
+                                    let onset_ms = self
+                                        .consumer_busy_since
+                                        .get(&offender_key)
+                                        .map(|start| onset_offset_ms(now, *start));
+                                    OffenderSignal {
+                                        pod,
+                                        onset_ms,
+                                        cpu_percent,
+                                        fork_count: fork_counts.get(&offender_key).copied(),
+                                        short_job_count: short_job_counts
+                                            .get(&offender_key)
+                                            .copied(),
+                                    }
                                 })
                                 .collect();
 
@@ -1294,20 +1361,26 @@ mod tests {
         victim_pre_window.insert("cpu_stall_us".to_string(), vec![0.0, 50_000.0, 120_000.0]);
 
         let offenders = vec![
-            (
-                PodRef {
+            OffenderSignal {
+                pod: PodRef {
                     namespace: "prod".to_string(),
                     pod: "image-resize-worker".to_string(),
                 },
-                Some(-9_000i64),
-            ),
-            (
-                PodRef {
+                onset_ms: Some(-9_000i64),
+                cpu_percent: 87.5,
+                fork_count: Some(12),
+                short_job_count: None,
+            },
+            OffenderSignal {
+                pod: PodRef {
                     namespace: "prod".to_string(),
                     pod: "sidecar-proxy".to_string(),
                 },
-                None,
-            ),
+                onset_ms: None,
+                cpu_percent: 3.0,
+                fork_count: None,
+                short_job_count: None,
+            },
         ];
 
         let candidates = build_candidate_windows(
@@ -1331,11 +1404,16 @@ mod tests {
 
         let hog_window = &candidates[1];
         assert_eq!(hog_window.pod.pod, "image-resize-worker");
-        assert!(hog_window.pre_window.is_empty());
+        assert_eq!(hog_window.pre_window.get("cpu_percent"), Some(&vec![87.5]));
+        assert_eq!(hog_window.pre_window.get("fork_count"), Some(&vec![12.0]));
         assert_eq!(hog_window.first_deviation_offset_ms, Some(-9_000));
 
         let untracked_window = &candidates[2];
         assert_eq!(untracked_window.pod.pod, "sidecar-proxy");
+        assert_eq!(
+            untracked_window.pre_window.get("cpu_percent"),
+            Some(&vec![3.0])
+        );
         assert_eq!(untracked_window.first_deviation_offset_ms, None);
     }
 
@@ -1345,15 +1423,16 @@ mod tests {
             namespace: "prod".to_string(),
             pod: "payment-api".to_string(),
         };
-        let offenders: Vec<(PodRef, Option<i64>)> = (0..MAX_CANDIDATE_OFFENDERS + 5)
-            .map(|i| {
-                (
-                    PodRef {
-                        namespace: "prod".to_string(),
-                        pod: format!("neighbour-{i}"),
-                    },
-                    None,
-                )
+        let offenders: Vec<OffenderSignal> = (0..MAX_CANDIDATE_OFFENDERS + 5)
+            .map(|i| OffenderSignal {
+                pod: PodRef {
+                    namespace: "prod".to_string(),
+                    pod: format!("neighbour-{i}"),
+                },
+                onset_ms: None,
+                cpu_percent: 0.0,
+                fork_count: None,
+                short_job_count: None,
             })
             .collect();
 
@@ -1362,6 +1441,122 @@ mod tests {
 
         // +1 for the victim's own window.
         assert_eq!(candidates.len(), MAX_CANDIDATE_OFFENDERS + 1);
+    }
+
+    /// The invariant `episode.rs`'s module doc claims: an episode captured
+    /// from a real `StallEvent` must replay in-process to the same
+    /// attribution `calculate_blame_attributions` produced live. This is
+    /// what would have caught offenders losing their `cpu_percent`/
+    /// `fork_count`/`short_job_count` series on the way into `Episode`.
+    #[test]
+    fn a_captured_episode_replays_to_the_same_attribution_as_the_live_stall_event() {
+        let victim = PodRef {
+            namespace: "prod".to_string(),
+            pod: "payment-api".to_string(),
+        };
+        let offender = PodRef {
+            namespace: "prod".to_string(),
+            pod: "fork-bomb".to_string(),
+        };
+        // Present in both the CPU-consumer list and fork_counts.
+        let cpu_offender = PodRef {
+            namespace: "prod".to_string(),
+            pod: "cpu-hog".to_string(),
+        };
+        let mut fork_counts = HashMap::new();
+        fork_counts.insert("prod/fork-bomb".to_string(), 200u64);
+        let short_job_counts = HashMap::new();
+
+        let candidates = build_candidate_windows(
+            victim.clone(),
+            Some("Deployment".to_string()),
+            Some("payment-api".to_string()),
+            BTreeMap::new(),
+            Some(-5_000),
+            1000,
+            &[
+                // Blamed live purely via fork_counts -- never appears as a
+                // CPU consumer, so `cpu_percent` defaults to 0.0 here too.
+                OffenderSignal {
+                    pod: offender.clone(),
+                    onset_ms: Some(-4_000),
+                    cpu_percent: 0.0,
+                    fork_count: Some(200),
+                    short_job_count: None,
+                },
+                OffenderSignal {
+                    pod: cpu_offender.clone(),
+                    onset_ms: Some(-3_000),
+                    cpu_percent: 60.0,
+                    fork_count: None,
+                    short_job_count: None,
+                },
+            ],
+        );
+
+        let stall_event = StallEvent {
+            event_id: "live-event".to_string(),
+            victim_pod: victim.pod.clone(),
+            victim_namespace: victim.namespace.clone(),
+            stall_delta_us: 1_500_000,
+            timestamp: Instant::now(),
+            concurrent_consumers: vec![CpuConsumer {
+                pod: cpu_offender.pod.clone(),
+                namespace: cpu_offender.namespace.clone(),
+                cpu_percent: 60.0,
+            }],
+            fork_counts,
+            short_job_counts,
+            memory_stall_delta_us: 0,
+            io_stall_delta_us: 0,
+            memory_bytes: 0,
+            io_bytes: 0,
+            memory_anon_bytes: None,
+            memory_file_bytes: None,
+            memory_slab_bytes: None,
+            memory_pgmajfault_delta: None,
+            workingset_refault_delta: None,
+            candidates,
+        };
+
+        let live_attributions = calculate_blame_attributions(&stall_event);
+        assert_eq!(
+            live_attributions.len(),
+            2,
+            "test setup should blame both the fork-only and CPU offenders"
+        );
+
+        let episode = crate::episode::Episode::from_capture(&stall_event, None);
+        let replayed = episode.to_stall_event();
+        let replayed_attributions = calculate_blame_attributions(&replayed);
+
+        // Compare on everything but `timestamp` (wall-clock-at-call, not part
+        // of the replay invariant), sorted by offender since both sides are
+        // built by iterating a HashMap in unspecified order.
+        let normalize = |attrs: &[BlameAttribution]| {
+            let mut rows: Vec<_> = attrs
+                .iter()
+                .map(|a| {
+                    (
+                        a.offender_pod.clone(),
+                        a.offender_namespace.clone(),
+                        a.blame_score,
+                        a.stall_us,
+                        a.attributed_stall_us,
+                        a.cpu_share,
+                        a.fork_count,
+                    )
+                })
+                .collect();
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            rows
+        };
+
+        assert_eq!(
+            normalize(&live_attributions),
+            normalize(&replayed_attributions),
+            "an episode captured from a live StallEvent must replay to the same attribution"
+        );
     }
 
     #[test]
