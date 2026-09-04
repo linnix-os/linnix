@@ -1,6 +1,6 @@
 use anyhow::Result;
 use log::{debug, info, warn};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,6 +9,7 @@ use walkdir::WalkDir;
 
 use crate::attribution::AttributionSink;
 use crate::context::ContextStore;
+use crate::episode::{CandidateWindow, PodRef};
 use crate::k8s::K8sContext;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -65,6 +66,16 @@ pub struct StallEvent {
     /// Snapshot of `io.stat` (rbytes + wbytes summed across devices and
     /// containers) at trigger time.
     pub io_bytes: u64,
+    /// The victim plus every offender candidate's own signal window,
+    /// captured for episode replay. The victim's `pre_window` carries its
+    /// retained cpu/memory/io stall-delta series; offender candidates carry
+    /// an empty `pre_window` (their per-tick CPU% is not retained as a full
+    /// series, only a busy-since start time, so `first_deviation_offset_ms`
+    /// is still real but there is no sample vector behind it yet).
+    /// `post_window` is always empty on every candidate here — filling it
+    /// needs deferred, multi-scan finalization after the trigger fires,
+    /// which does not exist yet. None of this feeds `calculate_blame_attributions`.
+    pub candidates: Vec<CandidateWindow>,
 }
 
 #[derive(Debug, Clone)]
@@ -208,8 +219,78 @@ fn extract_container_id(cgroup_path: &Path) -> Option<String> {
     (id.len() == 64).then(|| id.to_string())
 }
 
-const HISTORY_SIZE: usize = 10;
 const STALL_THRESHOLD_US: u64 = 100_000; // 100ms threshold for significant stall
+
+/// A candidate offender's CPU share, at or above which it counts as "busy" for
+/// onset bookkeeping (`consumer_busy_since`). Below this it is treated as idle
+/// and its busy-since start time is cleared, so a pod that dips under the bar
+/// and later spikes again gets a fresh onset rather than one dated to its
+/// first, unrelated blip.
+const CONSUMER_BUSY_CPU_PERCENT: f32 = 5.0;
+
+/// Offender candidates captured onto a `StallEvent`, beyond the victim itself.
+/// Bounds episode-capture size on a node with many concurrent consumers.
+const MAX_CANDIDATE_OFFENDERS: usize = 10;
+
+/// How many samples of history (at the scan loop's 1-second cadence) to keep
+/// per signal per pod/container.
+///
+/// Must comfortably exceed `sustained_pressure_seconds`: the trigger fires
+/// only after pressure has been sustained that long, so retained history
+/// shorter than that window can never reach back to a pre-pressure baseline
+/// -- onset detection would be structurally impossible regardless of how it's
+/// computed. The `+ 20` pads for baseline samples before the deviation
+/// starts; the `.max(15)` floors capacity even when a test or a real config
+/// sets `sustained_pressure_seconds` to 0.
+fn compute_history_capacity(sustained_pressure_seconds: u64) -> usize {
+    (sustained_pressure_seconds.max(15) as usize) * 2 + 20
+}
+
+/// Milliseconds from `start` to `now`, negated: the deviation preceded the
+/// trigger, so the offset is always zero or negative. A thin wrapper so the
+/// sign convention lives in one place and call sites read as English
+/// ("onset_offset_ms(now, pressure_start_time)") rather than repeating the
+/// negation and the cast.
+fn onset_offset_ms(now: Instant, start: Instant) -> i64 {
+    -(now.duration_since(start).as_millis() as i64)
+}
+
+/// Assembles the per-candidate windows attached to a `StallEvent`: one for
+/// the victim (its own retained signal series), and one per offender still
+/// tracked in `consumer_busy_since`. Free-standing and pure so it can be
+/// tested without driving the scan loop.
+fn build_candidate_windows(
+    victim: PodRef,
+    victim_owner_kind: Option<String>,
+    victim_owner_name: Option<String>,
+    victim_pre_window: BTreeMap<String, Vec<f64>>,
+    victim_onset_ms: Option<i64>,
+    sample_interval_ms: u64,
+    offenders: &[(PodRef, Option<i64>)],
+) -> Vec<CandidateWindow> {
+    let mut candidates = Vec::with_capacity(1 + offenders.len());
+    candidates.push(CandidateWindow {
+        pod: victim,
+        owner_kind: victim_owner_kind,
+        owner_name: victim_owner_name,
+        pre_window: victim_pre_window,
+        post_window: BTreeMap::new(),
+        sample_interval_ms,
+        first_deviation_offset_ms: victim_onset_ms,
+    });
+    for (pod, onset_ms) in offenders.iter().take(MAX_CANDIDATE_OFFENDERS) {
+        candidates.push(CandidateWindow {
+            pod: pod.clone(),
+            owner_kind: None,
+            owner_name: None,
+            pre_window: BTreeMap::new(),
+            post_window: BTreeMap::new(),
+            sample_interval_ms,
+            first_deviation_offset_ms: *onset_ms,
+        });
+    }
+    candidates
+}
 
 /// Fork count over a detection window at which an offender is considered to be
 /// forking as hard as the score can express. Beyond this the term saturates, so
@@ -250,8 +331,29 @@ pub struct PsiMonitor {
     history: HashMap<String, VecDeque<PsiSnapshot>>,
     memory_history: HashMap<String, VecDeque<PsiSnapshot>>,
     io_history: HashMap<String, VecDeque<PsiSnapshot>>,
+    /// Pod-keyed (not container-keyed) per-scan stall-delta series, retained
+    /// across scans so a trigger can attach the victim's own signal history
+    /// to its `CandidateWindow`. Pushed once per scan from the same deltas
+    /// `pod_deltas` already computes; unlike `history` above these are plain
+    /// `f64` samples (episode series are signal-agnostic vectors) rather than
+    /// cumulative `PsiSnapshot`s.
+    pod_cpu_stall_series: HashMap<String, VecDeque<f64>>,
+    pod_memory_stall_series: HashMap<String, VecDeque<f64>>,
+    pod_io_stall_series: HashMap<String, VecDeque<f64>>,
+    /// When each concurrent CPU consumer pod most recently transitioned from
+    /// idle to busy (>= `CONSUMER_BUSY_CPU_PERCENT`). Sampled once per scan,
+    /// but only while some pod's `pressure_start_time` is active -- gating
+    /// avoids walking the live process map every second on an otherwise-quiet
+    /// node. This is deliberately start-time bookkeeping rather than a full
+    /// per-tick series (see `StallEvent::candidates` doc comment): cheap, and
+    /// enough to give offender candidates a real (not fabricated) onset.
+    consumer_busy_since: HashMap<String, Instant>,
     pressure_start_time: HashMap<String, Instant>,
     sustained_pressure_duration: Duration,
+    /// Sample cap for every history map above, sized from
+    /// `sustained_pressure_duration` by `compute_history_capacity` so it can
+    /// always reach back to a pre-pressure baseline.
+    history_capacity: usize,
     cgroup_root: PathBuf,
     /// When set, `run` stops after this many scans instead of looping forever.
     max_iterations: Option<u64>,
@@ -266,6 +368,8 @@ struct PodPsiDelta {
     io_delta_stall_us: u64,
     memory_bytes: u64,
     io_bytes: u64,
+    owner_kind: Option<String>,
+    owner_name: Option<String>,
 }
 
 impl PsiMonitor {
@@ -284,8 +388,13 @@ impl PsiMonitor {
             history: HashMap::new(),
             memory_history: HashMap::new(),
             io_history: HashMap::new(),
+            pod_cpu_stall_series: HashMap::new(),
+            pod_memory_stall_series: HashMap::new(),
+            pod_io_stall_series: HashMap::new(),
+            consumer_busy_since: HashMap::new(),
             pressure_start_time: HashMap::new(),
             sustained_pressure_duration: Duration::from_secs(sustained_pressure_seconds),
+            history_capacity: compute_history_capacity(sustained_pressure_seconds),
             cgroup_root: PathBuf::from("/sys/fs/cgroup"),
             max_iterations: None,
         }
@@ -333,6 +442,8 @@ impl PsiMonitor {
                             io_delta_stall_us: 0,
                             memory_bytes: 0,
                             io_bytes: 0,
+                            owner_kind: meta.owner_kind.clone(),
+                            owner_name: meta.owner_name.clone(),
                         });
 
                     self.sink.metrics().record_victim_pressure(
@@ -357,7 +468,7 @@ impl PsiMonitor {
                     hist.push_back(snapshot);
 
                     // Keep only last N snapshots
-                    if hist.len() > HISTORY_SIZE {
+                    if hist.len() > self.history_capacity {
                         hist.pop_front();
                     }
 
@@ -387,7 +498,7 @@ impl PsiMonitor {
                                     );
                             }
                             mem_hist.push_back(mem_snapshot);
-                            if mem_hist.len() > HISTORY_SIZE {
+                            if mem_hist.len() > self.history_capacity {
                                 mem_hist.pop_front();
                             }
                         }
@@ -401,7 +512,7 @@ impl PsiMonitor {
                                     );
                             }
                             io_hist.push_back(io_snapshot);
-                            if io_hist.len() > HISTORY_SIZE {
+                            if io_hist.len() > self.history_capacity {
                                 io_hist.pop_front();
                             }
                         }
@@ -412,6 +523,31 @@ impl PsiMonitor {
                         }
 
                         pod_delta.io_bytes = pod_delta.io_bytes.saturating_add(signals.io_bytes);
+                    }
+                }
+            }
+
+            // Retain this scan's per-pod deltas as a series, keyed the same
+            // way as `pod_deltas` itself. Pushed unconditionally (including
+            // zero-delta scans) so the series' sample spacing stays uniform
+            // at the scan loop's 1-second cadence -- a series with dropped
+            // quiet samples would make `sample_interval_ms` a lie.
+            for (key, pod_delta) in &pod_deltas {
+                if !pod_delta.has_previous_sample {
+                    continue;
+                }
+                for (series, value) in [
+                    (&mut self.pod_cpu_stall_series, pod_delta.delta_stall_us),
+                    (
+                        &mut self.pod_memory_stall_series,
+                        pod_delta.memory_delta_stall_us,
+                    ),
+                    (&mut self.pod_io_stall_series, pod_delta.io_delta_stall_us),
+                ] {
+                    let samples = series.entry(key.clone()).or_default();
+                    samples.push_back(value as f64);
+                    if samples.len() > self.history_capacity {
+                        samples.pop_front();
                     }
                 }
             }
@@ -448,6 +584,61 @@ impl PsiMonitor {
                                 .context
                                 .get_pod_activity_window(self.sustained_pressure_duration);
 
+                            let mut victim_pre_window: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+                            victim_pre_window.insert(
+                                "cpu_stall_us".to_string(),
+                                self.pod_cpu_stall_series
+                                    .get(&key)
+                                    .map(|s| s.iter().copied().collect())
+                                    .unwrap_or_default(),
+                            );
+                            victim_pre_window.insert(
+                                "memory_stall_us".to_string(),
+                                self.pod_memory_stall_series
+                                    .get(&key)
+                                    .map(|s| s.iter().copied().collect())
+                                    .unwrap_or_default(),
+                            );
+                            victim_pre_window.insert(
+                                "io_stall_us".to_string(),
+                                self.pod_io_stall_series
+                                    .get(&key)
+                                    .map(|s| s.iter().copied().collect())
+                                    .unwrap_or_default(),
+                            );
+
+                            let offenders: Vec<(PodRef, Option<i64>)> = consumers
+                                .iter()
+                                .filter(|c| format!("{}/{}", c.namespace, c.pod) != key)
+                                .map(|c| {
+                                    let consumer_key = format!("{}/{}", c.namespace, c.pod);
+                                    let onset_ms = self
+                                        .consumer_busy_since
+                                        .get(&consumer_key)
+                                        .map(|start| onset_offset_ms(now, *start));
+                                    (
+                                        PodRef {
+                                            namespace: c.namespace.clone(),
+                                            pod: c.pod.clone(),
+                                        },
+                                        onset_ms,
+                                    )
+                                })
+                                .collect();
+
+                            let candidates = build_candidate_windows(
+                                PodRef {
+                                    namespace: pod_delta.namespace.clone(),
+                                    pod: pod_delta.pod_name.clone(),
+                                },
+                                pod_delta.owner_kind.clone(),
+                                pod_delta.owner_name.clone(),
+                                victim_pre_window,
+                                Some(onset_offset_ms(now, start_time)),
+                                1000,
+                                &offenders,
+                            );
+
                             let stall_event = StallEvent {
                                 event_id: uuid::Uuid::new_v4().to_string(),
                                 victim_pod: pod_delta.pod_name.clone(),
@@ -461,6 +652,7 @@ impl PsiMonitor {
                                 io_bytes: pod_delta.io_bytes,
                                 fork_counts,
                                 short_job_counts,
+                                candidates,
                             };
 
                             info!(
@@ -516,6 +708,22 @@ impl PsiMonitor {
                 } else {
                     // No pressure, reset timer
                     self.pressure_start_time.remove(&key);
+                }
+            }
+
+            // Update offender-candidate onset bookkeeping. Gated on some pod
+            // already being tracked for sustained pressure so a quiet node
+            // never pays the cost of walking the live process map -- see the
+            // `consumer_busy_since` field doc comment.
+            if !self.pressure_start_time.is_empty() {
+                let now = Instant::now();
+                for c in self.get_concurrent_cpu_consumers() {
+                    let key = format!("{}/{}", c.namespace, c.pod);
+                    if c.cpu_percent >= CONSUMER_BUSY_CPU_PERCENT {
+                        self.consumer_busy_since.entry(key).or_insert(now);
+                    } else {
+                        self.consumer_busy_since.remove(&key);
+                    }
                 }
             }
 
@@ -798,6 +1006,7 @@ mod tests {
             io_stall_delta_us: 0,
             memory_bytes: 0,
             io_bytes: 0,
+            candidates: vec![],
             fork_counts,
             short_job_counts,
         };
@@ -830,5 +1039,114 @@ mod tests {
             .unwrap();
         assert!((short_attr.blame_score - 1.0).abs() < 0.001);
         assert_eq!(short_attr.short_job_count, 100);
+    }
+
+    #[test]
+    fn test_compute_history_capacity_exceeds_sustained_pressure_window() {
+        // The floor keeps a 0- or short-configured duration from starving
+        // history entirely -- a trigger that fires almost immediately still
+        // needs somewhere to record baseline samples.
+        assert_eq!(compute_history_capacity(0), 50);
+        assert_eq!(compute_history_capacity(15), 50);
+        // Above the floor, capacity tracks the configured duration so a
+        // longer sustained-pressure window still leaves room for a
+        // pre-pressure baseline instead of being entirely consumed by it.
+        assert_eq!(compute_history_capacity(60), 140);
+        assert!(compute_history_capacity(60) > 60);
+    }
+
+    #[test]
+    fn test_onset_offset_ms_is_negative_elapsed_time() {
+        let start = Instant::now();
+        std::thread::sleep(Duration::from_millis(5));
+        let now = Instant::now();
+        let offset = onset_offset_ms(now, start);
+        assert!(offset <= -5, "offset was {offset}, expected <= -5");
+    }
+
+    #[test]
+    fn test_onset_offset_ms_is_zero_when_start_equals_now() {
+        let now = Instant::now();
+        assert_eq!(onset_offset_ms(now, now), 0);
+    }
+
+    #[test]
+    fn test_build_candidate_windows_carries_victim_series_and_offender_onsets() {
+        let victim = PodRef {
+            namespace: "prod".to_string(),
+            pod: "payment-api".to_string(),
+        };
+        let mut victim_pre_window = BTreeMap::new();
+        victim_pre_window.insert("cpu_stall_us".to_string(), vec![0.0, 50_000.0, 120_000.0]);
+
+        let offenders = vec![
+            (
+                PodRef {
+                    namespace: "prod".to_string(),
+                    pod: "image-resize-worker".to_string(),
+                },
+                Some(-9_000i64),
+            ),
+            (
+                PodRef {
+                    namespace: "prod".to_string(),
+                    pod: "sidecar-proxy".to_string(),
+                },
+                None,
+            ),
+        ];
+
+        let candidates = build_candidate_windows(
+            victim.clone(),
+            Some("Deployment".to_string()),
+            Some("payment-api".to_string()),
+            victim_pre_window.clone(),
+            Some(-15_000),
+            1000,
+            &offenders,
+        );
+
+        assert_eq!(candidates.len(), 3);
+
+        let victim_window = &candidates[0];
+        assert_eq!(victim_window.pod, victim);
+        assert_eq!(victim_window.owner_kind.as_deref(), Some("Deployment"));
+        assert_eq!(victim_window.pre_window, victim_pre_window);
+        assert_eq!(victim_window.post_window, BTreeMap::new());
+        assert_eq!(victim_window.first_deviation_offset_ms, Some(-15_000));
+
+        let hog_window = &candidates[1];
+        assert_eq!(hog_window.pod.pod, "image-resize-worker");
+        assert!(hog_window.pre_window.is_empty());
+        assert_eq!(hog_window.first_deviation_offset_ms, Some(-9_000));
+
+        let untracked_window = &candidates[2];
+        assert_eq!(untracked_window.pod.pod, "sidecar-proxy");
+        assert_eq!(untracked_window.first_deviation_offset_ms, None);
+    }
+
+    #[test]
+    fn test_build_candidate_windows_caps_offenders_at_the_max() {
+        let victim = PodRef {
+            namespace: "prod".to_string(),
+            pod: "payment-api".to_string(),
+        };
+        let offenders: Vec<(PodRef, Option<i64>)> = (0..MAX_CANDIDATE_OFFENDERS + 5)
+            .map(|i| {
+                (
+                    PodRef {
+                        namespace: "prod".to_string(),
+                        pod: format!("neighbour-{i}"),
+                    },
+                    None,
+                )
+            })
+            .collect();
+
+        let candidates =
+            build_candidate_windows(victim, None, None, BTreeMap::new(), None, 1000, &offenders);
+
+        // +1 for the victim's own window.
+        assert_eq!(candidates.len(), MAX_CANDIDATE_OFFENDERS + 1);
     }
 }

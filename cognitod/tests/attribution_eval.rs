@@ -175,6 +175,7 @@ fn build_stall_event(scenario: &Scenario) -> StallEvent {
         io_stall_delta_us: 0,
         memory_bytes: 0,
         io_bytes: 0,
+        candidates: vec![],
         fork_counts: scenario
             .forks
             .iter()
@@ -382,6 +383,7 @@ fn a_flood_of_distinct_offenders_stays_bounded() {
             io_stall_delta_us: 0,
             memory_bytes: 0,
             io_bytes: 0,
+            candidates: vec![],
             fork_counts: HashMap::new(),
             short_job_counts: HashMap::new(),
         };
@@ -481,6 +483,7 @@ fn a_second_offender_is_not_silenced_by_the_first() {
         io_stall_delta_us: 0,
         memory_bytes: 0,
         io_bytes: 0,
+        candidates: vec![],
         fork_counts: HashMap::new(),
         short_job_counts: HashMap::new(),
     };
