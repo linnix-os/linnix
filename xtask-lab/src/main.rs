@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use cognitod::attribution::{AttributionSink, BlameMetrics};
 use cognitod::collectors::psi::calculate_blame_attributions;
-use cognitod::episode::Episode;
+use cognitod::episode::{Episode, EpisodeSource};
 use cognitod::schema::InsightReason;
 use serde::Serialize;
 
@@ -107,8 +107,23 @@ pub enum Verdict {
 pub struct EpisodeScore {
     pub episode_id: String,
     pub scenario: Option<String>,
+    pub source: EpisodeSource,
     pub verdict: Verdict,
     pub predicted: Option<Prediction>,
+}
+
+/// Accuracy over one `EpisodeSource`'s slice of a score run. Kept separate
+/// per source because they mean different things: `Synthetic` accuracy is a
+/// regression gate (the six hand-authored scenarios must keep scoring
+/// 100%), while `VmCapture`/`DesignPartner` accuracy is a number to watch,
+/// not a bar to clear -- a real capture can be a genuinely hard case no
+/// scenario author anticipated.
+#[derive(Debug, Serialize)]
+pub struct SourceBreakdown {
+    pub source: EpisodeSource,
+    pub scored: usize,
+    pub correct: usize,
+    pub accuracy: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -116,7 +131,18 @@ pub struct ScoreReport {
     pub scored: usize,
     pub correct: usize,
     pub accuracy: f64,
+    pub by_source: Vec<SourceBreakdown>,
     pub episodes: Vec<EpisodeScore>,
+}
+
+impl ScoreReport {
+    /// The `Synthetic` breakdown, if any episode of that source was scored.
+    /// This is the one `run_score` gates the build on -- see its doc comment.
+    pub fn synthetic(&self) -> Option<&SourceBreakdown> {
+        self.by_source
+            .iter()
+            .find(|b| b.source == EpisodeSource::Synthetic)
+    }
 }
 
 fn score_one(episode: &Episode) -> EpisodeScore {
@@ -139,9 +165,38 @@ fn score_one(episode: &Episode) -> EpisodeScore {
     EpisodeScore {
         episode_id: episode.episode_id.clone(),
         scenario: episode.scenario.clone(),
+        source: episode.source,
         verdict,
         predicted,
     }
+}
+
+fn breakdown_for(scores: &[EpisodeScore], source: EpisodeSource) -> Option<SourceBreakdown> {
+    let mut scored = 0;
+    let mut correct = 0;
+    for s in scores.iter().filter(|s| s.source == source) {
+        if s.verdict == Verdict::NoGroundTruth {
+            continue;
+        }
+        scored += 1;
+        if s.verdict == Verdict::Correct {
+            correct += 1;
+        }
+    }
+    if scored == 0 && !scores.iter().any(|s| s.source == source) {
+        return None;
+    }
+    let accuracy = if scored > 0 {
+        correct as f64 / scored as f64
+    } else {
+        1.0
+    };
+    Some(SourceBreakdown {
+        source,
+        scored,
+        correct,
+        accuracy,
+    })
 }
 
 pub fn score(episodes: &[Episode]) -> ScoreReport {
@@ -161,10 +216,20 @@ pub fn score(episodes: &[Episode]) -> ScoreReport {
         1.0
     };
 
+    let by_source = [
+        EpisodeSource::Synthetic,
+        EpisodeSource::VmCapture,
+        EpisodeSource::DesignPartner,
+    ]
+    .into_iter()
+    .filter_map(|source| breakdown_for(&scores, source))
+    .collect();
+
     ScoreReport {
         scored,
         correct,
         accuracy,
+        by_source,
         episodes: scores,
     }
 }
@@ -258,12 +323,18 @@ fn run_score(path: &Path) -> Result<()> {
     let report = score(&episodes);
     println!("{}", serde_json::to_string_pretty(&report)?);
 
-    if report.accuracy < 1.0 {
+    // Only `Synthetic` accuracy gates the build. `VmCapture`/`DesignPartner`
+    // episodes are real-world data, not a hand-authored regression suite --
+    // a genuinely hard real capture must not fail CI the way a regression in
+    // the six scenario manifests should. See `SourceBreakdown`'s doc comment.
+    if let Some(synthetic) = report.synthetic()
+        && synthetic.accuracy < 1.0
+    {
         bail!(
-            "accuracy {:.1}% ({}/{} correct) is below 100%",
-            report.accuracy * 100.0,
-            report.correct,
-            report.scored
+            "synthetic accuracy {:.1}% ({}/{} correct) is below 100%",
+            synthetic.accuracy * 100.0,
+            synthetic.correct,
+            synthetic.scored
         );
     }
     Ok(())
@@ -343,5 +414,52 @@ mod tests {
 
         let report = score(&[episode]);
         assert_eq!(report.episodes[0].verdict, Verdict::WrongReason);
+    }
+
+    #[test]
+    fn a_wrong_vm_capture_does_not_drag_down_the_synthetic_breakdown() {
+        let synthetic = golden();
+        let mut vm_capture = golden();
+        vm_capture.source = EpisodeSource::VmCapture;
+        vm_capture.episode_id = "ep-vm-wrong".to_string();
+        vm_capture.ground_truth.as_mut().unwrap().reason_code = InsightReason::NoisyNeighbor;
+
+        let report = score(&[synthetic, vm_capture]);
+
+        let synthetic_breakdown = report.synthetic().expect("a synthetic episode was scored");
+        assert_eq!(synthetic_breakdown.accuracy, 1.0);
+
+        let vm_breakdown = report
+            .by_source
+            .iter()
+            .find(|b| b.source == EpisodeSource::VmCapture)
+            .expect("a vm_capture episode was scored");
+        assert!(vm_breakdown.accuracy < 1.0);
+
+        // Overall accuracy still reflects the mix -- only the per-source
+        // breakdown, which `run_score` gates on, separates them.
+        assert!(report.accuracy < 1.0);
+    }
+
+    #[test]
+    fn synthetic_accuracy_below_100_percent_fails_the_gate_even_with_a_perfect_vm_capture() {
+        let mut synthetic = golden();
+        synthetic.ground_truth.as_mut().unwrap().reason_code = InsightReason::NoisyNeighbor;
+        let mut vm_capture = golden();
+        vm_capture.source = EpisodeSource::VmCapture;
+        vm_capture.episode_id = "ep-vm-right".to_string();
+
+        let report = score(&[synthetic, vm_capture]);
+
+        assert!(report.synthetic().unwrap().accuracy < 1.0);
+        assert_eq!(
+            report
+                .by_source
+                .iter()
+                .find(|b| b.source == EpisodeSource::VmCapture)
+                .unwrap()
+                .accuracy,
+            1.0
+        );
     }
 }
