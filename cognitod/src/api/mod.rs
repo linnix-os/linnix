@@ -2567,10 +2567,7 @@ async fn submit_feedback(
     Path(id): Path<String>,
     Json(payload): Json<FeedbackPayload>,
 ) -> impl IntoResponse {
-    if state
-        .insights
-        .update_feedback(&id, payload.feedback.clone())
-    {
+    if state.insights.update_feedback(&id, payload.feedback) {
         log::info!(
             "Received feedback {:?} for insight {}",
             payload.feedback,
