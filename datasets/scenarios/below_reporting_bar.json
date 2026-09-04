@@ -1,0 +1,12 @@
+{
+  "name": "a stall split thinly across many neighbours reports nobody",
+  "victim": { "namespace": "prod", "pod": "payment-api" },
+  "victim_stall_us": 300000,
+  "consumers": [
+    { "pod": "neighbour-a", "cpu_percent": 25.0 },
+    { "pod": "neighbour-b", "cpu_percent": 25.0 },
+    { "pod": "neighbour-c", "cpu_percent": 25.0 },
+    { "pod": "neighbour-d", "cpu_percent": 25.0 }
+  ],
+  "expect_reported": []
+}

@@ -1,0 +1,16 @@
+{
+  "name": "a pod busy across many processes is credited for all of them",
+  "victim": { "namespace": "prod", "pod": "payment-api" },
+  "victim_stall_us": 1000000,
+  "consumers": [
+    { "pod": "multi-proc-worker", "cpu_percent": 20.0 },
+    { "pod": "multi-proc-worker", "cpu_percent": 20.0 },
+    { "pod": "multi-proc-worker", "cpu_percent": 20.0 },
+    { "pod": "multi-proc-worker", "cpu_percent": 20.0 },
+    { "pod": "single-proc-neighbour", "cpu_percent": 30.0 }
+  ],
+  "expect_reported": [
+    { "pod": "multi-proc-worker", "reason": "noisy_neighbor" },
+    { "pod": "single-proc-neighbour", "reason": "noisy_neighbor" }
+  ]
+}

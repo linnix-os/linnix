@@ -1,5 +1,5 @@
 {
-  "version": "0.1",
+  "version": "0.2",
   "episode_id": "ep-fork-storm-000001",
   "captured_at": "2026-09-03T00:00:00Z",
   "source": "synthetic",
@@ -12,6 +12,7 @@
     "namespace": "prod",
     "pod": "payment-api"
   },
+  "victim_stall_us": 1000000,
   "candidates": [
     {
       "pod": {

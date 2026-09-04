@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::schema::{Insight, InsightReason};
 
-pub const EPISODE_FORMAT_VERSION: &str = "0.1";
+pub const EPISODE_FORMAT_VERSION: &str = "0.2";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PodRef {
@@ -122,6 +122,12 @@ pub struct Episode {
     pub scenario: Option<String>,
     pub trigger: TriggerInfo,
     pub victim: PodRef,
+    /// The victim's total PSI stall for the window that triggered this
+    /// episode, in microseconds -- `StallEvent::stall_delta_us` at capture
+    /// time. Added on the v0.2 format bump: replay needs a magnitude to
+    /// weight blame against, and nothing else in the record carries one (a
+    /// candidate's own series records *its* signals, not the victim's).
+    pub victim_stall_us: u64,
     pub candidates: Vec<CandidateWindow>,
     /// The pod/ownership graph as a flat edge list (owner -> pod), rather
     /// than a nested tree, so it round-trips through JSON without a custom
@@ -145,6 +151,87 @@ pub struct PodGraphEdge {
     pub owner_kind: String,
     pub owner_name: String,
     pub pod: PodRef,
+}
+
+impl Episode {
+    /// Reconstructs the `StallEvent` this episode was captured from (or, for
+    /// a synthetic episode, the one a scenario asserts) well enough to run it
+    /// back through `calculate_blame_attributions`.
+    ///
+    /// Not a full inverse of capture: `StallEvent` also carries live
+    /// memory/io scalars and an offender-side candidate series that
+    /// `calculate_blame_attributions` never reads, so those are left at
+    /// their zero/empty defaults here. Each candidate's `cpu_percent`,
+    /// `fork_count` and `short_job_count` are read from its last pre-window
+    /// sample (falling back to the last post-window sample when the
+    /// pre-window is empty), since those are the three signals the blame
+    /// score actually weighs.
+    pub fn to_stall_event(&self) -> crate::collectors::psi::StallEvent {
+        use crate::collectors::psi::{CpuConsumer, StallEvent};
+        use std::collections::HashMap;
+
+        let mut concurrent_consumers = Vec::new();
+        let mut fork_counts = HashMap::new();
+        let mut short_job_counts = HashMap::new();
+
+        for candidate in &self.candidates {
+            if candidate.pod == self.victim {
+                continue;
+            }
+            let key = format!("{}/{}", candidate.pod.namespace, candidate.pod.pod);
+
+            if let Some(cpu_percent) = candidate_signal(candidate, "cpu_percent") {
+                concurrent_consumers.push(CpuConsumer {
+                    pod: candidate.pod.pod.clone(),
+                    namespace: candidate.pod.namespace.clone(),
+                    cpu_percent: cpu_percent as f32,
+                });
+            }
+            if let Some(fork_count) = candidate_signal(candidate, "fork_count") {
+                fork_counts.insert(key.clone(), fork_count as u64);
+            }
+            if let Some(short_job_count) = candidate_signal(candidate, "short_job_count") {
+                short_job_counts.insert(key, short_job_count as u64);
+            }
+        }
+
+        StallEvent {
+            event_id: self.episode_id.clone(),
+            victim_pod: self.victim.pod.clone(),
+            victim_namespace: self.victim.namespace.clone(),
+            stall_delta_us: self.victim_stall_us,
+            timestamp: std::time::Instant::now(),
+            concurrent_consumers,
+            fork_counts,
+            short_job_counts,
+            memory_stall_delta_us: 0,
+            io_stall_delta_us: 0,
+            memory_bytes: 0,
+            io_bytes: 0,
+            memory_anon_bytes: None,
+            memory_file_bytes: None,
+            memory_slab_bytes: None,
+            memory_pgmajfault_delta: None,
+            workingset_refault_delta: None,
+            candidates: Vec::new(),
+        }
+    }
+}
+
+/// The last sample of `key` in a candidate's pre-window, or its post-window
+/// when the pre-window has none -- see `Episode::to_stall_event`.
+fn candidate_signal(candidate: &CandidateWindow, key: &str) -> Option<f64> {
+    candidate
+        .pre_window
+        .get(key)
+        .and_then(|series| series.last())
+        .or_else(|| {
+            candidate
+                .post_window
+                .get(key)
+                .and_then(|series| series.last())
+        })
+        .copied()
 }
 
 #[cfg(test)]

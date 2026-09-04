@@ -8,6 +8,10 @@ fn main() -> Result<()> {
         eprintln!("Usage: cargo xtask <command>");
         eprintln!("Commands:");
         eprintln!("  build-ebpf    Build eBPF programs");
+        eprintln!();
+        eprintln!("The Incident Lab CLI (replay/score episodes) lives in a separate");
+        eprintln!("binary, `cargo lab`, so `cargo xtask build-ebpf` never has to compile");
+        eprintln!("cognitod under the pinned eBPF nightly toolchain.");
         std::process::exit(1);
     }
 

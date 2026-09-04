@@ -1,0 +1,7 @@
+{
+  "name": "a CI runner churning short-lived jobs is named as the offender",
+  "victim": { "namespace": "prod", "pod": "payment-api" },
+  "victim_stall_us": 600000,
+  "short_jobs": [{ "pod": "ci-runner", "count": 120 }],
+  "expect_reported": [{ "pod": "ci-runner", "reason": "short_job_churn" }]
+}

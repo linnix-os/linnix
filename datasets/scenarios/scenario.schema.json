@@ -1,0 +1,81 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://linnix.dev/schema/scenario.v1.json",
+  "title": "ScenarioManifest",
+  "description": "Regenerated from xtask_lab::scenario::ScenarioManifest (xtask-lab/src/scenario.rs). Human-authored input to `cargo lab run`: describes a cluster situation and who a correct diagnosis should name. Materialized into a synthetic Episode (datasets/schema/episode.schema.json) which `cargo lab score` then grades a heuristic replay against.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "victim", "victim_stall_us"],
+  "properties": {
+    "name": {
+      "description": "The situation, in the words a user would use -- becomes Episode.scenario.",
+      "type": "string",
+      "minLength": 1
+    },
+    "victim": { "$ref": "#/definitions/pod_ref" },
+    "victim_stall_us": {
+      "description": "The victim's total PSI stall for this scenario's window, in microseconds.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "consumers": {
+      "description": "CPU consumers during the stall window. A pod may appear more than once (one entry per process); its shares are summed.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pod", "cpu_percent"],
+        "properties": {
+          "pod": { "type": "string", "minLength": 1 },
+          "cpu_percent": { "type": "number", "minimum": 0 }
+        }
+      }
+    },
+    "forks": {
+      "description": "Fork counts observed in the window, keyed by pod.",
+      "type": "array",
+      "items": { "$ref": "#/definitions/count_spec" }
+    },
+    "short_jobs": {
+      "description": "Short-lived-job counts observed in the window, keyed by pod.",
+      "type": "array",
+      "items": { "$ref": "#/definitions/count_spec" }
+    },
+    "expect_reported": {
+      "description": "Offenders a correct diagnosis should name, in rank order. The first entry becomes the materialized episode's ground_truth; later entries document a scenario with more than one real offender but are not separately scored by `xtask lab score`, which only grades the top-ranked prediction. Empty when no offender should clear the reporting bar.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pod", "reason"],
+        "properties": {
+          "pod": { "type": "string", "minLength": 1 },
+          "reason": {
+            "description": "See datasets/schema/insight.schema.json#/definitions/reason_code -- the same merged vocabulary.",
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "pod_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["namespace", "pod"],
+      "properties": {
+        "namespace": { "type": "string" },
+        "pod": { "type": "string" }
+      }
+    },
+    "count_spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pod", "count"],
+      "properties": {
+        "pod": { "type": "string", "minLength": 1 },
+        "count": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

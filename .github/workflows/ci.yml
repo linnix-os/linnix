@@ -108,6 +108,20 @@ jobs:
       - name: Build eBPF artifacts
         run: cargo xtask build-ebpf
 
+  lab-score:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Materialize scenario manifests into episodes
+        run: cargo lab run datasets/scenarios /tmp/lab-episodes
+      - name: Add the golden fixture to the same scoring pass
+        run: cp datasets/episodes/golden/*.json /tmp/lab-episodes/
+      - name: Score the Incident Lab against ground truth
+        run: cargo lab score /tmp/lab-episodes
+
   validate-docs:
     runs-on: ubuntu-latest
     steps:
