@@ -23,7 +23,7 @@ async fn investigate_ranks_offenders_by_attributed_stall() {
                             {"offender_pod":"image-resizer","offender_namespace":"media",
                              "stall_us":1000000,"attributed_stall_us":700000,"blame_score":2.0,
                              "timestamp":100,"cpu_share":0.62,"fork_count":186,
-                             "short_job_count":42,"reason":"high_cpu_contention"},
+                             "short_job_count":42,"reason":"noisy_neighbor"},
                             {"offender_pod":"etl-runner","offender_namespace":"batch",
                              "stall_us":1000000,"attributed_stall_us":300000,"blame_score":1.0,
                              "timestamp":100,"cpu_share":0.20,"fork_count":4,

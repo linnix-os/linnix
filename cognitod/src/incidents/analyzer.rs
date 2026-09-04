@@ -204,8 +204,9 @@ Rules:
 - A hypothesis with no supporting citation will be discarded.
 - If a fact argues against your hypothesis, cite it under
   contradicting_fact_ids. Saying so is worth more than omitting it.
-- reason_code must be one of: fork_storm, short_job_flood, runaway_tree,
-  cpu_spin, io_saturation, oom_risk, normal.
+- reason_code must be one of: fork_storm, short_job_churn, runaway_tree,
+  cpu_spin, noisy_neighbor, io_saturation, oom_risk, cpu_throttled,
+  disk_pressure, network_saturation, deployment_regression, normal.
 - confidence is your own estimate, 0.0 to 1.0.
 
 Reply with JSON only, in exactly this shape:

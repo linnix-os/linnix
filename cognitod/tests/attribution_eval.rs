@@ -14,14 +14,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cognitod::attribution::{AlertOutput, AttributionSink, BlameMetrics, BlameReason};
+use cognitod::attribution::{AlertOutput, AttributionSink, BlameMetrics};
 use cognitod::collectors::psi::{CpuConsumer, StallEvent, calculate_blame_attributions};
 use cognitod::metrics::Metrics;
+use cognitod::schema::InsightReason;
 
 /// What an offender is expected to look like in the emitted output.
 struct ExpectedOffender {
     pod: &'static str,
-    reason: BlameReason,
+    reason: InsightReason,
     /// Inclusive bounds on the stall credited to this offender, in
     /// milliseconds. A range rather than a point because the split is
     /// proportional to a heuristic score we expect to keep tuning.
@@ -50,7 +51,7 @@ const SCENARIOS: &[Scenario] = &[
         short_jobs: &[],
         expect_reported: &[ExpectedOffender {
             pod: "image-resize-worker",
-            reason: BlameReason::HighCpuContention,
+            reason: InsightReason::NoisyNeighbor,
             stall_ms: (700, 800),
         }],
         expect_counted_only: &["sidecar-proxy"],
@@ -64,12 +65,12 @@ const SCENARIOS: &[Scenario] = &[
         expect_reported: &[
             ExpectedOffender {
                 pod: "fork-bomb",
-                reason: BlameReason::ForkStorm,
+                reason: InsightReason::ForkStorm,
                 stall_ms: (600, 900),
             },
             ExpectedOffender {
                 pod: "steady-worker",
-                reason: BlameReason::HighCpuContention,
+                reason: InsightReason::NoisyNeighbor,
                 stall_ms: (100, 400),
             },
         ],
@@ -83,7 +84,7 @@ const SCENARIOS: &[Scenario] = &[
         short_jobs: &[("prod/ci-runner", 120)],
         expect_reported: &[ExpectedOffender {
             pod: "ci-runner",
-            reason: BlameReason::ShortJobChurn,
+            reason: InsightReason::ShortJobChurn,
             stall_ms: (500, 600),
         }],
         expect_counted_only: &[],
@@ -99,7 +100,7 @@ const SCENARIOS: &[Scenario] = &[
         short_jobs: &[],
         expect_reported: &[ExpectedOffender {
             pod: "image-resize-worker",
-            reason: BlameReason::HighCpuContention,
+            reason: InsightReason::NoisyNeighbor,
             stall_ms: (890, 900),
         }],
         expect_counted_only: &[],
@@ -122,12 +123,12 @@ const SCENARIOS: &[Scenario] = &[
         expect_reported: &[
             ExpectedOffender {
                 pod: "multi-proc-worker",
-                reason: BlameReason::HighCpuContention,
+                reason: InsightReason::NoisyNeighbor,
                 stall_ms: (700, 730),
             },
             ExpectedOffender {
                 pod: "single-proc-neighbour",
-                reason: BlameReason::HighCpuContention,
+                reason: InsightReason::NoisyNeighbor,
                 stall_ms: (260, 280),
             },
         ],
@@ -323,7 +324,7 @@ fn json_event_matches_the_documented_schema() {
     assert_eq!(json["victim"]["namespace"], VICTIM_NS);
     assert_eq!(json["offender"]["pod"], "image-resize-worker");
     assert_eq!(json["offender"]["namespace"], VICTIM_NS);
-    assert_eq!(json["offender"]["reason"], "high_cpu_contention");
+    assert_eq!(json["offender"]["reason"], "noisy_neighbor");
 }
 
 #[test]

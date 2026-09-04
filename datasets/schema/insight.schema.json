@@ -1,58 +1,114 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://linnix.dev/schema/insight.v0.2.json",
+  "title": "Insight",
+  "description": "Regenerated from cognitod::schema::Insight (cognitod/src/schema.rs). This is the pod-scoped shape the daemon actually emits over /insights, /insights/recent and /insights/{id} -- v0.1's process-scoped class/why/actions shape (datasets/examples/v0.1-legacy/) predates this and was never wired to the daemon's real output.",
+  "version": "0.2",
+  "type": "object",
   "additionalProperties": false,
+  "required": [
+    "id",
+    "reason_code",
+    "summary",
+    "confidence",
+    "top_pods",
+    "suggested_next_step",
+    "evidence_refs",
+    "primary_process",
+    "k8s"
+  ],
   "properties": {
-    "actions": {
-      "items": {
-        "maxLength": 160,
-        "minLength": 1,
-        "type": "string"
-      },
-      "maxItems": 3,
-      "type": "array"
+    "id": {
+      "type": "string",
+      "minLength": 1
     },
-    "class": {
-      "enum": [
-        "fork_storm",
-        "short_job_flood",
-        "runaway_tree",
-        "cpu_spin",
-        "io_saturation",
-        "oom_risk",
-        "normal"
-      ],
-      "type": "string"
+    "reason_code": {
+      "$ref": "#/definitions/reason_code"
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
     },
     "confidence": {
-      "maximum": 1.0,
+      "type": "number",
       "minimum": 0.0,
-      "type": "number"
+      "maximum": 1.0
+    },
+    "top_pods": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/pod_contribution"
+      }
+    },
+    "suggested_next_step": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evidence_refs": {
+      "description": "Ids of the facts that grounded this insight's summary (incidents::investigation::Fact::id). Added in v0.2 -- absent from v0.1. Empty array, not omission, when nothing grounded the insight.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
     },
     "primary_process": {
-      "oneOf": [
-        {
-          "type": "null"
-        },
-        {
-          "maxLength": 120,
-          "minLength": 1,
-          "type": "string"
-        }
-      ]
+      "description": "Compat field, predates pod-scoped attribution.",
+      "type": ["string", "null"]
     },
-    "why": {
-      "maxLength": 120,
-      "minLength": 1,
-      "type": "string"
+    "k8s": {
+      "description": "Compat field.",
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/definitions/k8s_metadata" }
+      ]
     }
   },
-  "required": [
-    "class",
-    "confidence",
-    "primary_process",
-    "why",
-    "actions"
-  ],
-  "title": "Insight",
-  "type": "object"
+  "definitions": {
+    "reason_code": {
+      "description": "The single reason-code vocabulary shared by insights and stall attributions (cognitod::schema::InsightReason). Merges the pre-v0.2 InsightReason (7 values) and attribution::BlameReason (3 values, folded in as fork_storm/short_job_churn/noisy_neighbor) into one enum, so reason-code accuracy can be scored against a single ground truth. Covers the Incident Lab failure library.",
+      "type": "string",
+      "enum": [
+        "fork_storm",
+        "short_job_churn",
+        "runaway_tree",
+        "cpu_spin",
+        "noisy_neighbor",
+        "io_saturation",
+        "oom_risk",
+        "cpu_throttled",
+        "disk_pressure",
+        "network_saturation",
+        "deployment_regression",
+        "normal"
+      ]
+    },
+    "pod_contribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["namespace", "pod", "cpu_usage", "psi_contribution"],
+      "properties": {
+        "namespace": { "type": "string" },
+        "pod": { "type": "string" },
+        "cpu_usage": { "type": "number" },
+        "psi_contribution": { "type": "number" }
+      }
+    },
+    "k8s_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pod_name", "namespace", "container_name", "owner_kind", "owner_name", "priority", "slo_tier"],
+      "properties": {
+        "pod_name": { "type": "string" },
+        "namespace": { "type": "string" },
+        "container_name": { "type": "string" },
+        "owner_kind": { "type": ["string", "null"] },
+        "owner_name": { "type": ["string", "null"] },
+        "priority": {
+          "type": "string",
+          "enum": ["critical", "high", "medium", "low"]
+        },
+        "slo_tier": { "type": ["string", "null"] }
+      }
+    }
+  }
 }

@@ -28,7 +28,7 @@ impl From<&str> for Priority {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
 pub struct K8sMetadata {
     pub pod_name: String,
     pub namespace: String,

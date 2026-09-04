@@ -1,15 +1,40 @@
 use crate::k8s::K8sMetadata;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// The single reason-code vocabulary shared by insights (LLM-facing
+/// diagnoses) and stall attributions (the heuristic blame score's dominant
+/// term). Before this merge the two lived as separate enums --
+/// `InsightReason` (7 variants) and `attribution::BlameReason` (3 variants,
+/// now folded in as `ForkStorm`, `ShortJobChurn`, `NoisyNeighbor`) -- which
+/// meant reason-code accuracy could never be scored against a single ground
+/// truth. See datasets/schema/insight.schema.json (v0.2) for the wire
+/// contract this enum backs.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InsightReason {
     ForkStorm,
-    ShortJobFlood,
+    ShortJobChurn,
     RunawayTree,
     CpuSpin,
+    /// A pod's stall is dominated by another pod's CPU share rather than by
+    /// forks or short-job churn. Formerly `BlameReason::HighCpuContention`
+    /// ("high_cpu_contention"); renamed on the v0.2 schema bump since this is
+    /// the failure library's "CPU noisy neighbour" scenario by another name.
+    NoisyNeighbor,
     IoSaturation,
     OomRisk,
+    /// cgroup `cpu.max` quota throttling the workload rather than a
+    /// neighbour stealing its CPU -- distinct from `NoisyNeighbor` because
+    /// the fix is raising the pod's own limit, not evicting anyone else.
+    CpuThrottled,
+    /// Ephemeral-storage / disk-pressure eviction path (unbounded log
+    /// writes, etc.), distinct from `IoSaturation`'s throughput contention.
+    DiskPressure,
+    /// Retransmits / connection exhaustion / socket saturation.
+    NetworkSaturation,
+    /// A rollout raised resource usage or introduced a regression; the
+    /// culprit is a deployment revision, not a neighbouring pod.
+    DeploymentRegression,
     Normal,
 }
 
@@ -17,11 +42,16 @@ impl InsightReason {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::ForkStorm => "fork_storm",
-            Self::ShortJobFlood => "short_job_flood",
+            Self::ShortJobChurn => "short_job_churn",
             Self::RunawayTree => "runaway_tree",
             Self::CpuSpin => "cpu_spin",
+            Self::NoisyNeighbor => "noisy_neighbor",
             Self::IoSaturation => "io_saturation",
             Self::OomRisk => "oom_risk",
+            Self::CpuThrottled => "cpu_throttled",
+            Self::DiskPressure => "disk_pressure",
+            Self::NetworkSaturation => "network_saturation",
+            Self::DeploymentRegression => "deployment_regression",
             Self::Normal => "normal",
         }
     }
@@ -31,7 +61,7 @@ impl InsightReason {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PodContribution {
     pub namespace: String,
     pub pod: String,
@@ -39,7 +69,7 @@ pub struct PodContribution {
     pub psi_contribution: f32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Insight {
     pub reason_code: InsightReason,
     pub summary: String,
@@ -47,6 +77,15 @@ pub struct Insight {
     pub id: String,
     pub top_pods: Vec<PodContribution>,
     pub suggested_next_step: String,
+    /// Ids of the facts (`incidents::investigation::Fact::id`) that ground
+    /// this insight's summary, in the same numbering the analyzer cited
+    /// against the incident. Empty rather than omitted when nothing grounded
+    /// it -- an insight that cites nothing is a fact worth keeping, not a
+    /// missing field. Added on the v0.2 schema bump so the Incident Lab can
+    /// score evidence correctness (every ref must resolve to a supplied fact
+    /// whose value matches the episode).
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
     // Compat fields
     pub primary_process: Option<String>,
     pub k8s: Option<K8sMetadata>,
@@ -92,6 +131,7 @@ mod tests {
                 psi_contribution: 10.0,
             }],
             suggested_next_step: "Check".to_string(),
+            evidence_refs: vec![],
             primary_process: None,
             k8s: None,
         };
@@ -117,6 +157,7 @@ mod tests {
                 psi_contribution: 5.0,
             }],
             suggested_next_step: "Wait".to_string(),
+            evidence_refs: vec![],
             primary_process: None,
             k8s: None,
         };
