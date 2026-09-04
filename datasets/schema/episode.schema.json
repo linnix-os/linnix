@@ -1,9 +1,9 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://linnix.dev/schema/episode.v0.1.json",
+  "$id": "https://linnix.dev/schema/episode.v0.2.json",
   "title": "Episode",
   "description": "Regenerated from cognitod::episode::Episode (cognitod/src/episode.rs). One captured or replayed incident: the invariant this format holds is that an episode captured on a real k3s VM must replay in-process on a laptop, byte-identically, with no kernel involvement. Versioned independently of the Insight schema (datasets/schema/insight.schema.json) embedded in `diagnosis`.",
-  "version": "0.1",
+  "version": "0.2",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -14,6 +14,7 @@
     "scenario",
     "trigger",
     "victim",
+    "victim_stall_us",
     "candidates",
     "pod_graph",
     "diagnosis",
@@ -22,7 +23,7 @@
     "outcome"
   ],
   "properties": {
-    "version": { "type": "string", "const": "0.1" },
+    "version": { "type": "string", "const": "0.2" },
     "episode_id": { "type": "string", "minLength": 1 },
     "captured_at": { "type": "string", "format": "date-time" },
     "source": {
@@ -40,6 +41,11 @@
       }
     },
     "victim": { "$ref": "#/definitions/pod_ref" },
+    "victim_stall_us": {
+      "description": "StallEvent::stall_delta_us at capture time -- the magnitude replay weights blame against.",
+      "type": "integer",
+      "minimum": 0
+    },
     "candidates": {
       "type": "array",
       "items": { "$ref": "#/definitions/candidate_window" }
