@@ -204,6 +204,7 @@ impl IncidentStore {
         .await?;
 
         apply_required_column_migrations(&pool).await?;
+        remap_legacy_feedback_labels(&pool).await?;
 
         // No backfill: an id cannot be reconstructed for rows written before
         // the monitor emitted one, and grouping them by `(timestamp, stall_us)`
@@ -840,6 +841,36 @@ async fn apply_required_column_migrations(pool: &SqlitePool) -> Result<(), sqlx:
     Ok(())
 }
 
+/// Remaps `feedback.label` values from the old `Useful | Noise` taxonomy (plus
+/// `wrong_root_cause`, which migrations/003_add_feedback.sql's CHECK
+/// constraint allowed but no Rust enum ever constructed) to the five-way
+/// taxonomy `FeedbackLabel` now writes. See
+/// migrations/007_widen_feedback_taxonomy.sql for the mapping this documents;
+/// unlike a `stall_attributions`/`incidents` column addition, remapping
+/// existing *values* has no place in `REQUIRED_COLUMNS`, so it runs here
+/// instead. An `UPDATE ... WHERE label IN (...)` rather than a table rebuild:
+/// the daemon's own `FeedbackLabel` enum is what actually constrains new
+/// writes, so a SQLite-level CHECK constraint would duplicate that
+/// enforcement without adding any. Safe to run on every startup — once no row
+/// carries a legacy label, the `WHERE` clause matches nothing.
+async fn remap_legacy_feedback_labels(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE feedback
+        SET label = CASE label
+            WHEN 'useful' THEN 'correct'
+            WHEN 'noise' THEN 'incomplete'
+            WHEN 'wrong_root_cause' THEN 'wrong_culprit'
+            ELSE label
+        END
+        WHERE label IN ('useful', 'noise', 'wrong_root_cause')
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 async fn column_exists(pool: &SqlitePool, table: &str, column: &str) -> Result<bool, sqlx::Error> {
     let escaped_table = table.replace('"', "\"\"");
     let rows = sqlx::query(&format!("PRAGMA table_info(\"{escaped_table}\")"))
@@ -903,5 +934,56 @@ mod tests {
 
         assert_eq!(stored.event_type, "warning");
         assert!(db_path.exists());
+    }
+
+    #[tokio::test]
+    async fn legacy_feedback_labels_are_remapped_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("incidents.db");
+
+        // Simulate rows written by a pre-taxonomy daemon: bypass
+        // insert_feedback (which only ever writes current-taxonomy labels)
+        // and insert the legacy strings directly, as a real old row would
+        // have them on disk.
+        {
+            let store = IncidentStore::new(&db_path).await.unwrap();
+            for (id, label) in [
+                ("legacy-useful", "useful"),
+                ("legacy-noise", "noise"),
+                ("legacy-wrong-root-cause", "wrong_root_cause"),
+            ] {
+                sqlx::query(
+                    "INSERT INTO feedback (insight_id, timestamp, label, source) VALUES (?, 0, ?, 'cli')",
+                )
+                .bind(id)
+                .bind(label)
+                .execute(&store.pool)
+                .await
+                .unwrap();
+            }
+        }
+
+        // Reopening (as a restart would) must remap the legacy rows in place,
+        // and must be a no-op the second time -- nothing left to match.
+        let store = IncidentStore::new(&db_path).await.unwrap();
+        remap_legacy_feedback_labels(&store.pool).await.unwrap();
+
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT insight_id, label FROM feedback ORDER BY insight_id")
+                .fetch_all(&store.pool)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                ("legacy-noise".to_string(), "incomplete".to_string()),
+                ("legacy-useful".to_string(), "correct".to_string()),
+                (
+                    "legacy-wrong-root-cause".to_string(),
+                    "wrong_culprit".to_string()
+                ),
+            ]
+        );
     }
 }

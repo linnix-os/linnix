@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://linnix.dev/schema/insight.v0.2.json",
   "title": "Insight",
-  "description": "Regenerated from cognitod::schema::Insight (cognitod/src/schema.rs). This is the pod-scoped shape the daemon actually emits over /insights, /insights/recent and /insights/{id} -- v0.1's process-scoped class/why/actions shape (datasets/examples/v0.1-legacy/) predates this and was never wired to the daemon's real output.",
+  "description": "Regenerated from cognitod::schema::Insight (cognitod/src/schema.rs). This is the pod-scoped shape of the `insight` field nested in every InsightRecord the daemon returns from /insights, /insights/recent and /insights/{id} (those endpoints wrap it as {timestamp, insight, feedback} -- validate against the `insight` sub-object, not the raw response body). v0.1's process-scoped class/why/actions shape (datasets/examples/v0.1-legacy/) predates this and was never wired to the daemon's real output.",
   "version": "0.2",
   "type": "object",
   "additionalProperties": false,
