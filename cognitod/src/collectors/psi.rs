@@ -1,6 +1,6 @@
 use anyhow::Result;
 use log::{debug, info, warn};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,6 +9,7 @@ use walkdir::WalkDir;
 
 use crate::attribution::AttributionSink;
 use crate::context::ContextStore;
+use crate::episode::{CandidateWindow, PodRef};
 use crate::k8s::K8sContext;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,6 +50,49 @@ pub struct StallEvent {
     pub concurrent_consumers: Vec<CpuConsumer>,
     pub fork_counts: HashMap<String, u64>,
     pub short_job_counts: HashMap<String, u64>,
+    /// Memory-pressure stall accrued over the same window as `stall_delta_us`,
+    /// from `memory.pressure` in the same cgroup as the triggering
+    /// `cpu.pressure` read. Carried for episode capture only — the blame
+    /// score in `calculate_blame_attributions` stays CPU/fork/short-job only,
+    /// so this does not change what gets attributed, only what gets recorded.
+    pub memory_stall_delta_us: u64,
+    /// Same idea for `io.pressure`.
+    pub io_stall_delta_us: u64,
+    /// Snapshot of `memory.current` (bytes) at trigger time, summed across the
+    /// victim pod's containers. Zero when the file was unreadable rather than
+    /// `Option`, matching `stall_delta_us`'s convention elsewhere in this
+    /// struct.
+    pub memory_bytes: u64,
+    /// Snapshot of `io.stat` (rbytes + wbytes summed across devices and
+    /// containers) at trigger time.
+    pub io_bytes: u64,
+    /// Point-in-time snapshot of `memory.stat`'s anon/file/slab bytes, summed
+    /// across the victim pod's containers at trigger time. `None` when no
+    /// container exposed the field this scan — unlike `memory_bytes` above,
+    /// `memory.stat`'s field set moves with kernel version, so a missing
+    /// field here cannot be safely folded into zero.
+    pub memory_anon_bytes: Option<u64>,
+    pub memory_file_bytes: Option<u64>,
+    pub memory_slab_bytes: Option<u64>,
+    /// Counters from `memory.stat`, delta'd over the same window as
+    /// `stall_delta_us` the same way `memory_stall_delta_us` is (current
+    /// reading minus the container's previous scan). Major faults and
+    /// reclaim-driven refaults are thrashing indicators — what turns "using a
+    /// lot of memory" into "the kernel is fighting to keep it". `None` when
+    /// no container exposed the counter, or none had a previous sample yet.
+    pub memory_pgmajfault_delta: Option<u64>,
+    /// Sum of `workingset_refault_anon` + `workingset_refault_file` deltas.
+    pub workingset_refault_delta: Option<u64>,
+    /// The victim plus every offender candidate's own signal window,
+    /// captured for episode replay. The victim's `pre_window` carries its
+    /// retained cpu/memory/io stall-delta series; offender candidates carry
+    /// an empty `pre_window` (their per-tick CPU% is not retained as a full
+    /// series, only a busy-since start time, so `first_deviation_offset_ms`
+    /// is still real but there is no sample vector behind it yet).
+    /// `post_window` is always empty on every candidate here — filling it
+    /// needs deferred, multi-scan finalization after the trigger fires,
+    /// which does not exist yet. None of this feeds `calculate_blame_attributions`.
+    pub candidates: Vec<CandidateWindow>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +153,125 @@ pub fn parse_psi_file(content: &str) -> Result<PsiSnapshot> {
     })
 }
 
+/// Sums `rbytes` + `wbytes` across every device line of a cgroup v2 `io.stat`
+/// file. A cgroup only lists the devices it actually touched, so this is
+/// already scoped to the container — no filtering needed.
+fn parse_io_stat(content: &str) -> u64 {
+    let mut total = 0u64;
+    for line in content.lines() {
+        for field in line.split_whitespace().skip(1) {
+            if let Some((key, value)) = field.split_once('=')
+                && (key == "rbytes" || key == "wbytes")
+                && let Ok(v) = value.parse::<u64>()
+            {
+                total = total.saturating_add(v);
+            }
+        }
+    }
+    total
+}
+
+/// Reads a cgroup v2 `memory.current` file: a single integer, in bytes.
+fn read_memory_current(path: &Path) -> Option<u64> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
+/// Fields read from a cgroup v2 `memory.stat` file, split by shape rather
+/// than kept in one undifferentiated map: `memory.stat` mixes point-in-time
+/// gauges (`anon`, `file`, `slab`) with monotonic counters accrued since the
+/// cgroup was created (`pgmajfault`, `workingset_refault_*`). Collapsing both
+/// into one `HashMap<String, u64>` would let a reader treat a lifetime
+/// counter as "bytes during the stall" — the same naming trap `io_bytes`
+/// already carries elsewhere in this file. Every field is `Option` rather
+/// than defaulting to zero: `memory.stat`'s field set moves with kernel
+/// version (`zswap` is 5.19+, `pagetables` ~5.16+), so a missing field on an
+/// older kernel must stay distinguishable from a real zero reading.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct MemoryStat {
+    anon_bytes: Option<u64>,
+    file_bytes: Option<u64>,
+    slab_bytes: Option<u64>,
+    pgmajfault_total: Option<u64>,
+    workingset_refault_anon_total: Option<u64>,
+    workingset_refault_file_total: Option<u64>,
+}
+
+/// Parses a cgroup v2 `memory.stat` file (`key value` lines, one per field)
+/// into the curated subset of fields tracked here. Pure so it can be tested
+/// without a fixture directory. Unrecognized lines and unparseable values are
+/// silently skipped rather than treated as an error — `memory.stat` carries
+/// many more fields than are curated here, and a kernel adding a new one
+/// should not make this parser fail.
+fn parse_memory_stat(content: &str) -> MemoryStat {
+    let mut values: HashMap<&str, u64> = HashMap::new();
+    for line in content.lines() {
+        if let Some((key, value)) = line.split_once(' ')
+            && let Ok(v) = value.trim().parse::<u64>()
+        {
+            values.insert(key, v);
+        }
+    }
+    MemoryStat {
+        anon_bytes: values.get("anon").copied(),
+        file_bytes: values.get("file").copied(),
+        slab_bytes: values.get("slab").copied(),
+        pgmajfault_total: values.get("pgmajfault").copied(),
+        workingset_refault_anon_total: values.get("workingset_refault_anon").copied(),
+        workingset_refault_file_total: values.get("workingset_refault_file").copied(),
+    }
+}
+
+/// The non-CPU signals read from a single container's cgroup v2 directory in
+/// one scan. `None` fields mean the file was missing or unreadable (older
+/// kernels, a controller not delegated to this cgroup) rather than a real
+/// zero reading.
+#[derive(Debug, Default, PartialEq)]
+struct CgroupSignals {
+    memory_pressure: Option<PsiSnapshot>,
+    io_pressure: Option<PsiSnapshot>,
+    memory_bytes: Option<u64>,
+    io_bytes: u64,
+    memory_stat: MemoryStat,
+}
+
+/// Reads `memory.pressure`, `io.pressure`, `memory.current`, `io.stat` and
+/// `memory.stat` from a cgroup v2 directory, sibling to the `cpu.pressure`
+/// file the scan loop is anchored on. Pure and side-effect free so it can be
+/// tested against a fixture directory without driving the async scan loop.
+fn read_cgroup_signals(cgroup_dir: &Path) -> CgroupSignals {
+    CgroupSignals {
+        memory_pressure: std::fs::read_to_string(cgroup_dir.join("memory.pressure"))
+            .ok()
+            .and_then(|c| parse_psi_file(&c).ok()),
+        io_pressure: std::fs::read_to_string(cgroup_dir.join("io.pressure"))
+            .ok()
+            .and_then(|c| parse_psi_file(&c).ok()),
+        memory_bytes: read_memory_current(&cgroup_dir.join("memory.current")),
+        io_bytes: std::fs::read_to_string(cgroup_dir.join("io.stat"))
+            .ok()
+            .map(|c| parse_io_stat(&c))
+            .unwrap_or(0),
+        memory_stat: std::fs::read_to_string(cgroup_dir.join("memory.stat"))
+            .ok()
+            .map(|c| parse_memory_stat(&c))
+            .unwrap_or_default(),
+    }
+}
+
+/// Adds an optional per-container reading into a pod-level accumulator.
+/// `None` (field absent on this container, e.g. an older kernel) leaves the
+/// accumulator untouched rather than being treated as zero — a pod is only
+/// reported `None` for a field if *no* container this scan exposed it.
+fn accumulate_optional(acc: &mut Option<u64>, value: Option<u64>) {
+    if let Some(v) = value {
+        *acc = Some(acc.unwrap_or(0).saturating_add(v));
+    }
+}
+
 fn find_psi_files(base_path: &Path) -> Vec<PathBuf> {
     WalkDir::new(base_path)
         .into_iter()
@@ -133,8 +296,78 @@ fn extract_container_id(cgroup_path: &Path) -> Option<String> {
     (id.len() == 64).then(|| id.to_string())
 }
 
-const HISTORY_SIZE: usize = 10;
 const STALL_THRESHOLD_US: u64 = 100_000; // 100ms threshold for significant stall
+
+/// A candidate offender's CPU share, at or above which it counts as "busy" for
+/// onset bookkeeping (`consumer_busy_since`). Below this it is treated as idle
+/// and its busy-since start time is cleared, so a pod that dips under the bar
+/// and later spikes again gets a fresh onset rather than one dated to its
+/// first, unrelated blip.
+const CONSUMER_BUSY_CPU_PERCENT: f32 = 5.0;
+
+/// Offender candidates captured onto a `StallEvent`, beyond the victim itself.
+/// Bounds episode-capture size on a node with many concurrent consumers.
+const MAX_CANDIDATE_OFFENDERS: usize = 10;
+
+/// How many samples of history (at the scan loop's 1-second cadence) to keep
+/// per signal per pod/container.
+///
+/// Must comfortably exceed `sustained_pressure_seconds`: the trigger fires
+/// only after pressure has been sustained that long, so retained history
+/// shorter than that window can never reach back to a pre-pressure baseline
+/// -- onset detection would be structurally impossible regardless of how it's
+/// computed. The `+ 20` pads for baseline samples before the deviation
+/// starts; the `.max(15)` floors capacity even when a test or a real config
+/// sets `sustained_pressure_seconds` to 0.
+fn compute_history_capacity(sustained_pressure_seconds: u64) -> usize {
+    (sustained_pressure_seconds.max(15) as usize) * 2 + 20
+}
+
+/// Milliseconds from `start` to `now`, negated: the deviation preceded the
+/// trigger, so the offset is always zero or negative. A thin wrapper so the
+/// sign convention lives in one place and call sites read as English
+/// ("onset_offset_ms(now, pressure_start_time)") rather than repeating the
+/// negation and the cast.
+fn onset_offset_ms(now: Instant, start: Instant) -> i64 {
+    -(now.duration_since(start).as_millis() as i64)
+}
+
+/// Assembles the per-candidate windows attached to a `StallEvent`: one for
+/// the victim (its own retained signal series), and one per offender still
+/// tracked in `consumer_busy_since`. Free-standing and pure so it can be
+/// tested without driving the scan loop.
+fn build_candidate_windows(
+    victim: PodRef,
+    victim_owner_kind: Option<String>,
+    victim_owner_name: Option<String>,
+    victim_pre_window: BTreeMap<String, Vec<f64>>,
+    victim_onset_ms: Option<i64>,
+    sample_interval_ms: u64,
+    offenders: &[(PodRef, Option<i64>)],
+) -> Vec<CandidateWindow> {
+    let mut candidates = Vec::with_capacity(1 + offenders.len());
+    candidates.push(CandidateWindow {
+        pod: victim,
+        owner_kind: victim_owner_kind,
+        owner_name: victim_owner_name,
+        pre_window: victim_pre_window,
+        post_window: BTreeMap::new(),
+        sample_interval_ms,
+        first_deviation_offset_ms: victim_onset_ms,
+    });
+    for (pod, onset_ms) in offenders.iter().take(MAX_CANDIDATE_OFFENDERS) {
+        candidates.push(CandidateWindow {
+            pod: pod.clone(),
+            owner_kind: None,
+            owner_name: None,
+            pre_window: BTreeMap::new(),
+            post_window: BTreeMap::new(),
+            sample_interval_ms,
+            first_deviation_offset_ms: *onset_ms,
+        });
+    }
+    candidates
+}
 
 /// Fork count over a detection window at which an offender is considered to be
 /// forking as hard as the score can express. Beyond this the term saturates, so
@@ -165,12 +398,46 @@ pub struct PsiMonitor {
     context: Arc<ContextStore>,
     incident_store: Option<Arc<crate::incidents::IncidentStore>>,
     sink: Arc<AttributionSink>,
-    /// Container-level histories keyed by container id. PSI counters are
-    /// emitted by container cgroups; pod-level stall windows are derived by
-    /// summing same-scan container deltas after each container cursor advances.
+    /// Container-level CPU-pressure histories keyed by container id. PSI
+    /// counters are emitted by container cgroups; pod-level stall windows are
+    /// derived by summing same-scan container deltas after each container
+    /// cursor advances. CPU is the sole detection signal (`STALL_THRESHOLD_US`
+    /// below applies only here) — memory/io deltas are computed the same way
+    /// but only ever recorded onto a `StallEvent` that CPU pressure already
+    /// triggered, never used to trigger one themselves.
     history: HashMap<String, VecDeque<PsiSnapshot>>,
+    memory_history: HashMap<String, VecDeque<PsiSnapshot>>,
+    io_history: HashMap<String, VecDeque<PsiSnapshot>>,
+    /// Pod-keyed (not container-keyed) per-scan stall-delta series, retained
+    /// across scans so a trigger can attach the victim's own signal history
+    /// to its `CandidateWindow`. Pushed once per scan from the same deltas
+    /// `pod_deltas` already computes; unlike `history` above these are plain
+    /// `f64` samples (episode series are signal-agnostic vectors) rather than
+    /// cumulative `PsiSnapshot`s.
+    pod_cpu_stall_series: HashMap<String, VecDeque<f64>>,
+    pod_memory_stall_series: HashMap<String, VecDeque<f64>>,
+    pod_io_stall_series: HashMap<String, VecDeque<f64>>,
+    /// Each container's most recent `memory.stat` reading, keyed the same way
+    /// as `history`. Only the counter fields are ever read back out of this
+    /// (`pgmajfault_total`, `workingset_refault_*_total`) — they're needed to
+    /// delta this scan's cumulative counters against the last one, the same
+    /// way `history` backs `delta_stall_us`. The gauge fields are stored too
+    /// only because `MemoryStat` is one struct; they are not read back.
+    memory_stat_history: HashMap<String, MemoryStat>,
+    /// When each concurrent CPU consumer pod most recently transitioned from
+    /// idle to busy (>= `CONSUMER_BUSY_CPU_PERCENT`). Sampled once per scan,
+    /// but only while some pod's `pressure_start_time` is active -- gating
+    /// avoids walking the live process map every second on an otherwise-quiet
+    /// node. This is deliberately start-time bookkeeping rather than a full
+    /// per-tick series (see `StallEvent::candidates` doc comment): cheap, and
+    /// enough to give offender candidates a real (not fabricated) onset.
+    consumer_busy_since: HashMap<String, Instant>,
     pressure_start_time: HashMap<String, Instant>,
     sustained_pressure_duration: Duration,
+    /// Sample cap for every history map above, sized from
+    /// `sustained_pressure_duration` by `compute_history_capacity` so it can
+    /// always reach back to a pre-pressure baseline.
+    history_capacity: usize,
     cgroup_root: PathBuf,
     /// When set, `run` stops after this many scans instead of looping forever.
     max_iterations: Option<u64>,
@@ -181,6 +448,17 @@ struct PodPsiDelta {
     namespace: String,
     delta_stall_us: u64,
     has_previous_sample: bool,
+    memory_delta_stall_us: u64,
+    io_delta_stall_us: u64,
+    memory_bytes: u64,
+    io_bytes: u64,
+    memory_anon_bytes: Option<u64>,
+    memory_file_bytes: Option<u64>,
+    memory_slab_bytes: Option<u64>,
+    memory_pgmajfault_delta: Option<u64>,
+    workingset_refault_delta: Option<u64>,
+    owner_kind: Option<String>,
+    owner_name: Option<String>,
 }
 
 impl PsiMonitor {
@@ -197,8 +475,16 @@ impl PsiMonitor {
             incident_store,
             sink,
             history: HashMap::new(),
+            memory_history: HashMap::new(),
+            io_history: HashMap::new(),
+            pod_cpu_stall_series: HashMap::new(),
+            pod_memory_stall_series: HashMap::new(),
+            pod_io_stall_series: HashMap::new(),
+            memory_stat_history: HashMap::new(),
+            consumer_busy_since: HashMap::new(),
             pressure_start_time: HashMap::new(),
             sustained_pressure_duration: Duration::from_secs(sustained_pressure_seconds),
+            history_capacity: compute_history_capacity(sustained_pressure_seconds),
             cgroup_root: PathBuf::from("/sys/fs/cgroup"),
             max_iterations: None,
         }
@@ -242,6 +528,17 @@ impl PsiMonitor {
                             namespace: meta.namespace.clone(),
                             delta_stall_us: 0,
                             has_previous_sample: false,
+                            memory_delta_stall_us: 0,
+                            io_delta_stall_us: 0,
+                            memory_bytes: 0,
+                            io_bytes: 0,
+                            memory_anon_bytes: None,
+                            memory_file_bytes: None,
+                            memory_slab_bytes: None,
+                            memory_pgmajfault_delta: None,
+                            workingset_refault_delta: None,
+                            owner_kind: meta.owner_kind.clone(),
+                            owner_name: meta.owner_name.clone(),
                         });
 
                     self.sink.metrics().record_victim_pressure(
@@ -255,7 +552,7 @@ impl PsiMonitor {
                     // deltas are aggregated after every container's own
                     // cursor has been advanced, so sibling containers never
                     // compare their cumulative counters against each other.
-                    let hist = self.history.entry(container_id).or_default();
+                    let hist = self.history.entry(container_id.clone()).or_default();
 
                     // Calculate delta if we have previous snapshot
                     let delta_stall_opt = hist
@@ -266,7 +563,7 @@ impl PsiMonitor {
                     hist.push_back(snapshot);
 
                     // Keep only last N snapshots
-                    if hist.len() > HISTORY_SIZE {
+                    if hist.len() > self.history_capacity {
                         hist.pop_front();
                     }
 
@@ -274,6 +571,132 @@ impl PsiMonitor {
                         pod_delta.has_previous_sample = true;
                         pod_delta.delta_stall_us =
                             pod_delta.delta_stall_us.saturating_add(delta_stall);
+                    }
+
+                    // memory.pressure, io.pressure, memory.current and io.stat
+                    // all sit in the same cgroup v2 directory as the
+                    // cpu.pressure file this scan is anchored on, so no
+                    // separate directory walk is needed. These are recorded
+                    // for episode capture only — CPU pressure above remains
+                    // the sole trigger, and none of this feeds
+                    // `calculate_blame_attributions`.
+                    if let Some(cgroup_dir) = path.parent() {
+                        let signals = read_cgroup_signals(cgroup_dir);
+
+                        if let Some(mem_snapshot) = signals.memory_pressure {
+                            let mem_hist =
+                                self.memory_history.entry(container_id.clone()).or_default();
+                            if let Some(prev) = mem_hist.back() {
+                                pod_delta.memory_delta_stall_us =
+                                    pod_delta.memory_delta_stall_us.saturating_add(
+                                        mem_snapshot.some_total.saturating_sub(prev.some_total),
+                                    );
+                            }
+                            mem_hist.push_back(mem_snapshot);
+                            if mem_hist.len() > self.history_capacity {
+                                mem_hist.pop_front();
+                            }
+                        }
+
+                        if let Some(io_snapshot) = signals.io_pressure {
+                            let io_hist = self.io_history.entry(container_id.clone()).or_default();
+                            if let Some(prev) = io_hist.back() {
+                                pod_delta.io_delta_stall_us =
+                                    pod_delta.io_delta_stall_us.saturating_add(
+                                        io_snapshot.some_total.saturating_sub(prev.some_total),
+                                    );
+                            }
+                            io_hist.push_back(io_snapshot);
+                            if io_hist.len() > self.history_capacity {
+                                io_hist.pop_front();
+                            }
+                        }
+
+                        if let Some(mem_bytes) = signals.memory_bytes {
+                            pod_delta.memory_bytes =
+                                pod_delta.memory_bytes.saturating_add(mem_bytes);
+                        }
+
+                        pod_delta.io_bytes = pod_delta.io_bytes.saturating_add(signals.io_bytes);
+
+                        // memory.stat gauges are a point-in-time snapshot
+                        // (summed across containers, like memory_bytes
+                        // above); its counters are cumulative since cgroup
+                        // creation, so they're delta'd against this
+                        // container's previous reading first, same as
+                        // delta_stall_us.
+                        accumulate_optional(
+                            &mut pod_delta.memory_anon_bytes,
+                            signals.memory_stat.anon_bytes,
+                        );
+                        accumulate_optional(
+                            &mut pod_delta.memory_file_bytes,
+                            signals.memory_stat.file_bytes,
+                        );
+                        accumulate_optional(
+                            &mut pod_delta.memory_slab_bytes,
+                            signals.memory_stat.slab_bytes,
+                        );
+
+                        let prev_stat = self.memory_stat_history.get(&container_id).cloned();
+
+                        if let (Some(prev), Some(cur)) = (
+                            prev_stat.as_ref().and_then(|p| p.pgmajfault_total),
+                            signals.memory_stat.pgmajfault_total,
+                        ) {
+                            accumulate_optional(
+                                &mut pod_delta.memory_pgmajfault_delta,
+                                Some(cur.saturating_sub(prev)),
+                            );
+                        }
+
+                        let refault_delta = match (
+                            prev_stat
+                                .as_ref()
+                                .and_then(|p| p.workingset_refault_anon_total),
+                            signals.memory_stat.workingset_refault_anon_total,
+                            prev_stat
+                                .as_ref()
+                                .and_then(|p| p.workingset_refault_file_total),
+                            signals.memory_stat.workingset_refault_file_total,
+                        ) {
+                            (Some(prev_anon), Some(cur_anon), Some(prev_file), Some(cur_file)) => {
+                                Some(
+                                    cur_anon.saturating_sub(prev_anon)
+                                        + cur_file.saturating_sub(prev_file),
+                                )
+                            }
+                            _ => None,
+                        };
+                        accumulate_optional(&mut pod_delta.workingset_refault_delta, refault_delta);
+
+                        self.memory_stat_history
+                            .insert(container_id.clone(), signals.memory_stat);
+                    }
+                }
+            }
+
+            // Retain this scan's per-pod deltas as a series, keyed the same
+            // way as `pod_deltas` itself. Pushed unconditionally (including
+            // zero-delta scans) so the series' sample spacing stays uniform
+            // at the scan loop's 1-second cadence -- a series with dropped
+            // quiet samples would make `sample_interval_ms` a lie.
+            for (key, pod_delta) in &pod_deltas {
+                if !pod_delta.has_previous_sample {
+                    continue;
+                }
+                for (series, value) in [
+                    (&mut self.pod_cpu_stall_series, pod_delta.delta_stall_us),
+                    (
+                        &mut self.pod_memory_stall_series,
+                        pod_delta.memory_delta_stall_us,
+                    ),
+                    (&mut self.pod_io_stall_series, pod_delta.io_delta_stall_us),
+                ] {
+                    let samples = series.entry(key.clone()).or_default();
+                    samples.push_back(value as f64);
+                    if samples.len() > self.history_capacity {
+                        samples.pop_front();
                     }
                 }
             }
@@ -310,6 +733,61 @@ impl PsiMonitor {
                                 .context
                                 .get_pod_activity_window(self.sustained_pressure_duration);
 
+                            let mut victim_pre_window: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+                            victim_pre_window.insert(
+                                "cpu_stall_us".to_string(),
+                                self.pod_cpu_stall_series
+                                    .get(&key)
+                                    .map(|s| s.iter().copied().collect())
+                                    .unwrap_or_default(),
+                            );
+                            victim_pre_window.insert(
+                                "memory_stall_us".to_string(),
+                                self.pod_memory_stall_series
+                                    .get(&key)
+                                    .map(|s| s.iter().copied().collect())
+                                    .unwrap_or_default(),
+                            );
+                            victim_pre_window.insert(
+                                "io_stall_us".to_string(),
+                                self.pod_io_stall_series
+                                    .get(&key)
+                                    .map(|s| s.iter().copied().collect())
+                                    .unwrap_or_default(),
+                            );
+
+                            let offenders: Vec<(PodRef, Option<i64>)> = consumers
+                                .iter()
+                                .filter(|c| format!("{}/{}", c.namespace, c.pod) != key)
+                                .map(|c| {
+                                    let consumer_key = format!("{}/{}", c.namespace, c.pod);
+                                    let onset_ms = self
+                                        .consumer_busy_since
+                                        .get(&consumer_key)
+                                        .map(|start| onset_offset_ms(now, *start));
+                                    (
+                                        PodRef {
+                                            namespace: c.namespace.clone(),
+                                            pod: c.pod.clone(),
+                                        },
+                                        onset_ms,
+                                    )
+                                })
+                                .collect();
+
+                            let candidates = build_candidate_windows(
+                                PodRef {
+                                    namespace: pod_delta.namespace.clone(),
+                                    pod: pod_delta.pod_name.clone(),
+                                },
+                                pod_delta.owner_kind.clone(),
+                                pod_delta.owner_name.clone(),
+                                victim_pre_window,
+                                Some(onset_offset_ms(now, start_time)),
+                                1000,
+                                &offenders,
+                            );
+
                             let stall_event = StallEvent {
                                 event_id: uuid::Uuid::new_v4().to_string(),
                                 victim_pod: pod_delta.pod_name.clone(),
@@ -317,15 +795,27 @@ impl PsiMonitor {
                                 stall_delta_us: delta_stall,
                                 timestamp: now,
                                 concurrent_consumers: consumers.clone(),
+                                memory_stall_delta_us: pod_delta.memory_delta_stall_us,
+                                io_stall_delta_us: pod_delta.io_delta_stall_us,
+                                memory_bytes: pod_delta.memory_bytes,
+                                io_bytes: pod_delta.io_bytes,
+                                memory_anon_bytes: pod_delta.memory_anon_bytes,
+                                memory_file_bytes: pod_delta.memory_file_bytes,
+                                memory_slab_bytes: pod_delta.memory_slab_bytes,
+                                memory_pgmajfault_delta: pod_delta.memory_pgmajfault_delta,
+                                workingset_refault_delta: pod_delta.workingset_refault_delta,
                                 fork_counts,
                                 short_job_counts,
+                                candidates,
                             };
 
                             info!(
-                                "[psi] StallEvent: {}/{} stalled {}us with {} concurrent consumers",
+                                "[psi] StallEvent: {}/{} stalled {}us (mem={}us io={}us) with {} concurrent consumers",
                                 stall_event.victim_namespace,
                                 stall_event.victim_pod,
                                 stall_event.stall_delta_us,
+                                stall_event.memory_stall_delta_us,
+                                stall_event.io_stall_delta_us,
                                 consumers.len()
                             );
 
@@ -372,6 +862,22 @@ impl PsiMonitor {
                 } else {
                     // No pressure, reset timer
                     self.pressure_start_time.remove(&key);
+                }
+            }
+
+            // Update offender-candidate onset bookkeeping. Gated on some pod
+            // already being tracked for sustained pressure so a quiet node
+            // never pays the cost of walking the live process map -- see the
+            // `consumer_busy_since` field doc comment.
+            if !self.pressure_start_time.is_empty() {
+                let now = Instant::now();
+                for c in self.get_concurrent_cpu_consumers() {
+                    let key = format!("{}/{}", c.namespace, c.pod);
+                    if c.cpu_percent >= CONSUMER_BUSY_CPU_PERCENT {
+                        self.consumer_busy_since.entry(key).or_insert(now);
+                    } else {
+                        self.consumer_busy_since.remove(&key);
+                    }
                 }
             }
 
@@ -547,6 +1053,72 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_io_stat_sums_rbytes_and_wbytes_across_devices() {
+        let content = "8:0 rbytes=1000 wbytes=2000 rios=1 wios=2 dbytes=0 dios=0\n\
+                        8:16 rbytes=500 wbytes=250 rios=1 wios=1 dbytes=0 dios=0\n";
+        assert_eq!(parse_io_stat(content), 1000 + 2000 + 500 + 250);
+    }
+
+    #[test]
+    fn test_parse_io_stat_empty_is_zero() {
+        assert_eq!(parse_io_stat(""), 0);
+    }
+
+    #[test]
+    fn test_read_memory_current() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("memory.current");
+        std::fs::write(&path, "12345\n").unwrap();
+        assert_eq!(read_memory_current(&path), Some(12345));
+    }
+
+    #[test]
+    fn test_read_memory_current_missing_file_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            read_memory_current(&tmp.path().join("memory.current")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_read_cgroup_signals_reads_all_four_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("memory.pressure"),
+            "some avg10=0.00 avg60=0.00 avg300=0.00 total=111\n\
+             full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("io.pressure"),
+            "some avg10=0.00 avg60=0.00 avg300=0.00 total=222\n\
+             full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("memory.current"), "4096\n").unwrap();
+        std::fs::write(
+            tmp.path().join("io.stat"),
+            "8:0 rbytes=10 wbytes=20 rios=1 wios=1 dbytes=0 dios=0\n",
+        )
+        .unwrap();
+
+        let signals = read_cgroup_signals(tmp.path());
+
+        assert_eq!(signals.memory_pressure.unwrap().some_total, 111);
+        assert_eq!(signals.io_pressure.unwrap().some_total, 222);
+        assert_eq!(signals.memory_bytes, Some(4096));
+        assert_eq!(signals.io_bytes, 30);
+    }
+
+    #[test]
+    fn test_read_cgroup_signals_missing_files_read_as_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let signals = read_cgroup_signals(tmp.path());
+        assert_eq!(signals, CgroupSignals::default());
+    }
+
+    #[test]
     fn test_extract_container_id() {
         let path = Path::new(
             "/sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice/cri-containerd-e4063920952d766348421832d2df465324397166164478852332152342342342.scope/cpu.pressure",
@@ -584,6 +1156,16 @@ mod tests {
                     cpu_percent: 10.0,
                 },
             ],
+            memory_stall_delta_us: 0,
+            io_stall_delta_us: 0,
+            memory_bytes: 0,
+            io_bytes: 0,
+            memory_anon_bytes: None,
+            memory_file_bytes: None,
+            memory_slab_bytes: None,
+            memory_pgmajfault_delta: None,
+            workingset_refault_delta: None,
+            candidates: vec![],
             fork_counts,
             short_job_counts,
         };
@@ -616,5 +1198,169 @@ mod tests {
             .unwrap();
         assert!((short_attr.blame_score - 1.0).abs() < 0.001);
         assert_eq!(short_attr.short_job_count, 100);
+    }
+
+    #[test]
+    fn test_compute_history_capacity_exceeds_sustained_pressure_window() {
+        // The floor keeps a 0- or short-configured duration from starving
+        // history entirely -- a trigger that fires almost immediately still
+        // needs somewhere to record baseline samples.
+        assert_eq!(compute_history_capacity(0), 50);
+        assert_eq!(compute_history_capacity(15), 50);
+        // Above the floor, capacity tracks the configured duration so a
+        // longer sustained-pressure window still leaves room for a
+        // pre-pressure baseline instead of being entirely consumed by it.
+        assert_eq!(compute_history_capacity(60), 140);
+        assert!(compute_history_capacity(60) > 60);
+    }
+
+    #[test]
+    fn test_onset_offset_ms_is_negative_elapsed_time() {
+        let start = Instant::now();
+        std::thread::sleep(Duration::from_millis(5));
+        let now = Instant::now();
+        let offset = onset_offset_ms(now, start);
+        assert!(offset <= -5, "offset was {offset}, expected <= -5");
+    }
+
+    #[test]
+    fn test_onset_offset_ms_is_zero_when_start_equals_now() {
+        let now = Instant::now();
+        assert_eq!(onset_offset_ms(now, now), 0);
+    }
+
+    #[test]
+    fn test_build_candidate_windows_carries_victim_series_and_offender_onsets() {
+        let victim = PodRef {
+            namespace: "prod".to_string(),
+            pod: "payment-api".to_string(),
+        };
+        let mut victim_pre_window = BTreeMap::new();
+        victim_pre_window.insert("cpu_stall_us".to_string(), vec![0.0, 50_000.0, 120_000.0]);
+
+        let offenders = vec![
+            (
+                PodRef {
+                    namespace: "prod".to_string(),
+                    pod: "image-resize-worker".to_string(),
+                },
+                Some(-9_000i64),
+            ),
+            (
+                PodRef {
+                    namespace: "prod".to_string(),
+                    pod: "sidecar-proxy".to_string(),
+                },
+                None,
+            ),
+        ];
+
+        let candidates = build_candidate_windows(
+            victim.clone(),
+            Some("Deployment".to_string()),
+            Some("payment-api".to_string()),
+            victim_pre_window.clone(),
+            Some(-15_000),
+            1000,
+            &offenders,
+        );
+
+        assert_eq!(candidates.len(), 3);
+
+        let victim_window = &candidates[0];
+        assert_eq!(victim_window.pod, victim);
+        assert_eq!(victim_window.owner_kind.as_deref(), Some("Deployment"));
+        assert_eq!(victim_window.pre_window, victim_pre_window);
+        assert_eq!(victim_window.post_window, BTreeMap::new());
+        assert_eq!(victim_window.first_deviation_offset_ms, Some(-15_000));
+
+        let hog_window = &candidates[1];
+        assert_eq!(hog_window.pod.pod, "image-resize-worker");
+        assert!(hog_window.pre_window.is_empty());
+        assert_eq!(hog_window.first_deviation_offset_ms, Some(-9_000));
+
+        let untracked_window = &candidates[2];
+        assert_eq!(untracked_window.pod.pod, "sidecar-proxy");
+        assert_eq!(untracked_window.first_deviation_offset_ms, None);
+    }
+
+    #[test]
+    fn test_build_candidate_windows_caps_offenders_at_the_max() {
+        let victim = PodRef {
+            namespace: "prod".to_string(),
+            pod: "payment-api".to_string(),
+        };
+        let offenders: Vec<(PodRef, Option<i64>)> = (0..MAX_CANDIDATE_OFFENDERS + 5)
+            .map(|i| {
+                (
+                    PodRef {
+                        namespace: "prod".to_string(),
+                        pod: format!("neighbour-{i}"),
+                    },
+                    None,
+                )
+            })
+            .collect();
+
+        let candidates =
+            build_candidate_windows(victim, None, None, BTreeMap::new(), None, 1000, &offenders);
+
+        // +1 for the victim's own window.
+        assert_eq!(candidates.len(), MAX_CANDIDATE_OFFENDERS + 1);
+    }
+
+    #[test]
+    fn test_parse_memory_stat_reads_curated_fields() {
+        let content = "\
+anon 61566976
+file 4096
+kernel_stack 36864
+slab 1048576
+pgfault 9001
+pgmajfault 12
+workingset_refault_anon 3
+workingset_refault_file 7
+";
+        let stat = parse_memory_stat(content);
+        assert_eq!(stat.anon_bytes, Some(61_566_976));
+        assert_eq!(stat.file_bytes, Some(4_096));
+        assert_eq!(stat.slab_bytes, Some(1_048_576));
+        assert_eq!(stat.pgmajfault_total, Some(12));
+        assert_eq!(stat.workingset_refault_anon_total, Some(3));
+        assert_eq!(stat.workingset_refault_file_total, Some(7));
+    }
+
+    #[test]
+    fn test_parse_memory_stat_leaves_missing_fields_none_not_zero() {
+        // An older kernel's memory.stat lacking a curated field must not be
+        // read as a real zero reading -- only the fields actually present
+        // are populated.
+        let stat = parse_memory_stat("anon 100\n");
+        assert_eq!(stat.anon_bytes, Some(100));
+        assert_eq!(stat.file_bytes, None);
+        assert_eq!(stat.pgmajfault_total, None);
+    }
+
+    #[test]
+    fn test_parse_memory_stat_skips_unparseable_lines() {
+        let stat = parse_memory_stat("anon not_a_number\nfile 42\ngarbage line here\n");
+        assert_eq!(stat.anon_bytes, None);
+        assert_eq!(stat.file_bytes, Some(42));
+    }
+
+    #[test]
+    fn test_accumulate_optional_sums_present_values_and_ignores_none() {
+        let mut acc: Option<u64> = None;
+        accumulate_optional(&mut acc, Some(10));
+        accumulate_optional(&mut acc, None);
+        accumulate_optional(&mut acc, Some(5));
+        assert_eq!(acc, Some(15));
+    }
+
+    #[test]
+    fn test_accumulate_optional_stays_none_when_nothing_ever_present() {
+        let mut acc: Option<u64> = None;
+        accumulate_optional(&mut acc, None);
+        assert_eq!(acc, None);
     }
 }
