@@ -66,6 +66,23 @@ pub struct StallEvent {
     /// Snapshot of `io.stat` (rbytes + wbytes summed across devices and
     /// containers) at trigger time.
     pub io_bytes: u64,
+    /// Point-in-time snapshot of `memory.stat`'s anon/file/slab bytes, summed
+    /// across the victim pod's containers at trigger time. `None` when no
+    /// container exposed the field this scan — unlike `memory_bytes` above,
+    /// `memory.stat`'s field set moves with kernel version, so a missing
+    /// field here cannot be safely folded into zero.
+    pub memory_anon_bytes: Option<u64>,
+    pub memory_file_bytes: Option<u64>,
+    pub memory_slab_bytes: Option<u64>,
+    /// Counters from `memory.stat`, delta'd over the same window as
+    /// `stall_delta_us` the same way `memory_stall_delta_us` is (current
+    /// reading minus the container's previous scan). Major faults and
+    /// reclaim-driven refaults are thrashing indicators — what turns "using a
+    /// lot of memory" into "the kernel is fighting to keep it". `None` when
+    /// no container exposed the counter, or none had a previous sample yet.
+    pub memory_pgmajfault_delta: Option<u64>,
+    /// Sum of `workingset_refault_anon` + `workingset_refault_file` deltas.
+    pub workingset_refault_delta: Option<u64>,
     /// The victim plus every offender candidate's own signal window,
     /// captured for episode replay. The victim's `pre_window` carries its
     /// retained cpu/memory/io stall-delta series; offender candidates carry
@@ -163,6 +180,51 @@ fn read_memory_current(path: &Path) -> Option<u64> {
         .ok()
 }
 
+/// Fields read from a cgroup v2 `memory.stat` file, split by shape rather
+/// than kept in one undifferentiated map: `memory.stat` mixes point-in-time
+/// gauges (`anon`, `file`, `slab`) with monotonic counters accrued since the
+/// cgroup was created (`pgmajfault`, `workingset_refault_*`). Collapsing both
+/// into one `HashMap<String, u64>` would let a reader treat a lifetime
+/// counter as "bytes during the stall" — the same naming trap `io_bytes`
+/// already carries elsewhere in this file. Every field is `Option` rather
+/// than defaulting to zero: `memory.stat`'s field set moves with kernel
+/// version (`zswap` is 5.19+, `pagetables` ~5.16+), so a missing field on an
+/// older kernel must stay distinguishable from a real zero reading.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct MemoryStat {
+    anon_bytes: Option<u64>,
+    file_bytes: Option<u64>,
+    slab_bytes: Option<u64>,
+    pgmajfault_total: Option<u64>,
+    workingset_refault_anon_total: Option<u64>,
+    workingset_refault_file_total: Option<u64>,
+}
+
+/// Parses a cgroup v2 `memory.stat` file (`key value` lines, one per field)
+/// into the curated subset of fields tracked here. Pure so it can be tested
+/// without a fixture directory. Unrecognized lines and unparseable values are
+/// silently skipped rather than treated as an error — `memory.stat` carries
+/// many more fields than are curated here, and a kernel adding a new one
+/// should not make this parser fail.
+fn parse_memory_stat(content: &str) -> MemoryStat {
+    let mut values: HashMap<&str, u64> = HashMap::new();
+    for line in content.lines() {
+        if let Some((key, value)) = line.split_once(' ')
+            && let Ok(v) = value.trim().parse::<u64>()
+        {
+            values.insert(key, v);
+        }
+    }
+    MemoryStat {
+        anon_bytes: values.get("anon").copied(),
+        file_bytes: values.get("file").copied(),
+        slab_bytes: values.get("slab").copied(),
+        pgmajfault_total: values.get("pgmajfault").copied(),
+        workingset_refault_anon_total: values.get("workingset_refault_anon").copied(),
+        workingset_refault_file_total: values.get("workingset_refault_file").copied(),
+    }
+}
+
 /// The non-CPU signals read from a single container's cgroup v2 directory in
 /// one scan. `None` fields mean the file was missing or unreadable (older
 /// kernels, a controller not delegated to this cgroup) rather than a real
@@ -173,12 +235,13 @@ struct CgroupSignals {
     io_pressure: Option<PsiSnapshot>,
     memory_bytes: Option<u64>,
     io_bytes: u64,
+    memory_stat: MemoryStat,
 }
 
-/// Reads `memory.pressure`, `io.pressure`, `memory.current` and `io.stat` from
-/// a cgroup v2 directory, sibling to the `cpu.pressure` file the scan loop is
-/// anchored on. Pure and side-effect free so it can be tested against a
-/// fixture directory without driving the async scan loop.
+/// Reads `memory.pressure`, `io.pressure`, `memory.current`, `io.stat` and
+/// `memory.stat` from a cgroup v2 directory, sibling to the `cpu.pressure`
+/// file the scan loop is anchored on. Pure and side-effect free so it can be
+/// tested against a fixture directory without driving the async scan loop.
 fn read_cgroup_signals(cgroup_dir: &Path) -> CgroupSignals {
     CgroupSignals {
         memory_pressure: std::fs::read_to_string(cgroup_dir.join("memory.pressure"))
@@ -192,6 +255,20 @@ fn read_cgroup_signals(cgroup_dir: &Path) -> CgroupSignals {
             .ok()
             .map(|c| parse_io_stat(&c))
             .unwrap_or(0),
+        memory_stat: std::fs::read_to_string(cgroup_dir.join("memory.stat"))
+            .ok()
+            .map(|c| parse_memory_stat(&c))
+            .unwrap_or_default(),
+    }
+}
+
+/// Adds an optional per-container reading into a pod-level accumulator.
+/// `None` (field absent on this container, e.g. an older kernel) leaves the
+/// accumulator untouched rather than being treated as zero — a pod is only
+/// reported `None` for a field if *no* container this scan exposed it.
+fn accumulate_optional(acc: &mut Option<u64>, value: Option<u64>) {
+    if let Some(v) = value {
+        *acc = Some(acc.unwrap_or(0).saturating_add(v));
     }
 }
 
@@ -340,6 +417,13 @@ pub struct PsiMonitor {
     pod_cpu_stall_series: HashMap<String, VecDeque<f64>>,
     pod_memory_stall_series: HashMap<String, VecDeque<f64>>,
     pod_io_stall_series: HashMap<String, VecDeque<f64>>,
+    /// Each container's most recent `memory.stat` reading, keyed the same way
+    /// as `history`. Only the counter fields are ever read back out of this
+    /// (`pgmajfault_total`, `workingset_refault_*_total`) — they're needed to
+    /// delta this scan's cumulative counters against the last one, the same
+    /// way `history` backs `delta_stall_us`. The gauge fields are stored too
+    /// only because `MemoryStat` is one struct; they are not read back.
+    memory_stat_history: HashMap<String, MemoryStat>,
     /// When each concurrent CPU consumer pod most recently transitioned from
     /// idle to busy (>= `CONSUMER_BUSY_CPU_PERCENT`). Sampled once per scan,
     /// but only while some pod's `pressure_start_time` is active -- gating
@@ -368,6 +452,11 @@ struct PodPsiDelta {
     io_delta_stall_us: u64,
     memory_bytes: u64,
     io_bytes: u64,
+    memory_anon_bytes: Option<u64>,
+    memory_file_bytes: Option<u64>,
+    memory_slab_bytes: Option<u64>,
+    memory_pgmajfault_delta: Option<u64>,
+    workingset_refault_delta: Option<u64>,
     owner_kind: Option<String>,
     owner_name: Option<String>,
 }
@@ -391,6 +480,7 @@ impl PsiMonitor {
             pod_cpu_stall_series: HashMap::new(),
             pod_memory_stall_series: HashMap::new(),
             pod_io_stall_series: HashMap::new(),
+            memory_stat_history: HashMap::new(),
             consumer_busy_since: HashMap::new(),
             pressure_start_time: HashMap::new(),
             sustained_pressure_duration: Duration::from_secs(sustained_pressure_seconds),
@@ -442,6 +532,11 @@ impl PsiMonitor {
                             io_delta_stall_us: 0,
                             memory_bytes: 0,
                             io_bytes: 0,
+                            memory_anon_bytes: None,
+                            memory_file_bytes: None,
+                            memory_slab_bytes: None,
+                            memory_pgmajfault_delta: None,
+                            workingset_refault_delta: None,
                             owner_kind: meta.owner_kind.clone(),
                             owner_name: meta.owner_name.clone(),
                         });
@@ -523,6 +618,60 @@ impl PsiMonitor {
                         }
 
                         pod_delta.io_bytes = pod_delta.io_bytes.saturating_add(signals.io_bytes);
+
+                        // memory.stat gauges are a point-in-time snapshot
+                        // (summed across containers, like memory_bytes
+                        // above); its counters are cumulative since cgroup
+                        // creation, so they're delta'd against this
+                        // container's previous reading first, same as
+                        // delta_stall_us.
+                        accumulate_optional(
+                            &mut pod_delta.memory_anon_bytes,
+                            signals.memory_stat.anon_bytes,
+                        );
+                        accumulate_optional(
+                            &mut pod_delta.memory_file_bytes,
+                            signals.memory_stat.file_bytes,
+                        );
+                        accumulate_optional(
+                            &mut pod_delta.memory_slab_bytes,
+                            signals.memory_stat.slab_bytes,
+                        );
+
+                        let prev_stat = self.memory_stat_history.get(&container_id).cloned();
+
+                        if let (Some(prev), Some(cur)) = (
+                            prev_stat.as_ref().and_then(|p| p.pgmajfault_total),
+                            signals.memory_stat.pgmajfault_total,
+                        ) {
+                            accumulate_optional(
+                                &mut pod_delta.memory_pgmajfault_delta,
+                                Some(cur.saturating_sub(prev)),
+                            );
+                        }
+
+                        let refault_delta = match (
+                            prev_stat
+                                .as_ref()
+                                .and_then(|p| p.workingset_refault_anon_total),
+                            signals.memory_stat.workingset_refault_anon_total,
+                            prev_stat
+                                .as_ref()
+                                .and_then(|p| p.workingset_refault_file_total),
+                            signals.memory_stat.workingset_refault_file_total,
+                        ) {
+                            (Some(prev_anon), Some(cur_anon), Some(prev_file), Some(cur_file)) => {
+                                Some(
+                                    cur_anon.saturating_sub(prev_anon)
+                                        + cur_file.saturating_sub(prev_file),
+                                )
+                            }
+                            _ => None,
+                        };
+                        accumulate_optional(&mut pod_delta.workingset_refault_delta, refault_delta);
+
+                        self.memory_stat_history
+                            .insert(container_id.clone(), signals.memory_stat);
                     }
                 }
             }
@@ -650,6 +799,11 @@ impl PsiMonitor {
                                 io_stall_delta_us: pod_delta.io_delta_stall_us,
                                 memory_bytes: pod_delta.memory_bytes,
                                 io_bytes: pod_delta.io_bytes,
+                                memory_anon_bytes: pod_delta.memory_anon_bytes,
+                                memory_file_bytes: pod_delta.memory_file_bytes,
+                                memory_slab_bytes: pod_delta.memory_slab_bytes,
+                                memory_pgmajfault_delta: pod_delta.memory_pgmajfault_delta,
+                                workingset_refault_delta: pod_delta.workingset_refault_delta,
                                 fork_counts,
                                 short_job_counts,
                                 candidates,
@@ -1006,6 +1160,11 @@ mod tests {
             io_stall_delta_us: 0,
             memory_bytes: 0,
             io_bytes: 0,
+            memory_anon_bytes: None,
+            memory_file_bytes: None,
+            memory_slab_bytes: None,
+            memory_pgmajfault_delta: None,
+            workingset_refault_delta: None,
             candidates: vec![],
             fork_counts,
             short_job_counts,
@@ -1148,5 +1307,60 @@ mod tests {
 
         // +1 for the victim's own window.
         assert_eq!(candidates.len(), MAX_CANDIDATE_OFFENDERS + 1);
+    }
+
+    #[test]
+    fn test_parse_memory_stat_reads_curated_fields() {
+        let content = "\
+anon 61566976
+file 4096
+kernel_stack 36864
+slab 1048576
+pgfault 9001
+pgmajfault 12
+workingset_refault_anon 3
+workingset_refault_file 7
+";
+        let stat = parse_memory_stat(content);
+        assert_eq!(stat.anon_bytes, Some(61_566_976));
+        assert_eq!(stat.file_bytes, Some(4_096));
+        assert_eq!(stat.slab_bytes, Some(1_048_576));
+        assert_eq!(stat.pgmajfault_total, Some(12));
+        assert_eq!(stat.workingset_refault_anon_total, Some(3));
+        assert_eq!(stat.workingset_refault_file_total, Some(7));
+    }
+
+    #[test]
+    fn test_parse_memory_stat_leaves_missing_fields_none_not_zero() {
+        // An older kernel's memory.stat lacking a curated field must not be
+        // read as a real zero reading -- only the fields actually present
+        // are populated.
+        let stat = parse_memory_stat("anon 100\n");
+        assert_eq!(stat.anon_bytes, Some(100));
+        assert_eq!(stat.file_bytes, None);
+        assert_eq!(stat.pgmajfault_total, None);
+    }
+
+    #[test]
+    fn test_parse_memory_stat_skips_unparseable_lines() {
+        let stat = parse_memory_stat("anon not_a_number\nfile 42\ngarbage line here\n");
+        assert_eq!(stat.anon_bytes, None);
+        assert_eq!(stat.file_bytes, Some(42));
+    }
+
+    #[test]
+    fn test_accumulate_optional_sums_present_values_and_ignores_none() {
+        let mut acc: Option<u64> = None;
+        accumulate_optional(&mut acc, Some(10));
+        accumulate_optional(&mut acc, None);
+        accumulate_optional(&mut acc, Some(5));
+        assert_eq!(acc, Some(15));
+    }
+
+    #[test]
+    fn test_accumulate_optional_stays_none_when_nothing_ever_present() {
+        let mut acc: Option<u64> = None;
+        accumulate_optional(&mut acc, None);
+        assert_eq!(acc, None);
     }
 }
