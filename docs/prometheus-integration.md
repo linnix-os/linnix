@@ -130,7 +130,7 @@ Useful queries:
 
 Each attribution over 100ms also emits a JSON line on stdout with
 `"event_type": "linnix.stall_attribution"`, carrying the same victim/offender
-pair plus a `reason` of `high_cpu_contention`, `fork_storm`, or
+pair plus a `reason` of `noisy_neighbor`, `fork_storm`, or
 `short_job_churn` for log-based tooling.
 
 ## 6. Optional next steps

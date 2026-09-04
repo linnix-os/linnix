@@ -195,7 +195,7 @@ impl SlackNotifier {
             }));
         }
 
-        // View Dashboard & Feedback (ID is now mandatory)
+        // View Dashboard
         elements.push(json!({
             "type": "button",
             "text": {
@@ -206,31 +206,70 @@ impl SlackNotifier {
             "url": format!("{}/insights/{}", self.dashboard_base_url, insight.id)
         }));
 
-        elements.push(json!({
-            "type": "button",
-            "text": {
-                "type": "plain_text",
-                "text": "👍 Useful",
-                "emoji": true
-            },
-            "value": format!("useful:{}", insight.id),
-            "action_id": "feedback_useful"
-        }));
-
-        elements.push(json!({
-            "type": "button",
-            "text": {
-                "type": "plain_text",
-                "text": "👎 Noise",
-                "emoji": true
-            },
-            "value": format!("noise:{}", insight.id),
-            "action_id": "feedback_noise"
-        }));
-
         blocks.push(json!({
             "type": "actions",
             "elements": elements
+        }));
+
+        // Feedback taxonomy gets its own actions block: Slack caps one
+        // actions block at 5 elements, and Approve/Deny/Dashboard above can
+        // already use 3 of those.
+        let feedback_elements = vec![
+            json!({
+                "type": "button",
+                "text": {
+                    "type": "plain_text",
+                    "text": "✅ Correct",
+                    "emoji": true
+                },
+                "value": format!("correct:{}", insight.id),
+                "action_id": "feedback_correct"
+            }),
+            json!({
+                "type": "button",
+                "text": {
+                    "type": "plain_text",
+                    "text": "❌ Wrong pod",
+                    "emoji": true
+                },
+                "value": format!("wrong_culprit:{}", insight.id),
+                "action_id": "feedback_wrong_culprit"
+            }),
+            json!({
+                "type": "button",
+                "text": {
+                    "type": "plain_text",
+                    "text": "❌ Wrong reason",
+                    "emoji": true
+                },
+                "value": format!("wrong_reason:{}", insight.id),
+                "action_id": "feedback_wrong_reason"
+            }),
+            json!({
+                "type": "button",
+                "text": {
+                    "type": "plain_text",
+                    "text": "➕ Incomplete",
+                    "emoji": true
+                },
+                "value": format!("incomplete:{}", insight.id),
+                "action_id": "feedback_incomplete"
+            }),
+            json!({
+                "type": "button",
+                "text": {
+                    "type": "plain_text",
+                    "text": "🛠️ What fixed it",
+                    "emoji": true
+                },
+                "value": format!("what_fixed_it:{}", insight.id),
+                "action_id": "feedback_what_fixed_it"
+            }),
+        ];
+
+        blocks.push(json!({
+            "type": "actions",
+            "elements": feedback_elements
         }));
 
         let payload = json!({

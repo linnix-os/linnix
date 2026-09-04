@@ -8,6 +8,7 @@ pub mod collectors;
 pub mod config;
 pub mod context;
 pub mod enforcement;
+pub mod episode;
 pub mod handler;
 pub mod incidents;
 pub mod insights;

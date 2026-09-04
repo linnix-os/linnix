@@ -1,0 +1,100 @@
+{
+  "version": "0.1",
+  "episode_id": "ep-fork-storm-000001",
+  "captured_at": "2026-09-03T00:00:00Z",
+  "source": "synthetic",
+  "scenario": "fork_storm",
+  "trigger": {
+    "rule_name": "psi_stall_attribution",
+    "rule_version": "1"
+  },
+  "victim": {
+    "namespace": "prod",
+    "pod": "payment-api"
+  },
+  "candidates": [
+    {
+      "pod": {
+        "namespace": "prod",
+        "pod": "fork-bomb"
+      },
+      "owner_kind": "Job",
+      "owner_name": "fork-bomb-job",
+      "pre_window": {
+        "cpu_percent": [8.0, 9.5, 10.0],
+        "fork_count": [0, 2, 40]
+      },
+      "post_window": {
+        "cpu_percent": [10.0, 11.0, 12.0],
+        "fork_count": [400, 410, 415]
+      },
+      "sample_interval_ms": 1000,
+      "first_deviation_offset_ms": -2000
+    },
+    {
+      "pod": {
+        "namespace": "prod",
+        "pod": "steady-worker"
+      },
+      "owner_kind": "Deployment",
+      "owner_name": "steady-worker",
+      "pre_window": {
+        "cpu_percent": [18.0, 19.0, 20.0],
+        "fork_count": [0, 0, 0]
+      },
+      "post_window": {
+        "cpu_percent": [20.0, 20.0, 21.0],
+        "fork_count": [0, 0, 0]
+      },
+      "sample_interval_ms": 1000,
+      "first_deviation_offset_ms": null
+    }
+  ],
+  "pod_graph": [
+    {
+      "owner_kind": "Job",
+      "owner_name": "fork-bomb-job",
+      "pod": { "namespace": "prod", "pod": "fork-bomb" }
+    },
+    {
+      "owner_kind": "Deployment",
+      "owner_name": "steady-worker",
+      "pod": { "namespace": "prod", "pod": "steady-worker" }
+    },
+    {
+      "owner_kind": "Deployment",
+      "owner_name": "payment-api",
+      "pod": { "namespace": "prod", "pod": "payment-api" }
+    }
+  ],
+  "diagnosis": {
+    "id": "insight-ep-fork-storm-000001",
+    "reason_code": "fork_storm",
+    "summary": "fork-bomb spiked to 400+ forks/window while stalling payment-api",
+    "confidence": 0.82,
+    "top_pods": [
+      {
+        "namespace": "prod",
+        "pod": "fork-bomb",
+        "cpu_usage": 10.0,
+        "psi_contribution": 0.7
+      }
+    ],
+    "suggested_next_step": "Terminate the fork-bomb job and audit its retry policy",
+    "evidence_refs": ["f1", "f2"],
+    "primary_process": null,
+    "k8s": null
+  },
+  "ground_truth": {
+    "culprit": { "namespace": "prod", "pod": "fork-bomb" },
+    "reason_code": "fork_storm",
+    "corrected": false
+  },
+  "evidence_cited": ["f1", "f2"],
+  "outcome": {
+    "suggested_step_helped": true,
+    "recovery_time_ms": 4200,
+    "psi_before": 800000,
+    "psi_after": 12000
+  }
+}

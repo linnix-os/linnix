@@ -243,7 +243,7 @@ fn format_stall(us: u64) -> String {
 
 fn humanise_reason(reason: Option<&str>) -> &str {
     match reason {
-        Some("high_cpu_contention") => "high CPU contention",
+        Some("noisy_neighbor") => "CPU noisy neighbour",
         Some("fork_storm") => "fork storm",
         Some("short_job_churn") => "short-job churn",
         Some(other) => other,
@@ -486,7 +486,7 @@ mod tests {
             cpu_share: 0.5,
             fork_count: 10,
             short_job_count: 5,
-            reason: Some("high_cpu_contention".to_string()),
+            reason: Some("noisy_neighbor".to_string()),
             // Legacy shape by default: these cases predate event ids, and
             // keeping them on the fallback path means it stays covered.
             event_id: None,
@@ -673,7 +673,7 @@ mod tests {
         let report = render(&summarise(&rows), "payments", "api", "20m", false, None);
         assert!(report.contains("media/resizer"));
         assert!(report.contains("70% of attributed stall"));
-        assert!(report.contains("high CPU contention"));
+        assert!(report.contains("CPU noisy neighbour"));
         // The victim lost 1.0s, all of which was attributable here.
         assert!(report.contains("lost 1.0s to stalls"));
         assert!(report.contains("1.0s of that is attributed to neighbours"));

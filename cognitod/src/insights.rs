@@ -8,18 +8,48 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// The five-way correction taxonomy an engineer gives on an insight.
+///
+/// Replaces the earlier `Useful | Noise` (plus a `wrong_root_cause` label the
+/// SQLite `feedback` table allowed but no Rust enum ever constructed): those
+/// said whether an insight was worth reading, not what was wrong with it, so
+/// none of it could feed the ranker the failure library needs to score
+/// against. `WrongCulprit` and `WrongReason` split "wrong" into what
+/// specifically failed -- the offending pod or the classification -- which is
+/// exactly the axis the Incident Lab's Top-1/reason-code accuracy scores on.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum Feedback {
-    Useful,
-    Noise,
+pub enum FeedbackLabel {
+    /// The culprit and reason code were both right.
+    Correct,
+    /// The reason code may have been right, but the wrong pod was blamed.
+    WrongCulprit,
+    /// The right pod was blamed, but for the wrong reason.
+    WrongReason,
+    /// Right direction, but missing something (an offender, a signal).
+    Incomplete,
+    /// The diagnosis was wrong or absent, but the engineer knows what
+    /// actually fixed it -- ground truth to feed back into the corpus.
+    WhatFixedIt,
+}
+
+impl FeedbackLabel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Correct => "correct",
+            Self::WrongCulprit => "wrong_culprit",
+            Self::WrongReason => "wrong_reason",
+            Self::Incomplete => "incomplete",
+            Self::WhatFixedIt => "what_fixed_it",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct InsightRecord {
     pub timestamp: u64,
     pub insight: Insight,
-    pub feedback: Option<Feedback>,
+    pub feedback: Option<FeedbackLabel>,
 }
 
 pub struct InsightStore {
@@ -80,13 +110,10 @@ impl InsightStore {
         inner.iter().find(|r| r.insight.id == id).cloned()
     }
 
-    pub fn update_feedback(&self, id: &str, rating: Feedback) -> bool {
+    pub fn update_feedback(&self, id: &str, rating: FeedbackLabel) -> bool {
         let mut inner = self.inner.lock().unwrap();
         if let Some(record) = inner.iter_mut().find(|r| r.insight.id == id) {
-            let rating_label = match &rating {
-                Feedback::Useful => "useful",
-                Feedback::Noise => "noise",
-            };
+            let rating_label = rating.as_str();
 
             record.feedback = Some(rating);
 
@@ -164,6 +191,7 @@ mod tests {
             k8s: None,
             top_pods: Vec::new(),
             suggested_next_step: "Do nothing".to_string(),
+            evidence_refs: Vec::new(),
         }
     }
 

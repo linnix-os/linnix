@@ -24,6 +24,7 @@ use tokio::sync::broadcast;
 use crate::alerts::{Alert, Severity};
 use crate::collectors::psi::BlameAttribution;
 use crate::metrics::Metrics;
+use crate::schema::InsightReason;
 
 /// Minimum stall attributed to a *single* offender before we emit a JSON event
 /// or an alert for it. Distinct from the threshold that decides whether the
@@ -41,42 +42,32 @@ pub const DEFAULT_COOLDOWN_SECONDS: u64 = 300; // 5 minutes
 /// backstop against unbounded growth, not a sampling strategy.
 pub const DEFAULT_MAX_SERIES: usize = 4096;
 
-/// Why an offender was blamed, derived from whichever signal dominated its
-/// blame score. Surfaced in the JSON event so logs can be faceted by cause.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BlameReason {
-    HighCpuContention,
-    ForkStorm,
-    ShortJobChurn,
-}
+/// Picks the dominant factor using the same normalisation the blame score
+/// itself uses, so the reason always names the term that contributed most.
+///
+/// "The same normalisation" is enforced rather than asserted: both terms
+/// come from the functions `calculate_blame_attributions` sums, so there is
+/// no second copy of the arithmetic to drift out of step with the score.
+///
+/// Returns [`InsightReason`] rather than a dedicated blame-only enum -- prior
+/// to the v0.2 schema this classified into a separate `BlameReason`, which
+/// meant reason-code accuracy could never be scored against the same ground
+/// truth an LLM-facing insight uses. The three outcomes here are exactly
+/// `InsightReason::{NoisyNeighbor, ForkStorm, ShortJobChurn}`.
+pub fn classify_blame_reason(
+    cpu_share: f64,
+    fork_count: u64,
+    short_job_count: u64,
+) -> InsightReason {
+    let fork_score = crate::collectors::psi::fork_score(fork_count);
+    let short_job_score = crate::collectors::psi::short_job_score(short_job_count);
 
-impl BlameReason {
-    /// Picks the dominant factor using the same normalisation the blame score
-    /// itself uses, so the reason always names the term that contributed most.
-    ///
-    /// "The same normalisation" is enforced rather than asserted: both terms
-    /// come from the functions `calculate_blame_attributions` sums, so there is
-    /// no second copy of the arithmetic to drift out of step with the score.
-    pub fn classify(cpu_share: f64, fork_count: u64, short_job_count: u64) -> Self {
-        let fork_score = crate::collectors::psi::fork_score(fork_count);
-        let short_job_score = crate::collectors::psi::short_job_score(short_job_count);
-
-        if cpu_share >= fork_score && cpu_share >= short_job_score {
-            BlameReason::HighCpuContention
-        } else if fork_score >= short_job_score {
-            BlameReason::ForkStorm
-        } else {
-            BlameReason::ShortJobChurn
-        }
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            BlameReason::HighCpuContention => "high_cpu_contention",
-            BlameReason::ForkStorm => "fork_storm",
-            BlameReason::ShortJobChurn => "short_job_churn",
-        }
+    if cpu_share >= fork_score && cpu_share >= short_job_score {
+        InsightReason::NoisyNeighbor
+    } else if fork_score >= short_job_score {
+        InsightReason::ForkStorm
+    } else {
+        InsightReason::ShortJobChurn
     }
 }
 
@@ -90,7 +81,7 @@ pub struct VictimRef {
 pub struct OffenderRef {
     pub pod: String,
     pub namespace: String,
-    pub reason: BlameReason,
+    pub reason: InsightReason,
 }
 
 /// One machine-readable stall attribution, serialised as a single JSON line.
@@ -129,7 +120,7 @@ impl AttributionEvent {
             offender: OffenderRef {
                 pod: attr.offender_pod.clone(),
                 namespace: attr.offender_namespace.clone(),
-                reason: BlameReason::classify(
+                reason: classify_blame_reason(
                     attr.cpu_share,
                     attr.fork_count,
                     attr.short_job_count,
@@ -651,13 +642,13 @@ mod tests {
     #[test]
     fn blame_reason_picks_dominant_factor() {
         assert_eq!(
-            BlameReason::classify(0.9, 10, 5),
-            BlameReason::HighCpuContention
+            classify_blame_reason(0.9, 10, 5),
+            InsightReason::NoisyNeighbor
         );
-        assert_eq!(BlameReason::classify(0.1, 200, 5), BlameReason::ForkStorm);
+        assert_eq!(classify_blame_reason(0.1, 200, 5), InsightReason::ForkStorm);
         assert_eq!(
-            BlameReason::classify(0.1, 0, 100),
-            BlameReason::ShortJobChurn
+            classify_blame_reason(0.1, 0, 100),
+            InsightReason::ShortJobChurn
         );
     }
 
@@ -678,10 +669,11 @@ mod tests {
             let fork = crate::collectors::psi::fork_score(forks);
             let short = crate::collectors::psi::short_job_score(short_jobs);
 
-            let named = match BlameReason::classify(cpu_share, forks, short_jobs) {
-                BlameReason::HighCpuContention => cpu_share,
-                BlameReason::ForkStorm => fork,
-                BlameReason::ShortJobChurn => short,
+            let named = match classify_blame_reason(cpu_share, forks, short_jobs) {
+                InsightReason::NoisyNeighbor => cpu_share,
+                InsightReason::ForkStorm => fork,
+                InsightReason::ShortJobChurn => short,
+                other => panic!("classify_blame_reason returned unexpected variant {other:?}"),
             };
 
             assert!(

@@ -1349,13 +1349,13 @@ fn default_window() -> i64 {
 /// only persisted when its blame score exceeds zero, which takes at least one
 /// non-zero signal, so all three at zero means the columns were never
 /// populated — migration 005 added them with zero defaults. Classifying that
-/// would report `high_cpu_contention`, the branch three zeros happen to fall
+/// would report `noisy_neighbor`, the branch three zeros happen to fall
 /// into, as though it were a finding.
 fn with_blame_reason(attr: &cognitod::incidents::StallAttribution) -> serde_json::Value {
     let mut value = serde_json::to_value(attr).unwrap_or_default();
     let has_signal = attr.cpu_share > 0.0 || attr.fork_count > 0 || attr.short_job_count > 0;
     if has_signal && let Some(obj) = value.as_object_mut() {
-        let reason = cognitod::attribution::BlameReason::classify(
+        let reason = cognitod::attribution::classify_blame_reason(
             attr.cpu_share,
             attr.fork_count,
             attr.short_job_count,
@@ -2100,7 +2100,7 @@ fn dependency_version(target: &str) -> Option<String> {
 #[derive(Deserialize)]
 struct FeedbackRequest {
     insight_id: String,
-    label: String,  // "useful", "noise", "wrong"
+    label: crate::insights::FeedbackLabel,
     source: String, // "cli", "slack", "web"
     user_id: Option<String>,
 }
@@ -2119,7 +2119,7 @@ async fn submit_feedback_api(
     store
         .insert_feedback(
             &req.insight_id,
-            &req.label,
+            req.label.as_str(),
             &req.source,
             req.user_id.as_deref(),
         )
@@ -2559,7 +2559,7 @@ async fn get_insight_by_id(
 
 #[derive(Deserialize)]
 struct FeedbackPayload {
-    feedback: crate::insights::Feedback,
+    feedback: crate::insights::FeedbackLabel,
 }
 
 async fn submit_feedback(
@@ -2567,10 +2567,7 @@ async fn submit_feedback(
     Path(id): Path<String>,
     Json(payload): Json<FeedbackPayload>,
 ) -> impl IntoResponse {
-    if state
-        .insights
-        .update_feedback(&id, payload.feedback.clone())
-    {
+    if state.insights.update_feedback(&id, payload.feedback) {
         log::info!(
             "Received feedback {:?} for insight {}",
             payload.feedback,
@@ -2651,20 +2648,27 @@ async fn handle_slack_interaction(
                         }
                     }
                 }
-            } else if action.action_id == "feedback_useful"
-                && let Some(id) = action.value.strip_prefix("useful:")
-                && state
-                    .insights
-                    .update_feedback(id, crate::insights::Feedback::Useful)
+            } else if let Some((label, prefix)) = match action.action_id.as_str() {
+                "feedback_correct" => Some((crate::insights::FeedbackLabel::Correct, "correct:")),
+                "feedback_wrong_culprit" => Some((
+                    crate::insights::FeedbackLabel::WrongCulprit,
+                    "wrong_culprit:",
+                )),
+                "feedback_wrong_reason" => {
+                    Some((crate::insights::FeedbackLabel::WrongReason, "wrong_reason:"))
+                }
+                "feedback_incomplete" => {
+                    Some((crate::insights::FeedbackLabel::Incomplete, "incomplete:"))
+                }
+                "feedback_what_fixed_it" => Some((
+                    crate::insights::FeedbackLabel::WhatFixedIt,
+                    "what_fixed_it:",
+                )),
+                _ => None,
+            } && let Some(id) = action.value.strip_prefix(prefix)
+                && state.insights.update_feedback(id, label)
             {
-                log::info!("Marked insight {} as Useful", id);
-            } else if action.action_id == "feedback_noise"
-                && let Some(id) = action.value.strip_prefix("noise:")
-                && state
-                    .insights
-                    .update_feedback(id, crate::insights::Feedback::Noise)
-            {
-                log::info!("Marked insight {} as Noise", id);
+                log::info!("Marked insight {} as {}", id, label.as_str());
             }
         }
     } else {
@@ -3042,7 +3046,7 @@ mod tests {
         let value = with_blame_reason(&stored_attribution(0.8, 12, 3));
         assert_eq!(value["offender_pod"], "image-resizer");
         assert_eq!(value["attributed_stall_us"], 600_000);
-        assert_eq!(value["reason"], "high_cpu_contention");
+        assert_eq!(value["reason"], "noisy_neighbor");
     }
 
     #[test]
@@ -3469,6 +3473,7 @@ mod tests {
                 psi_contribution: 7.5,
             }],
             suggested_next_step: r#"Run <script>alert("step")</script>"#.to_string(),
+            evidence_refs: Vec::new(),
             primary_process: Some("worker<script>alert('process')</script>".to_string()),
             k8s: Some(K8sMetadata {
                 namespace: "kube<script>alert('namespace')</script>".to_string(),
@@ -3775,6 +3780,83 @@ mod tests {
         assert_eq!(action.status, ActionStatus::Approved);
         assert_eq!(action.approved_by.as_deref(), Some("slack_user"));
         assert_eq!(app_state.metrics.slack_approved(), 1);
+    }
+
+    #[tokio::test]
+    async fn slack_feedback_buttons_record_each_taxonomy_label() {
+        // Every one of the five feedback action ids must land on its own
+        // distinguishable label -- this is the taxonomy the Incident Lab
+        // scores against, so a button silently mapping to the wrong variant
+        // would corrupt every score derived from it.
+        let cases = [
+            (
+                "feedback_correct",
+                "correct",
+                crate::insights::FeedbackLabel::Correct,
+            ),
+            (
+                "feedback_wrong_culprit",
+                "wrong_culprit",
+                crate::insights::FeedbackLabel::WrongCulprit,
+            ),
+            (
+                "feedback_wrong_reason",
+                "wrong_reason",
+                crate::insights::FeedbackLabel::WrongReason,
+            ),
+            (
+                "feedback_incomplete",
+                "incomplete",
+                crate::insights::FeedbackLabel::Incomplete,
+            ),
+            (
+                "feedback_what_fixed_it",
+                "what_fixed_it",
+                crate::insights::FeedbackLabel::WhatFixedIt,
+            ),
+        ];
+
+        for (action_id, value_prefix, expected) in cases {
+            let enforcement = Arc::new(test_enforcement_queue(300));
+            let app_state = minimal_app_state(
+                Some("api-secret".to_string()),
+                Some("slack-secret".to_string()),
+                Some(enforcement),
+            );
+            let insight_id = format!("insight-{value_prefix}");
+            app_state.insights.record(Insight {
+                reason_code: InsightReason::ForkStorm,
+                summary: "test".to_string(),
+                confidence: 0.5,
+                id: insight_id.clone(),
+                top_pods: vec![],
+                suggested_next_step: "test".to_string(),
+                evidence_refs: Vec::new(),
+                primary_process: None,
+                k8s: None,
+            });
+
+            let body = slack_action_form_body(action_id, format!("{value_prefix}:{insight_id}"));
+            let response = super::all_routes(Arc::clone(&app_state))
+                .oneshot(signed_slack_request(
+                    body,
+                    "slack-secret",
+                    current_epoch_secs(),
+                ))
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let record = app_state
+                .insights
+                .get_by_id(&insight_id)
+                .expect("insight must still be stored");
+            assert_eq!(
+                record.feedback,
+                Some(expected),
+                "action_id {action_id} should have recorded {expected:?}"
+            );
+        }
     }
 
     #[tokio::test]

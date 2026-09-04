@@ -15,6 +15,7 @@ struct InsightRecord {
 
 #[derive(Deserialize, Debug)]
 struct Insight {
+    id: String,
     reason_code: String,
     confidence: f64,
     summary: String,
@@ -191,6 +192,15 @@ pub async fn run_blame(node_name: &str) -> Result<(), Box<dyn Error>> {
                             }
                             println!();
                         }
+
+                        // Correction affordance: this diagnosis is only as
+                        // good as the corpus it gets checked against, so the
+                        // command that shows it also shows how to correct it.
+                        println!(
+                            "\n    {} linnix feedback {} <correct|wrong-culprit|wrong-reason|incomplete|what-fixed-it>",
+                            "Correct this:".dimmed(),
+                            i.id
+                        );
 
                         println!();
                         println!("{}", "-".repeat(60).dimmed());

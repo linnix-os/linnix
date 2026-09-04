@@ -1,0 +1,149 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://linnix.dev/schema/episode.v0.1.json",
+  "title": "Episode",
+  "description": "Regenerated from cognitod::episode::Episode (cognitod/src/episode.rs). One captured or replayed incident: the invariant this format holds is that an episode captured on a real k3s VM must replay in-process on a laptop, byte-identically, with no kernel involvement. Versioned independently of the Insight schema (datasets/schema/insight.schema.json) embedded in `diagnosis`.",
+  "version": "0.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "episode_id",
+    "captured_at",
+    "source",
+    "scenario",
+    "trigger",
+    "victim",
+    "candidates",
+    "pod_graph",
+    "diagnosis",
+    "ground_truth",
+    "evidence_cited",
+    "outcome"
+  ],
+  "properties": {
+    "version": { "type": "string", "const": "0.1" },
+    "episode_id": { "type": "string", "minLength": 1 },
+    "captured_at": { "type": "string", "format": "date-time" },
+    "source": {
+      "type": "string",
+      "enum": ["synthetic", "vm_capture", "design_partner"]
+    },
+    "scenario": { "type": ["string", "null"] },
+    "trigger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rule_name", "rule_version"],
+      "properties": {
+        "rule_name": { "type": "string" },
+        "rule_version": { "type": "string" }
+      }
+    },
+    "victim": { "$ref": "#/definitions/pod_ref" },
+    "candidates": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/candidate_window" }
+    },
+    "pod_graph": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/pod_graph_edge" }
+    },
+    "diagnosis": {
+      "description": "See datasets/schema/insight.schema.json (v0.2). Not re-validated here to avoid two copies of the same contract drifting apart.",
+      "type": ["object", "null"]
+    },
+    "ground_truth": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["culprit", "reason_code", "corrected"],
+          "properties": {
+            "culprit": { "$ref": "#/definitions/pod_ref" },
+            "reason_code": {
+              "description": "See datasets/schema/insight.schema.json#/definitions/reason_code -- the same merged vocabulary.",
+              "type": "string"
+            },
+            "corrected": { "type": "boolean" }
+          }
+        }
+      ]
+    },
+    "evidence_cited": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "outcome": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["suggested_step_helped", "recovery_time_ms", "psi_before", "psi_after"],
+          "properties": {
+            "suggested_step_helped": { "type": ["boolean", "null"] },
+            "recovery_time_ms": { "type": ["integer", "null"], "minimum": 0 },
+            "psi_before": { "type": ["integer", "null"], "minimum": 0 },
+            "psi_after": { "type": ["integer", "null"], "minimum": 0 }
+          }
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "pod_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["namespace", "pod"],
+      "properties": {
+        "namespace": { "type": "string" },
+        "pod": { "type": "string" }
+      }
+    },
+    "candidate_window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pod",
+        "owner_kind",
+        "owner_name",
+        "pre_window",
+        "post_window",
+        "sample_interval_ms",
+        "first_deviation_offset_ms"
+      ],
+      "properties": {
+        "pod": { "$ref": "#/definitions/pod_ref" },
+        "owner_kind": { "type": ["string", "null"] },
+        "owner_name": { "type": ["string", "null"] },
+        "pre_window": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": { "type": "number" }
+          }
+        },
+        "post_window": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": { "type": "number" }
+          }
+        },
+        "sample_interval_ms": { "type": "integer", "minimum": 1 },
+        "first_deviation_offset_ms": { "type": ["integer", "null"] }
+      }
+    },
+    "pod_graph_edge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owner_kind", "owner_name", "pod"],
+      "properties": {
+        "owner_kind": { "type": "string" },
+        "owner_name": { "type": "string" },
+        "pod": { "$ref": "#/definitions/pod_ref" }
+      }
+    }
+  }
+}

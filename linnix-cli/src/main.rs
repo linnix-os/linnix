@@ -80,11 +80,12 @@ enum Command {
         /// Node name to analyze
         node_name: String,
     },
-    /// Provide feedback on an insight
+    /// Correct or confirm an insight's diagnosis
     Feedback {
         /// Insight ID
         id: String,
-        /// Feedback type (useful/noise)
+        /// Correction type: correct, wrong-culprit, wrong-reason, incomplete,
+        /// or what-fixed-it
         #[clap(value_enum)]
         #[clap(rename_all = "snake_case")]
         rating: FeedbackRating,
@@ -98,8 +99,11 @@ enum Command {
 #[derive(clap::ValueEnum, Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 enum FeedbackRating {
-    Useful,
-    Noise,
+    Correct,
+    WrongCulprit,
+    WrongReason,
+    Incomplete,
+    WhatFixedIt,
 }
 
 #[derive(Deserialize, Debug)]
