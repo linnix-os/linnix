@@ -49,6 +49,22 @@ pub struct StallEvent {
     pub concurrent_consumers: Vec<CpuConsumer>,
     pub fork_counts: HashMap<String, u64>,
     pub short_job_counts: HashMap<String, u64>,
+    /// Memory-pressure stall accrued over the same window as `stall_delta_us`,
+    /// from `memory.pressure` in the same cgroup as the triggering
+    /// `cpu.pressure` read. Carried for episode capture only — the blame
+    /// score in `calculate_blame_attributions` stays CPU/fork/short-job only,
+    /// so this does not change what gets attributed, only what gets recorded.
+    pub memory_stall_delta_us: u64,
+    /// Same idea for `io.pressure`.
+    pub io_stall_delta_us: u64,
+    /// Snapshot of `memory.current` (bytes) at trigger time, summed across the
+    /// victim pod's containers. Zero when the file was unreadable rather than
+    /// `Option`, matching `stall_delta_us`'s convention elsewhere in this
+    /// struct.
+    pub memory_bytes: u64,
+    /// Snapshot of `io.stat` (rbytes + wbytes summed across devices and
+    /// containers) at trigger time.
+    pub io_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +125,65 @@ pub fn parse_psi_file(content: &str) -> Result<PsiSnapshot> {
     })
 }
 
+/// Sums `rbytes` + `wbytes` across every device line of a cgroup v2 `io.stat`
+/// file. A cgroup only lists the devices it actually touched, so this is
+/// already scoped to the container — no filtering needed.
+fn parse_io_stat(content: &str) -> u64 {
+    let mut total = 0u64;
+    for line in content.lines() {
+        for field in line.split_whitespace().skip(1) {
+            if let Some((key, value)) = field.split_once('=')
+                && (key == "rbytes" || key == "wbytes")
+                && let Ok(v) = value.parse::<u64>()
+            {
+                total = total.saturating_add(v);
+            }
+        }
+    }
+    total
+}
+
+/// Reads a cgroup v2 `memory.current` file: a single integer, in bytes.
+fn read_memory_current(path: &Path) -> Option<u64> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
+/// The non-CPU signals read from a single container's cgroup v2 directory in
+/// one scan. `None` fields mean the file was missing or unreadable (older
+/// kernels, a controller not delegated to this cgroup) rather than a real
+/// zero reading.
+#[derive(Debug, Default, PartialEq)]
+struct CgroupSignals {
+    memory_pressure: Option<PsiSnapshot>,
+    io_pressure: Option<PsiSnapshot>,
+    memory_bytes: Option<u64>,
+    io_bytes: u64,
+}
+
+/// Reads `memory.pressure`, `io.pressure`, `memory.current` and `io.stat` from
+/// a cgroup v2 directory, sibling to the `cpu.pressure` file the scan loop is
+/// anchored on. Pure and side-effect free so it can be tested against a
+/// fixture directory without driving the async scan loop.
+fn read_cgroup_signals(cgroup_dir: &Path) -> CgroupSignals {
+    CgroupSignals {
+        memory_pressure: std::fs::read_to_string(cgroup_dir.join("memory.pressure"))
+            .ok()
+            .and_then(|c| parse_psi_file(&c).ok()),
+        io_pressure: std::fs::read_to_string(cgroup_dir.join("io.pressure"))
+            .ok()
+            .and_then(|c| parse_psi_file(&c).ok()),
+        memory_bytes: read_memory_current(&cgroup_dir.join("memory.current")),
+        io_bytes: std::fs::read_to_string(cgroup_dir.join("io.stat"))
+            .ok()
+            .map(|c| parse_io_stat(&c))
+            .unwrap_or(0),
+    }
+}
+
 fn find_psi_files(base_path: &Path) -> Vec<PathBuf> {
     WalkDir::new(base_path)
         .into_iter()
@@ -165,10 +240,16 @@ pub struct PsiMonitor {
     context: Arc<ContextStore>,
     incident_store: Option<Arc<crate::incidents::IncidentStore>>,
     sink: Arc<AttributionSink>,
-    /// Container-level histories keyed by container id. PSI counters are
-    /// emitted by container cgroups; pod-level stall windows are derived by
-    /// summing same-scan container deltas after each container cursor advances.
+    /// Container-level CPU-pressure histories keyed by container id. PSI
+    /// counters are emitted by container cgroups; pod-level stall windows are
+    /// derived by summing same-scan container deltas after each container
+    /// cursor advances. CPU is the sole detection signal (`STALL_THRESHOLD_US`
+    /// below applies only here) — memory/io deltas are computed the same way
+    /// but only ever recorded onto a `StallEvent` that CPU pressure already
+    /// triggered, never used to trigger one themselves.
     history: HashMap<String, VecDeque<PsiSnapshot>>,
+    memory_history: HashMap<String, VecDeque<PsiSnapshot>>,
+    io_history: HashMap<String, VecDeque<PsiSnapshot>>,
     pressure_start_time: HashMap<String, Instant>,
     sustained_pressure_duration: Duration,
     cgroup_root: PathBuf,
@@ -181,6 +262,10 @@ struct PodPsiDelta {
     namespace: String,
     delta_stall_us: u64,
     has_previous_sample: bool,
+    memory_delta_stall_us: u64,
+    io_delta_stall_us: u64,
+    memory_bytes: u64,
+    io_bytes: u64,
 }
 
 impl PsiMonitor {
@@ -197,6 +282,8 @@ impl PsiMonitor {
             incident_store,
             sink,
             history: HashMap::new(),
+            memory_history: HashMap::new(),
+            io_history: HashMap::new(),
             pressure_start_time: HashMap::new(),
             sustained_pressure_duration: Duration::from_secs(sustained_pressure_seconds),
             cgroup_root: PathBuf::from("/sys/fs/cgroup"),
@@ -242,6 +329,10 @@ impl PsiMonitor {
                             namespace: meta.namespace.clone(),
                             delta_stall_us: 0,
                             has_previous_sample: false,
+                            memory_delta_stall_us: 0,
+                            io_delta_stall_us: 0,
+                            memory_bytes: 0,
+                            io_bytes: 0,
                         });
 
                     self.sink.metrics().record_victim_pressure(
@@ -255,7 +346,7 @@ impl PsiMonitor {
                     // deltas are aggregated after every container's own
                     // cursor has been advanced, so sibling containers never
                     // compare their cumulative counters against each other.
-                    let hist = self.history.entry(container_id).or_default();
+                    let hist = self.history.entry(container_id.clone()).or_default();
 
                     // Calculate delta if we have previous snapshot
                     let delta_stall_opt = hist
@@ -274,6 +365,53 @@ impl PsiMonitor {
                         pod_delta.has_previous_sample = true;
                         pod_delta.delta_stall_us =
                             pod_delta.delta_stall_us.saturating_add(delta_stall);
+                    }
+
+                    // memory.pressure, io.pressure, memory.current and io.stat
+                    // all sit in the same cgroup v2 directory as the
+                    // cpu.pressure file this scan is anchored on, so no
+                    // separate directory walk is needed. These are recorded
+                    // for episode capture only — CPU pressure above remains
+                    // the sole trigger, and none of this feeds
+                    // `calculate_blame_attributions`.
+                    if let Some(cgroup_dir) = path.parent() {
+                        let signals = read_cgroup_signals(cgroup_dir);
+
+                        if let Some(mem_snapshot) = signals.memory_pressure {
+                            let mem_hist =
+                                self.memory_history.entry(container_id.clone()).or_default();
+                            if let Some(prev) = mem_hist.back() {
+                                pod_delta.memory_delta_stall_us =
+                                    pod_delta.memory_delta_stall_us.saturating_add(
+                                        mem_snapshot.some_total.saturating_sub(prev.some_total),
+                                    );
+                            }
+                            mem_hist.push_back(mem_snapshot);
+                            if mem_hist.len() > HISTORY_SIZE {
+                                mem_hist.pop_front();
+                            }
+                        }
+
+                        if let Some(io_snapshot) = signals.io_pressure {
+                            let io_hist = self.io_history.entry(container_id.clone()).or_default();
+                            if let Some(prev) = io_hist.back() {
+                                pod_delta.io_delta_stall_us =
+                                    pod_delta.io_delta_stall_us.saturating_add(
+                                        io_snapshot.some_total.saturating_sub(prev.some_total),
+                                    );
+                            }
+                            io_hist.push_back(io_snapshot);
+                            if io_hist.len() > HISTORY_SIZE {
+                                io_hist.pop_front();
+                            }
+                        }
+
+                        if let Some(mem_bytes) = signals.memory_bytes {
+                            pod_delta.memory_bytes =
+                                pod_delta.memory_bytes.saturating_add(mem_bytes);
+                        }
+
+                        pod_delta.io_bytes = pod_delta.io_bytes.saturating_add(signals.io_bytes);
                     }
                 }
             }
@@ -317,15 +455,21 @@ impl PsiMonitor {
                                 stall_delta_us: delta_stall,
                                 timestamp: now,
                                 concurrent_consumers: consumers.clone(),
+                                memory_stall_delta_us: pod_delta.memory_delta_stall_us,
+                                io_stall_delta_us: pod_delta.io_delta_stall_us,
+                                memory_bytes: pod_delta.memory_bytes,
+                                io_bytes: pod_delta.io_bytes,
                                 fork_counts,
                                 short_job_counts,
                             };
 
                             info!(
-                                "[psi] StallEvent: {}/{} stalled {}us with {} concurrent consumers",
+                                "[psi] StallEvent: {}/{} stalled {}us (mem={}us io={}us) with {} concurrent consumers",
                                 stall_event.victim_namespace,
                                 stall_event.victim_pod,
                                 stall_event.stall_delta_us,
+                                stall_event.memory_stall_delta_us,
+                                stall_event.io_stall_delta_us,
                                 consumers.len()
                             );
 
@@ -547,6 +691,72 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_io_stat_sums_rbytes_and_wbytes_across_devices() {
+        let content = "8:0 rbytes=1000 wbytes=2000 rios=1 wios=2 dbytes=0 dios=0\n\
+                        8:16 rbytes=500 wbytes=250 rios=1 wios=1 dbytes=0 dios=0\n";
+        assert_eq!(parse_io_stat(content), 1000 + 2000 + 500 + 250);
+    }
+
+    #[test]
+    fn test_parse_io_stat_empty_is_zero() {
+        assert_eq!(parse_io_stat(""), 0);
+    }
+
+    #[test]
+    fn test_read_memory_current() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("memory.current");
+        std::fs::write(&path, "12345\n").unwrap();
+        assert_eq!(read_memory_current(&path), Some(12345));
+    }
+
+    #[test]
+    fn test_read_memory_current_missing_file_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            read_memory_current(&tmp.path().join("memory.current")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_read_cgroup_signals_reads_all_four_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("memory.pressure"),
+            "some avg10=0.00 avg60=0.00 avg300=0.00 total=111\n\
+             full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("io.pressure"),
+            "some avg10=0.00 avg60=0.00 avg300=0.00 total=222\n\
+             full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("memory.current"), "4096\n").unwrap();
+        std::fs::write(
+            tmp.path().join("io.stat"),
+            "8:0 rbytes=10 wbytes=20 rios=1 wios=1 dbytes=0 dios=0\n",
+        )
+        .unwrap();
+
+        let signals = read_cgroup_signals(tmp.path());
+
+        assert_eq!(signals.memory_pressure.unwrap().some_total, 111);
+        assert_eq!(signals.io_pressure.unwrap().some_total, 222);
+        assert_eq!(signals.memory_bytes, Some(4096));
+        assert_eq!(signals.io_bytes, 30);
+    }
+
+    #[test]
+    fn test_read_cgroup_signals_missing_files_read_as_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let signals = read_cgroup_signals(tmp.path());
+        assert_eq!(signals, CgroupSignals::default());
+    }
+
+    #[test]
     fn test_extract_container_id() {
         let path = Path::new(
             "/sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice/cri-containerd-e4063920952d766348421832d2df465324397166164478852332152342342342.scope/cpu.pressure",
@@ -584,6 +794,10 @@ mod tests {
                     cpu_percent: 10.0,
                 },
             ],
+            memory_stall_delta_us: 0,
+            io_stall_delta_us: 0,
+            memory_bytes: 0,
+            io_bytes: 0,
             fork_counts,
             short_job_counts,
         };
