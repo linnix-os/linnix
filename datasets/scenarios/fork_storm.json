@@ -1,0 +1,14 @@
+{
+  "name": "a fork bomb is blamed even though its CPU share looks modest",
+  "victim": { "namespace": "prod", "pod": "payment-api" },
+  "victim_stall_us": 1000000,
+  "consumers": [
+    { "pod": "fork-bomb", "cpu_percent": 10.0 },
+    { "pod": "steady-worker", "cpu_percent": 20.0 }
+  ],
+  "forks": [{ "pod": "fork-bomb", "count": 400 }],
+  "expect_reported": [
+    { "pod": "fork-bomb", "reason": "fork_storm" },
+    { "pod": "steady-worker", "reason": "noisy_neighbor" }
+  ]
+}

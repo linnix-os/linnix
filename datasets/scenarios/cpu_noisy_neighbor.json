@@ -1,0 +1,10 @@
+{
+  "name": "a single CPU hog monopolises the node and stalls the payment API",
+  "victim": { "namespace": "prod", "pod": "payment-api" },
+  "victim_stall_us": 800000,
+  "consumers": [
+    { "pod": "image-resize-worker", "cpu_percent": 90.0 },
+    { "pod": "sidecar-proxy", "cpu_percent": 1.0 }
+  ],
+  "expect_reported": [{ "pod": "image-resize-worker", "reason": "noisy_neighbor" }]
+}

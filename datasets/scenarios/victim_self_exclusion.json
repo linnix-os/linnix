@@ -1,0 +1,11 @@
+{
+  "name": "a CPU-bound victim is never blamed for stalling itself",
+  "victim": { "namespace": "prod", "pod": "payment-api" },
+  "victim_stall_us": 900000,
+  "consumers": [
+    { "pod": "payment-api", "cpu_percent": 70.0 },
+    { "pod": "image-resize-worker", "cpu_percent": 30.0 }
+  ],
+  "forks": [{ "pod": "payment-api", "count": 300 }],
+  "expect_reported": [{ "pod": "image-resize-worker", "reason": "noisy_neighbor" }]
+}

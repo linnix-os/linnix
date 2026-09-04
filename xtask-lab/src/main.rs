@@ -21,6 +21,8 @@
 //! regression gate are later Incident Lab slices; this binary only owns
 //! `replay` and `score` against episodes that already exist on disk.
 
+mod scenario;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -46,8 +48,17 @@ fn main() -> Result<()> {
                 .context("usage: cargo lab score <episode.json|dir>")?;
             run_score(&PathBuf::from(path))
         }
+        Some("run") => {
+            let scenarios_dir = args
+                .get(2)
+                .context("usage: cargo lab run <scenarios-dir> <output-dir>")?;
+            let output_dir = args
+                .get(3)
+                .context("usage: cargo lab run <scenarios-dir> <output-dir>")?;
+            run_scenarios(&PathBuf::from(scenarios_dir), &PathBuf::from(output_dir))
+        }
         Some(other) => bail!("unknown lab subcommand: {other}"),
-        None => bail!("usage: cargo lab <replay|score> <path>"),
+        None => bail!("usage: cargo lab <run|replay|score> <path>"),
     }
 }
 
@@ -164,15 +175,67 @@ fn load_episode(path: &Path) -> Result<Episode> {
     serde_json::from_str(&raw).with_context(|| format!("parsing episode file {}", path.display()))
 }
 
+/// A JSON data file, excluding the `*.schema.json` sibling every `datasets/`
+/// directory carries alongside its records.
+fn is_data_json(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "json")
+        && !path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().ends_with(".schema.json"))
+}
+
 fn load_episodes_from_dir(dir: &Path) -> Result<Vec<Episode>> {
     let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
         .with_context(|| format!("reading episode directory {}", dir.display()))?
         .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|ext| ext == "json"))
+        .filter(|p| is_data_json(p))
         .collect();
     paths.sort();
 
     paths.iter().map(|p| load_episode(p)).collect()
+}
+
+fn load_scenarios_from_dir(dir: &Path) -> Result<Vec<scenario::ScenarioManifest>> {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("reading scenario directory {}", dir.display()))?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| is_data_json(p))
+        .collect();
+    paths.sort();
+
+    paths
+        .iter()
+        .map(|p| -> Result<scenario::ScenarioManifest> {
+            let raw = std::fs::read_to_string(p)
+                .with_context(|| format!("reading scenario file {}", p.display()))?;
+            serde_json::from_str(&raw)
+                .with_context(|| format!("parsing scenario file {}", p.display()))
+        })
+        .collect()
+}
+
+/// Materializes every scenario manifest under `scenarios_dir` into an episode
+/// JSON file under `output_dir`, named after the episode id so a rerun
+/// overwrites the same file rather than accumulating stale copies.
+fn run_scenarios(scenarios_dir: &Path, output_dir: &Path) -> Result<()> {
+    let scenarios = load_scenarios_from_dir(scenarios_dir)?;
+    if scenarios.is_empty() {
+        bail!(
+            "no scenario manifests found under {}",
+            scenarios_dir.display()
+        );
+    }
+    std::fs::create_dir_all(output_dir)
+        .with_context(|| format!("creating output directory {}", output_dir.display()))?;
+
+    for manifest in &scenarios {
+        let episode = manifest.to_episode();
+        let out_path = output_dir.join(format!("{}.json", episode.episode_id));
+        std::fs::write(&out_path, serde_json::to_string_pretty(&episode)?)
+            .with_context(|| format!("writing episode file {}", out_path.display()))?;
+        println!("wrote {}", out_path.display());
+    }
+    Ok(())
 }
 
 fn run_replay(path: &Path) -> Result<()> {
