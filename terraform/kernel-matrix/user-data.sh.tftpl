@@ -1,0 +1,60 @@
+#!/bin/bash
+#
+# Boots one Incident Lab kernel/topology matrix cell: arms a self-terminate
+# timer first (so it survives regardless of what happens below), then
+# installs cognitod and turns on episode capture.
+
+set -e
+
+exec > >(tee /var/log/user-data.log)
+exec 2>&1
+
+echo "========================================="
+echo "Incident Lab matrix cell: ${cell_name}"
+echo "Kernel: $(uname -r)  Arch: $(uname -m)"
+echo "Time: $(date -u)"
+echo "========================================="
+
+# Arm the TTL self-terminate before anything that can fail. It's a detached
+# background process, so once launched it survives any later step in this
+# script aborting under `set -e` -- the whole point of a safety net.
+sudo DEBIAN_FRONTEND=noninteractive apt-get update
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y awscli
+
+TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+INSTANCE_ID=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+REGION=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+TTL_SECONDS=$((${ttl_hours} * 3600))
+
+nohup bash -c "
+    sleep $TTL_SECONDS
+    echo 'ttl_hours elapsed, self-terminating ${cell_name} ($INSTANCE_ID)' | systemd-cat -t linnix-matrix-ttl
+    aws ec2 terminate-instances --instance-ids $INSTANCE_ID --region $REGION
+" >/var/log/linnix-matrix-ttl.log 2>&1 &
+disown
+
+echo "Self-terminate armed for $TTL_SECONDS seconds from now ($(date -u -d "+$TTL_SECONDS seconds")Z)."
+
+cloud-init status --wait || true
+
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    linux-headers-$(uname -r) || sudo apt-get install -y linux-headers-generic
+
+curl -fsSL "https://raw.githubusercontent.com/${github_repo}/main/docs/examples/install-ec2.sh" -o /tmp/install-ec2.sh
+chmod +x /tmp/install-ec2.sh
+sudo /tmp/install-ec2.sh --dev
+
+sudo tee -a /etc/linnix/linnix.toml > /dev/null <<'EOF'
+
+[episode_capture]
+enabled = true
+output_dir = "/var/lib/linnix/episodes"
+EOF
+
+sudo mkdir -p /var/lib/linnix/episodes
+sudo systemctl enable linnix-cognitod
+sudo systemctl restart linnix-cognitod
+
+echo "========================================="
+echo "cognitod installed with episode_capture enabled"
+echo "========================================="
