@@ -992,7 +992,7 @@ impl PsiMonitor {
     /// keep attributing stalls whether or not the matrix's capture disk is
     /// healthy.
     fn write_episode_capture(&self, capture: &EpisodeCaptureConfig, stall_event: &StallEvent) {
-        let episode = Episode::from_capture(stall_event, self.cell.clone());
+        let episode = Episode::from_capture(stall_event, self.cell.clone(), None);
         let path = Path::new(&capture.output_dir).join(format!("{}.json", episode.episode_id));
 
         if let Err(e) = std::fs::create_dir_all(&capture.output_dir) {
@@ -1526,7 +1526,7 @@ mod tests {
             "test setup should blame both the fork-only and CPU offenders"
         );
 
-        let episode = crate::episode::Episode::from_capture(&stall_event, None);
+        let episode = crate::episode::Episode::from_capture(&stall_event, None, None);
         let replayed = episode.to_stall_event();
         let replayed_attributions = calculate_blame_attributions(&replayed);
 

@@ -198,6 +198,7 @@ impl Episode {
     pub fn from_capture(
         stall_event: &crate::collectors::psi::StallEvent,
         cell: Option<Cell>,
+        ground_truth: Option<GroundTruth>,
     ) -> Episode {
         let mut pod_graph = Vec::new();
         for candidate in &stall_event.candidates {
@@ -231,7 +232,7 @@ impl Episode {
             candidates: stall_event.candidates.clone(),
             pod_graph,
             diagnosis: None,
-            ground_truth: None,
+            ground_truth,
             evidence_cited: Vec::new(),
             outcome: None,
         }
