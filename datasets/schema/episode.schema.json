@@ -1,9 +1,9 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://linnix.dev/schema/episode.v0.2.json",
+  "$id": "https://linnix.dev/schema/episode.v0.3.json",
   "title": "Episode",
   "description": "Regenerated from cognitod::episode::Episode (cognitod/src/episode.rs). One captured or replayed incident: the invariant this format holds is that an episode captured on a real k3s VM must replay in-process on a laptop, byte-identically, with no kernel involvement. Versioned independently of the Insight schema (datasets/schema/insight.schema.json) embedded in `diagnosis`.",
-  "version": "0.2",
+  "version": "0.3",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -15,6 +15,7 @@
     "trigger",
     "victim",
     "victim_stall_us",
+    "cell",
     "candidates",
     "pod_graph",
     "diagnosis",
@@ -23,7 +24,7 @@
     "outcome"
   ],
   "properties": {
-    "version": { "type": "string", "const": "0.2" },
+    "version": { "type": "string", "const": "0.3" },
     "episode_id": { "type": "string", "minLength": 1 },
     "captured_at": { "type": "string", "format": "date-time" },
     "source": {
@@ -45,6 +46,24 @@
       "description": "StallEvent::stall_delta_us at capture time -- the magnitude replay weights blame against.",
       "type": "integer",
       "minimum": 0
+    },
+    "cell": {
+      "description": "The kernel/topology cell a vm_capture episode ran on. Null for synthetic/design_partner episodes. Added on the v0.3 format bump for Phase 3's kernel/topology matrix.",
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kernel_release", "arch", "btf_present", "cgroup_driver", "k3s_version"],
+          "properties": {
+            "kernel_release": { "type": "string" },
+            "arch": { "type": "string" },
+            "btf_present": { "type": "boolean" },
+            "cgroup_driver": { "type": "string" },
+            "k3s_version": { "type": ["string", "null"] }
+          }
+        }
+      ]
     },
     "candidates": {
       "type": "array",

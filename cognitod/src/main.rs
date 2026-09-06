@@ -946,7 +946,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             incident_store.clone(),
             config.psi.sustained_pressure_seconds,
             sink,
-        );
+        )
+        .with_episode_capture(config.episode_capture.clone());
         tokio::spawn(async move {
             psi_monitor.run().await;
         });

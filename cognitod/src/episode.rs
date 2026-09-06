@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::schema::{Insight, InsightReason};
 
-pub const EPISODE_FORMAT_VERSION: &str = "0.2";
+pub const EPISODE_FORMAT_VERSION: &str = "0.3";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PodRef {
@@ -45,6 +45,33 @@ pub enum EpisodeSource {
     VmCapture,
     /// A design partner's correction on a live insight (Phase 5).
     DesignPartner,
+}
+
+/// The kernel/topology cell a `VmCapture` episode was captured on. `None` for
+/// `Synthetic`/`DesignPartner` episodes, which run in no real kernel at all.
+/// Added on the v0.3 format bump: Phase 3's kernel/topology matrix needs
+/// `xtask lab score` to break accuracy down per cell (e.g. "arm64 without
+/// BTF" vs "x86_64 5.15"), which is the whole point of running the matrix
+/// rather than one box.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Cell {
+    /// `uname -r`, e.g. "5.15.0-1053-aws".
+    pub kernel_release: String,
+    /// `std::env::consts::ARCH`, e.g. "x86_64" or "aarch64".
+    pub arch: String,
+    /// Whether `/sys/kernel/btf/vmlinux` exists. Attribution needs BTF to
+    /// attach; a cell without it is expected to degrade to PSI-only, and a
+    /// captured episode should say so rather than leave the reader to infer
+    /// it from an empty `diagnosis`.
+    pub btf_present: bool,
+    /// "cgroupv2" or "cgroupv1", read from which hierarchy is mounted. The
+    /// collectors require v2 (`/sys/fs/cgroup/*.pressure`), so a v1 cell is
+    /// expected to run PSI-only too.
+    pub cgroup_driver: String,
+    /// `k3s --version`'s first line, when the binary is on `PATH`. `None`
+    /// rather than a default string -- a capture that could not determine
+    /// this should say so, not claim an unknown version.
+    pub k3s_version: Option<String>,
 }
 
 /// The rule and trigger version that opened the incident this episode
@@ -128,6 +155,11 @@ pub struct Episode {
     /// weight blame against, and nothing else in the record carries one (a
     /// candidate's own series records *its* signals, not the victim's).
     pub victim_stall_us: u64,
+    /// The kernel/topology cell this was captured on. Added on the v0.3
+    /// format bump; `#[serde(default)]` so v0.2 episodes (`Synthetic`, which
+    /// never had one anyway) still deserialize.
+    #[serde(default)]
+    pub cell: Option<Cell>,
     pub candidates: Vec<CandidateWindow>,
     /// The pod/ownership graph as a flat edge list (owner -> pod), rather
     /// than a nested tree, so it round-trips through JSON without a custom
@@ -154,6 +186,58 @@ pub struct PodGraphEdge {
 }
 
 impl Episode {
+    /// Builds a `VmCapture` episode from a live `StallEvent`, the same shape
+    /// `ScenarioManifest::to_episode` produces for `Synthetic` ones.
+    ///
+    /// `diagnosis`/`ground_truth`/`outcome` are left empty here: a capture
+    /// happens at the exact seam where `StallEvent`/`BlameAttribution` are
+    /// computed, before the reasoner (if any) has run, and before either a
+    /// scenario's asserted truth or a design partner's correction exists.
+    /// Callers that know a ground truth (a scenario driving a real VM in the
+    /// matrix) attach it separately, the same way `to_episode` does.
+    pub fn from_capture(
+        stall_event: &crate::collectors::psi::StallEvent,
+        cell: Option<Cell>,
+        ground_truth: Option<GroundTruth>,
+    ) -> Episode {
+        let mut pod_graph = Vec::new();
+        for candidate in &stall_event.candidates {
+            if let (Some(owner_kind), Some(owner_name)) =
+                (&candidate.owner_kind, &candidate.owner_name)
+            {
+                pod_graph.push(PodGraphEdge {
+                    owner_kind: owner_kind.clone(),
+                    owner_name: owner_name.clone(),
+                    pod: candidate.pod.clone(),
+                });
+            }
+        }
+
+        Episode {
+            version: EPISODE_FORMAT_VERSION.to_string(),
+            episode_id: stall_event.event_id.clone(),
+            captured_at: chrono::Utc::now().to_rfc3339(),
+            source: EpisodeSource::VmCapture,
+            scenario: None,
+            trigger: TriggerInfo {
+                rule_name: "psi_stall_attribution".to_string(),
+                rule_version: "1".to_string(),
+            },
+            victim: PodRef {
+                namespace: stall_event.victim_namespace.clone(),
+                pod: stall_event.victim_pod.clone(),
+            },
+            victim_stall_us: stall_event.stall_delta_us,
+            cell,
+            candidates: stall_event.candidates.clone(),
+            pod_graph,
+            diagnosis: None,
+            ground_truth,
+            evidence_cited: Vec::new(),
+            outcome: None,
+        }
+    }
+
     /// Reconstructs the `StallEvent` this episode was captured from (or, for
     /// a synthetic episode, the one a scenario asserts) well enough to run it
     /// back through `calculate_blame_attributions`.
