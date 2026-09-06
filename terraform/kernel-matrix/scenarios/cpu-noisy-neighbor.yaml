@@ -1,0 +1,37 @@
+# Mirrors datasets/scenarios/cpu_noisy_neighbor.json: one pod that
+# monopolizes every core the cell has, plus a near-idle sidecar that a
+# CPU-share ranking must not blame instead.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: image-resize-worker
+  namespace: prod
+  labels:
+    app: image-resize-worker
+spec:
+  containers:
+    - name: stress
+      image: polinux/stress
+      command: ["/bin/sh", "-c"]
+      # $(nproc) rather than a fixed worker count: cells vary instance_type,
+      # and this only needs to saturate whatever core count the cell has.
+      args: ["stress --cpu $(nproc) --timeout 3600s"]
+      resources:
+        requests:
+          cpu: "500m"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sidecar-proxy
+  namespace: prod
+  labels:
+    app: sidecar-proxy
+spec:
+  containers:
+    - name: sidecar-proxy
+      image: busybox:1.36
+      command: ["sleep", "infinity"]
+      resources:
+        requests:
+          cpu: "10m"

@@ -1,0 +1,37 @@
+# Shared across every scenario: the "prod" namespace and the victim pod,
+# named to match datasets/scenarios/*.json's ground truth (namespace "prod",
+# pod "payment-api") so a stamped episode's identity lines up with what the
+# synthetic scenarios already assert. Applied once per cell and left running
+# -- only the offender manifest in this directory is applied/deleted per
+# injection run, so the victim's own PSI baseline isn't disturbed by
+# redeploying it between scenarios.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: prod
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: payment-api
+  namespace: prod
+  labels:
+    app: payment-api
+spec:
+  containers:
+    - name: payment-api
+      image: busybox:1.36
+      # Deliberately not idle: PSI stall only accrues to a process that is
+      # actually asking for CPU and not getting it -- a pod that never wants
+      # CPU can't be starved of it. This keeps a small, steady CPU ask going
+      # so contention from an offender pod shows up as real victim stall.
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          while true; do
+            dd if=/dev/zero bs=1M count=8 2>/dev/null | md5sum >/dev/null
+            sleep 0.2
+          done
+      resources:
+        requests:
+          cpu: "100m"

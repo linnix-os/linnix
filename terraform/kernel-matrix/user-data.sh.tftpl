@@ -40,6 +40,28 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get update
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
     linux-headers-$(uname -r) || sudo apt-get install -y linux-headers-generic
 
+# k3s: cognitod's PsiMonitor (and its episode_capture seam) only starts when
+# K8sContext resolves (main.rs gates the whole monitor on `Some(k8s_context)`)
+# -- without a real cluster to source pod identity from, [episode_capture]
+# below is dead config and this cell would capture nothing. cognitod runs as
+# a host systemd unit, not a cluster pod, so it can't use in-cluster auth;
+# it authenticates to k3s's local API instead ("manual mode" in
+# k8s.rs::K8sContext::new), via a token minted below.
+echo "=== installing k3s: $(date -u) ==="
+curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode=644 --disable=servicelb" sh -
+
+echo "=== waiting for node ready ==="
+until /usr/local/bin/k3s kubectl get nodes | grep -q ' Ready'; do sleep 5; done
+
+# A read-only ServiceAccount, not the k3s admin identity: K8sContext only
+# ever lists/watches pods to resolve container-id -> namespace/pod_name
+# (k8s.rs), so the built-in "view" ClusterRole is already more than enough.
+/usr/local/bin/k3s kubectl create serviceaccount linnix-reader -n kube-system
+/usr/local/bin/k3s kubectl create clusterrolebinding linnix-reader-view \
+    --clusterrole=view --serviceaccount=kube-system:linnix-reader
+LINNIX_K8S_TOKEN=$(/usr/local/bin/k3s kubectl create token linnix-reader -n kube-system \
+    --duration=$((${ttl_hours} + 1))h)
+
 # install-ec2.sh builds cognitod from source with LTO, which OOM-kills rustc
 # on small instances with no swap (confirmed: a t4g.small, 1.8GB RAM, no
 # swap, killed rustc twice linking cognitod's full dependency tree even
@@ -65,7 +87,21 @@ enabled = true
 output_dir = "/var/lib/linnix/episodes"
 EOF
 
+# Drop-in rather than editing install-ec2.sh's unit template directly: the
+# k8s wiring is specific to this matrix, not the shared installer. K8S_CA_CERT_PATH
+# points at k3s's own CA so the manual-mode client still verifies the server
+# cert (k3s's default serving cert already covers 127.0.0.1/localhost).
+sudo mkdir -p /etc/systemd/system/linnix-cognitod.service.d
+sudo tee /etc/systemd/system/linnix-cognitod.service.d/k8s.conf > /dev/null <<EOF
+[Service]
+Environment="K8S_API_URL=https://127.0.0.1:6443"
+Environment="K8S_TOKEN=$LINNIX_K8S_TOKEN"
+Environment="K8S_CA_CERT_PATH=/var/lib/rancher/k3s/server/tls/server-ca.crt"
+Environment="NODE_NAME=${cell_name}"
+EOF
+
 sudo mkdir -p /var/lib/linnix/episodes
+sudo systemctl daemon-reload
 sudo systemctl enable linnix-cognitod
 sudo systemctl restart linnix-cognitod
 
