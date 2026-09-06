@@ -49,11 +49,29 @@ BEFORE=$($SSH "sudo ls /var/lib/linnix/episodes 2>/dev/null || true")
 echo "=== [$CELL_NAME] injecting $SCENARIO ==="
 $SSH "$KUBECTL apply -f -" < "$SCRIPT_DIR/scenarios/$SCENARIO_FILE"
 
+# From here on the offender is live on the cell. A Ctrl-C (or any failure)
+# during the sleep below would otherwise exit under set -e and leave it
+# running -- a later run of a different scenario only applies/deletes its
+# own manifest, so the stray offender keeps faulting the victim underneath
+# the new capture while every new episode gets stamped with the new
+# scenario's ground truth, silently corrupting the corpus. The trap deletes
+# the same manifest on any exit path; it's disarmed right after the normal
+# delete below so that expected path doesn't run it twice.
+CLEANUP_ARMED=1
+cleanup_offender() {
+    if [ "$CLEANUP_ARMED" = "1" ]; then
+        echo "=== [$CELL_NAME] cleanup: deleting offender pods for $SCENARIO ===" >&2
+        $SSH "$KUBECTL delete -f -" < "$SCRIPT_DIR/scenarios/$SCENARIO_FILE" || true
+    fi
+}
+trap cleanup_offender EXIT INT TERM
+
 echo "=== [$CELL_NAME] letting the fault run for ${INJECT_DURATION_SECONDS}s ==="
 sleep "$INJECT_DURATION_SECONDS"
 
 echo "=== [$CELL_NAME] tearing down the offender pods ==="
 $SSH "$KUBECTL delete -f -" < "$SCRIPT_DIR/scenarios/$SCENARIO_FILE"
+CLEANUP_ARMED=0
 
 echo "=== [$CELL_NAME] diffing episode dir after injection ==="
 AFTER=$($SSH "sudo ls /var/lib/linnix/episodes 2>/dev/null || true")
