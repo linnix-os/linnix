@@ -146,6 +146,10 @@ resource "aws_instance" "cell" {
     ttl_hours   = var.ttl_hours
     cell_name   = each.key
   })
+  # Without this, a change to user-data.sh.tftpl only updates Terraform's
+  # state -- the running instance keeps whatever boot script it started
+  # with, since cloud-init doesn't re-run user-data on its own.
+  user_data_replace_on_change = true
 
   tags = merge(
     local.common_tags,

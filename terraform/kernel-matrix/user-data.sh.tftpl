@@ -40,6 +40,20 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get update
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
     linux-headers-$(uname -r) || sudo apt-get install -y linux-headers-generic
 
+# install-ec2.sh builds cognitod from source with LTO, which OOM-kills rustc
+# on small instances with no swap (confirmed: a t4g.small, 1.8GB RAM, no
+# swap, killed rustc twice linking cognitod's full dependency tree even
+# though the same build succeeded on an equally-sized amd64 instance). A
+# swapfile is the general fix -- cheap, and doesn't require sizing every
+# cell's instance_type to whatever the current dependency tree happens to
+# need.
+if [ "$(swapon --show | wc -l)" -eq 0 ]; then
+    sudo fallocate -l 4G /swapfile
+    sudo chmod 600 /swapfile
+    sudo mkswap /swapfile
+    sudo swapon /swapfile
+fi
+
 curl -fsSL "https://raw.githubusercontent.com/${github_repo}/main/docs/examples/install-ec2.sh" -o /tmp/install-ec2.sh
 chmod +x /tmp/install-ec2.sh
 sudo /tmp/install-ec2.sh --dev
