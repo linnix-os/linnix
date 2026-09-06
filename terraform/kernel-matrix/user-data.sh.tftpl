@@ -15,28 +15,28 @@ echo "Kernel: $(uname -r)  Arch: $(uname -m)"
 echo "Time: $(date -u)"
 echo "========================================="
 
-# Arm the TTL self-terminate before anything that can fail. It's a detached
-# background process, so once launched it survives any later step in this
-# script aborting under `set -e` -- the whole point of a safety net.
-sudo DEBIAN_FRONTEND=noninteractive apt-get update
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y awscli
-
-TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
-INSTANCE_ID=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
-REGION=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+# Arm the TTL self-terminate before anything that can fail, using only
+# tools already on the stock AMI -- no apt/network dependency, so a
+# provisioning failure (even a totally offline instance) can't prevent it
+# from firing. `systemctl poweroff` relies on the instance's
+# instance_initiated_shutdown_behavior being set to "terminate" (main.tf),
+# so a shutdown from inside the guest actually tears the instance down
+# instead of just stopping it.
 TTL_SECONDS=$((${ttl_hours} * 3600))
-
 nohup bash -c "
     sleep $TTL_SECONDS
-    echo 'ttl_hours elapsed, self-terminating ${cell_name} ($INSTANCE_ID)' | systemd-cat -t linnix-matrix-ttl
-    aws ec2 terminate-instances --instance-ids $INSTANCE_ID --region $REGION
+    echo 'ttl_hours elapsed, self-terminating ${cell_name}' | systemd-cat -t linnix-matrix-ttl
+    systemctl poweroff
 " >/var/log/linnix-matrix-ttl.log 2>&1 &
 disown
 
 echo "Self-terminate armed for $TTL_SECONDS seconds from now ($(date -u -d "+$TTL_SECONDS seconds")Z)."
 
-cloud-init status --wait || true
+# No `cloud-init status --wait` here: this script *is* cloud-init's own
+# user-data stage, so waiting on cloud-init to finish from inside it would
+# deadlock -- cloud-init can't finish until this script returns.
 
+sudo DEBIAN_FRONTEND=noninteractive apt-get update
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
     linux-headers-$(uname -r) || sudo apt-get install -y linux-headers-generic
 

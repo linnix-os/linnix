@@ -91,31 +91,11 @@ resource "aws_iam_role" "matrix" {
   tags = local.common_tags
 }
 
-# Lets each instance terminate itself once its ttl_hours elapses, scoped so
-# it can only ever terminate instances tagged as part of this module's own
-# run -- not a blanket ec2:TerminateInstances grant.
-resource "aws_iam_role_policy" "self_terminate" {
-  name_prefix = "self-terminate-"
-  role        = aws_iam_role.matrix.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect   = "Allow"
-        Action   = "ec2:TerminateInstances"
-        Resource = "*"
-        Condition = {
-          StringEquals = {
-            "ec2:ResourceTag/Project" = var.project_name
-          }
-        }
-      }
-    ]
-  })
-}
-
 # SSM as a fallback debugging path if SSH access needs revoking mid-run.
+# No ec2:TerminateInstances grant: the TTL self-terminate shuts the guest
+# down from the inside (`systemctl poweroff` + instance_initiated_shutdown_
+# behavior = "terminate" below), so the instance role never needs the AWS
+# API permission to terminate itself.
 resource "aws_iam_role_policy_attachment" "ssm" {
   role       = aws_iam_role.matrix.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
@@ -139,6 +119,12 @@ resource "aws_instance" "cell" {
   vpc_security_group_ids      = [aws_security_group.matrix.id]
   iam_instance_profile        = aws_iam_instance_profile.matrix.name
   associate_public_ip_address = var.associate_public_ip
+
+  # The TTL self-terminate in user-data.sh.tftpl shuts the guest down from
+  # the inside (`systemctl poweroff`) using only stock-AMI tools -- no
+  # awscli/IMDS credentials needed. That only tears the instance down
+  # rather than just stopping it because of this setting.
+  instance_initiated_shutdown_behavior = "terminate"
 
   root_block_device {
     volume_type           = "gp3"
