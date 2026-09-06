@@ -48,8 +48,10 @@ locals {
 
 # SSH only -- no dashboard/API/Prometheus ports. A matrix instance's only
 # job is to capture episodes to disk; nothing needs to reach cognitod's API
-# from outside, and this stays true even after the eventual k3s injection
-# harness lands (that harness will drive it over SSH/SSM, not the API).
+# from outside, and this stays true with the k3s injection harness
+# (../kernel-matrix/inject.sh): it drives each cell over plain ssh/scp, since
+# retrieving episode JSON files is the whole point of a run and SSM would
+# need an S3 hop or a tunnel to do that for no benefit over ssh.
 resource "aws_security_group" "matrix" {
   name_prefix = "${var.project_name}-"
   description = "SSH-only access for Incident Lab kernel/topology matrix instances"

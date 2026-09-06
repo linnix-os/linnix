@@ -1,0 +1,45 @@
+# Mirrors datasets/scenarios/fork_storm.json's identities and shape: a
+# high-fork-rate offender that a naive CPU-share ranking would under-blame,
+# plus a modest secondary consumer.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fork-bomb
+  namespace: prod
+  labels:
+    app: fork-bomb
+spec:
+  containers:
+    - name: fork-bomb
+      image: busybox:1.36
+      # No exec, just fork+exit as fast as possible -- drives the fork_count
+      # signal without meaningfully touching short_job_count.
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          while true; do
+            for i in $(seq 1 200); do ( : ) & done
+            wait
+          done
+      resources:
+        requests:
+          cpu: "50m"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: steady-worker
+  namespace: prod
+  labels:
+    app: steady-worker
+spec:
+  containers:
+    - name: stress
+      image: polinux/stress
+      command: ["stress"]
+      args: ["--cpu", "1", "--timeout", "3600s"]
+      resources:
+        requests:
+          cpu: "200m"
+        limits:
+          cpu: "200m"

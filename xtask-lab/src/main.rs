@@ -21,6 +21,7 @@
 //! regression gate are later Incident Lab slices; this binary only owns
 //! `replay` and `score` against episodes that already exist on disk.
 
+mod injection;
 mod scenario;
 
 use std::path::{Path, PathBuf};
@@ -57,8 +58,17 @@ fn main() -> Result<()> {
                 .context("usage: cargo lab run <scenarios-dir> <output-dir>")?;
             run_scenarios(&PathBuf::from(scenarios_dir), &PathBuf::from(output_dir))
         }
+        Some("stamp") => {
+            let path = args
+                .get(2)
+                .context("usage: cargo lab stamp <episode.json> <scenario-name>")?;
+            let scenario = args
+                .get(3)
+                .context("usage: cargo lab stamp <episode.json> <scenario-name>")?;
+            run_stamp(&PathBuf::from(path), scenario)
+        }
         Some(other) => bail!("unknown lab subcommand: {other}"),
-        None => bail!("usage: cargo lab <run|replay|score> <path>"),
+        None => bail!("usage: cargo lab <run|replay|score|stamp> <path>"),
     }
 }
 
@@ -300,6 +310,31 @@ fn run_scenarios(scenarios_dir: &Path, output_dir: &Path) -> Result<()> {
             .with_context(|| format!("writing episode file {}", out_path.display()))?;
         println!("wrote {}", out_path.display());
     }
+    Ok(())
+}
+
+/// Attaches the ground truth for a named injection scenario (see
+/// `injection::ground_truth_for`) to a raw `VmCapture` episode fetched off a
+/// kernel/topology matrix cell, and rewrites the file in place through
+/// `cognitod::episode::Episode`'s own (de)serialization -- never by editing
+/// the JSON directly, so the result can't drift from schema v0.3.
+///
+/// cognitod itself always writes a captured episode with `ground_truth:
+/// None` (`Episode::from_capture`'s doc comment): it has no way to know what
+/// it was shown. Only the harness that deployed the fault does.
+fn run_stamp(path: &Path, scenario: &str) -> Result<()> {
+    let mut episode = load_episode(path)?;
+    let ground_truth = injection::ground_truth_for(scenario)?;
+
+    episode.scenario = Some(scenario.to_string());
+    episode.ground_truth = Some(ground_truth);
+
+    std::fs::write(path, serde_json::to_string_pretty(&episode)?)
+        .with_context(|| format!("writing stamped episode {}", path.display()))?;
+    println!(
+        "stamped {} with scenario {scenario:?} ground truth",
+        path.display()
+    );
     Ok(())
 }
 

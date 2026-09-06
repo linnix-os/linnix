@@ -1,0 +1,25 @@
+# Mirrors datasets/scenarios/short_job_churn.json: a CI-runner-shaped
+# offender that execs a real (if trivial) process to completion on every
+# iteration, unlike fork-storm's bare fork+exit -- exercising
+# short_job_count rather than fork_count.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ci-runner
+  namespace: prod
+  labels:
+    app: ci-runner
+spec:
+  containers:
+    - name: ci-runner
+      image: busybox:1.36
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          while true; do
+            for i in $(seq 1 50); do /bin/true; done
+            sleep 0.05
+          done
+      resources:
+        requests:
+          cpu: "50m"
