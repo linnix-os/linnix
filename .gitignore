@@ -122,3 +122,12 @@ videos/
 
 # Local analysis scratch
 ARCHITECTURE-AUDIT.md
+
+# Terraform local state/plan artifacts (never commit real state or plans)
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+terraform.tfvars
+*.auto.tfvars
+!terraform/*/terraform.tfvars.example
