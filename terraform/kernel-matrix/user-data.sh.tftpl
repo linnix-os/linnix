@@ -91,13 +91,21 @@ EOF
 # k8s wiring is specific to this matrix, not the shared installer. K8S_CA_CERT_PATH
 # points at k3s's own CA so the manual-mode client still verifies the server
 # cert (k3s's default serving cert already covers 127.0.0.1/localhost).
+#
+# NODE_NAME must be the k3s node's own name (its hostname, by default), not
+# this matrix's cell_name label: K8sContext::start_watcher() filters its pod
+# LIST/WATCH with fieldSelector=spec.nodeName=$NODE_NAME, so a mismatch here
+# silently returns zero pods forever -- no error, just a container_map that
+# never populates and every pod's attribution/episode candidate lookup
+# missing (confirmed against a live cell: cell_name filtered out every pod).
+LINNIX_NODE_NAME=$(hostname)
 sudo mkdir -p /etc/systemd/system/linnix-cognitod.service.d
 sudo tee /etc/systemd/system/linnix-cognitod.service.d/k8s.conf > /dev/null <<EOF
 [Service]
 Environment="K8S_API_URL=https://127.0.0.1:6443"
 Environment="K8S_TOKEN=$LINNIX_K8S_TOKEN"
 Environment="K8S_CA_CERT_PATH=/var/lib/rancher/k3s/server/tls/server-ca.crt"
-Environment="NODE_NAME=${cell_name}"
+Environment="NODE_NAME=$LINNIX_NODE_NAME"
 EOF
 
 sudo mkdir -p /var/lib/linnix/episodes
