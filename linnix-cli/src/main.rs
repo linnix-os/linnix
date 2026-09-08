@@ -24,7 +24,12 @@ use pretty::PrettyEvent;
 #[derive(clap::Parser, Debug)]
 struct Args {
     /// Base URL of the Cognitod service
-    #[clap(long, default_value = "http://127.0.0.1:3000")]
+    ///
+    /// Global, so it is accepted on either side of a subcommand. An MCP client
+    /// is configured with one command line — `linnix-cli mcp serve --url ...`
+    /// is the order anyone writes it in, and a flag clap rejects there would
+    /// fail inside a client that shows the operator nothing but a dead server.
+    #[clap(long, global = true, default_value = "http://127.0.0.1:3000")]
     url: String,
 
     /// Show daemon status and exit

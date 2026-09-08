@@ -203,12 +203,13 @@ fn full_daemon() -> MockServer {
         then.status(200)
             .header("content-type", "application/json")
             .body(
-                r#"[{"pid":1,"ppid":0,"comm":"systemd","uid":0,"gid":0,
+                r#"{"root":4242,"nodes":[
+                    {"pid":1,"ppid":0,"comm":"systemd","uid":0,"gid":0,
                      "event_type":"exec","relationship":"ancestor","level":-1},
                     {"pid":4242,"ppid":1,"comm":"feature-builder","uid":0,"gid":0,
                      "event_type":"exec","relationship":"root","level":0},
                     {"pid":4301,"ppid":4242,"comm":"python","uid":0,"gid":0,
-                     "event_type":"exec","relationship":"descendant","level":1}]"#,
+                     "event_type":"exec","relationship":"descendant","level":1}]}"#,
             );
     });
     server.mock(|when, then| {
@@ -501,4 +502,126 @@ fn a_process_name_cannot_forge_a_line_of_the_report() {
         1,
         "the headline must stay one line: {text:?}"
     );
+}
+
+#[test]
+fn the_process_tree_reads_as_lines_not_as_json() {
+    // `/graph/{pid}` answers with a `{"root", "nodes"}` envelope. Reading the
+    // envelope as the node array falls back to dumping JSON at the very tier
+    // whose purpose is to be shorter than JSON — silently, since the fallback
+    // still returns a valid answer.
+    let server = full_daemon();
+    let mut client = McpClient::spawn(&server.base_url());
+
+    let (evidence, is_error) = client.call_tool(
+        "linnix_explain_process",
+        json!({"pid": 4242, "detail": "evidence"}),
+    );
+
+    assert!(!is_error, "{evidence}");
+    assert!(
+        !evidence.contains("\"event_type\""),
+        "the evidence tier must not fall back to JSON: {evidence}"
+    );
+    assert!(
+        evidence.contains("[ancestor] pid 1 `systemd`"),
+        "{evidence}"
+    );
+    assert!(
+        evidence.contains("[descendant] pid 4301 `python`"),
+        "{evidence}"
+    );
+
+    // Ancestors are at negative levels and descendants at positive ones, so
+    // indenting by absolute depth would draw them in the same column and
+    // invert half the tree.
+    let indent = |needle: &str| {
+        evidence
+            .lines()
+            .find(|line| line.contains(needle))
+            .map(|line| line.len() - line.trim_start().len())
+            .unwrap_or_else(|| panic!("no line for {needle}: {evidence}"))
+    };
+    // Matched on the `[relationship]` tag, not the process name: the headline
+    // above the tree names the queried process too, and it sits at column 0.
+    assert!(
+        indent("[ancestor] pid 1") < indent("[root] pid 4242"),
+        "an ancestor must sit shallower than the queried process: {evidence}"
+    );
+    assert!(
+        indent("[root] pid 4242") < indent("[descendant] pid 4301"),
+        "a descendant must sit deeper than the queried process: {evidence}"
+    );
+}
+
+#[test]
+fn an_unreadable_process_tree_is_not_reported_as_an_exited_process() {
+    // A process that exits between the two requests 404s on the second, and
+    // absorbing that race is worth it. Absorbing a 5xx is not: told "the
+    // process may have exited", an agent concludes the tree is empty when the
+    // truth is that we could not read it.
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/processes/4242");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"pid":4242,"ppid":1,"uid":0,"gid":0,"comm":"x","event_type":"exec","k8s":null}"#);
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/graph/4242");
+        then.status(500).body("boom");
+    });
+
+    let mut client = McpClient::spawn(&server.base_url());
+    let (text, is_error) = client.call_tool("linnix_explain_process", json!({"pid": 4242}));
+
+    assert!(is_error, "a 5xx on the tree must stay an error: {text}");
+    assert!(text.contains("500"), "{text}");
+    assert!(
+        !text.contains("may have exited"),
+        "a server error must not be reported as an exit: {text}"
+    );
+}
+
+#[test]
+fn url_is_accepted_on_either_side_of_the_subcommand() {
+    // `claude mcp add linnix -- linnix-cli mcp serve --url ...` is the order
+    // anyone configuring an MCP client writes. A flag clap rejects there fails
+    // inside a client that shows the operator nothing but a dead server.
+    let server = full_daemon();
+    for args in [
+        vec!["mcp", "serve", "--url", &server.base_url()],
+        vec!["--url", &server.base_url(), "mcp", "serve"],
+    ] {
+        let mut child = Command::new(assert_cmd::cargo::cargo_bin!("linnix-cli"))
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        let mut stdin = child.stdin.take().expect("stdin");
+        writeln!(
+            stdin,
+            "{}",
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                           "clientInfo": {"name": "t", "version": "0"}},
+            })
+        )
+        .expect("write");
+        stdin.flush().expect("flush");
+
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().expect("stdout"))
+            .read_line(&mut line)
+            .expect("read");
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let reply: Value = serde_json::from_str(&line)
+            .unwrap_or_else(|e| panic!("{args:?} did not start the server: {line} ({e})"));
+        assert_eq!(reply["result"]["serverInfo"]["name"], "linnix", "{args:?}");
+    }
 }

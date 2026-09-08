@@ -51,6 +51,28 @@ pub enum Detail {
     Raw,
 }
 
+/// A failed fetch, and whether the daemon simply had no such record.
+///
+/// The distinction exists for exactly one caller: `explain_process` fetches a
+/// process and then its tree, and a process that exits between the two gets a
+/// 404 on the second. That race is worth downgrading to a note. A network
+/// error, a 5xx or a token that stopped working is not — reported as "the
+/// process may have exited", it would have an agent conclude the box is fine
+/// when the truth is that we cannot see it.
+struct FetchError {
+    message: String,
+    not_found: bool,
+}
+
+impl FetchError {
+    fn fatal(message: String) -> Self {
+        Self {
+            message,
+            not_found: false,
+        }
+    }
+}
+
 /// The MCP server. Holds only what it needs to reach a cognitod.
 #[derive(Clone)]
 pub struct LinnixMcp {
@@ -160,16 +182,16 @@ impl LinnixMcp {
 
     /// Fetches and decodes one endpoint.
     ///
-    /// The error is a caller-facing sentence rather than a type, because every
-    /// failure here ends up in front of a model that has to decide what to do
-    /// next, and "connection refused" is not that. An agent's first contact
-    /// with this server is very often a laptop with no daemon running, so that
-    /// case in particular has to say what to start.
+    /// The message is a caller-facing sentence, because every failure here
+    /// ends up in front of a model that has to decide what to do next and
+    /// "connection refused" is not that. An agent's first contact with this
+    /// server is very often a laptop with no daemon running, so that case in
+    /// particular has to say what to start.
     async fn get<T: DeserializeOwned>(
         &self,
         path: &str,
         query: &[(&str, String)],
-    ) -> Result<T, String> {
+    ) -> Result<T, FetchError> {
         let url = format!("{}{}", self.base, path);
         let resp = self
             .client
@@ -178,45 +200,51 @@ impl LinnixMcp {
             .send()
             .await
             .map_err(|e| {
-                format!(
+                FetchError::fatal(format!(
                     "cannot reach cognitod at {}: {e}. Start the daemon, or point this \
-                     server at the right host with `linnix-cli mcp serve --url`. If the daemon \
-                     requires a token, set LINNIX_API_TOKEN in this server's environment.",
+                     server at the right host with `linnix-cli mcp serve --url <URL>`. If the \
+                     daemon requires a token, set LINNIX_API_TOKEN in this server's \
+                     environment.",
                     self.base
-                )
+                ))
             })?;
 
         match resp.status() {
             reqwest::StatusCode::NOT_FOUND => {
-                return Err(format!("cognitod has no record at {path}"));
+                return Err(FetchError {
+                    message: format!("cognitod has no record at {path}"),
+                    not_found: true,
+                });
             }
             // The daemon returns this for every route backed by a store it was
             // started without. Saying so is the difference between "there were
             // no incidents" and "this daemon cannot answer that question" —
             // an agent told the former would wrongly rule the host out.
             reqwest::StatusCode::SERVICE_UNAVAILABLE => {
-                return Err(format!(
+                return Err(FetchError::fatal(format!(
                     "cognitod is running without the store that backs {path}, so no history \
                      exists to query. This is a daemon configuration, not an absence of events."
-                ));
+                )));
             }
             reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
-                return Err(format!(
+                return Err(FetchError::fatal(format!(
                     "cognitod rejected the request to {path} ({}). It was started with an API \
                      token; set LINNIX_API_TOKEN in the environment this MCP server is \
                      launched with.",
                     resp.status()
-                ));
+                )));
             }
             status if !status.is_success() => {
-                return Err(format!("cognitod returned {status} for {path}"));
+                return Err(FetchError::fatal(format!(
+                    "cognitod returned {status} for {path}"
+                )));
             }
             _ => {}
         }
 
-        resp.json::<T>()
-            .await
-            .map_err(|e| format!("could not decode cognitod's reply to {path}: {e}"))
+        resp.json::<T>().await.map_err(|e| {
+            FetchError::fatal(format!("could not decode cognitod's reply to {path}: {e}"))
+        })
     }
 
     #[tool(
@@ -240,11 +268,11 @@ impl LinnixMcp {
         // while still calling itself raw.
         let status_json: serde_json::Value = match self.get("/status", &[]).await {
             Ok(v) => v,
-            Err(msg) => return Ok(tool_error(msg)),
+            Err(e) => return Ok(tool_error(e.message)),
         };
         let system_json: serde_json::Value = match self.get("/system", &[]).await {
             Ok(v) => v,
-            Err(msg) => return Ok(tool_error(msg)),
+            Err(e) => return Ok(tool_error(e.message)),
         };
 
         let status: Status = match serde_json::from_value(status_json.clone()) {
@@ -309,7 +337,7 @@ impl LinnixMcp {
         if params.detail == Detail::Raw {
             let raw: serde_json::Value = match self.get("/attribution", &query).await {
                 Ok(v) => v,
-                Err(msg) => return Ok(tool_error(msg)),
+                Err(e) => return Ok(tool_error(e.message)),
             };
             let permalink = raw
                 .get("permalink")
@@ -326,7 +354,7 @@ impl LinnixMcp {
 
         let body: AttributionResponse = match self.get("/attribution", &query).await {
             Ok(b) => b,
-            Err(msg) => return Ok(tool_error(msg)),
+            Err(e) => return Ok(tool_error(e.message)),
         };
 
         let investigation = investigate::summarise(&body.attributions);
@@ -374,7 +402,7 @@ impl LinnixMcp {
         let proc: serde_json::Value =
             match self.get(&format!("/processes/{}", params.pid), &[]).await {
                 Ok(p) => p,
-                Err(msg) => return Ok(tool_error(msg)),
+                Err(e) => return Ok(tool_error(e.message)),
             };
 
         if params.detail == Detail::Summary {
@@ -382,10 +410,16 @@ impl LinnixMcp {
         }
 
         // A live process always has a graph, but a process that exited between
-        // the two requests does not. That is a race, not a failure, and losing
-        // the process row we already hold to report it would be a bad trade.
+        // the two requests does not. That race is worth absorbing; nothing
+        // else is. Reporting a 5xx or an expired token as "the process may
+        // have exited" would tell an agent the tree is empty when the truth is
+        // that we could not read it.
         let graph: Option<serde_json::Value> =
-            self.get(&format!("/graph/{}", params.pid), &[]).await.ok();
+            match self.get(&format!("/graph/{}", params.pid), &[]).await {
+                Ok(graph) => Some(graph),
+                Err(e) if e.not_found => None,
+                Err(e) => return Ok(tool_error(e.message)),
+            };
 
         let mut out = process_headline(params.pid, &proc);
         if params.detail == Detail::Raw {
@@ -424,7 +458,7 @@ impl LinnixMcp {
             .await
         {
             Ok(i) => i,
-            Err(msg) => return Ok(tool_error(msg)),
+            Err(e) => return Ok(tool_error(e.message)),
         };
 
         if incidents.is_empty() {
@@ -463,14 +497,14 @@ impl LinnixMcp {
             let raw: serde_json::Value =
                 match self.get(&format!("/incidents/{}", params.id), &[]).await {
                     Ok(v) => v,
-                    Err(msg) => return Ok(tool_error(msg)),
+                    Err(e) => return Ok(tool_error(e.message)),
                 };
             return Ok(text(pretty_json(&raw)));
         }
 
         let view: IncidentView = match self.get(&format!("/incidents/{}", params.id), &[]).await {
             Ok(v) => v,
-            Err(msg) => return Ok(tool_error(msg)),
+            Err(e) => return Ok(tool_error(e.message)),
         };
 
         // `sanitized` strips terminal controls from every string that came
@@ -703,7 +737,10 @@ fn incident_headline(view: &IncidentView, id: i64) -> String {
 /// fork storm is visible in twenty short lines and buried in the same twenty
 /// nodes rendered as objects.
 fn render_tree(graph: &serde_json::Value) -> String {
-    let Some(nodes) = graph.as_array() else {
+    // `/graph/{pid}` answers with `{"root": <pid>, "nodes": [...]}`. Reading
+    // the envelope as the array would silently fall back to dumping JSON at
+    // the tier whose whole purpose is to be shorter than JSON.
+    let Some(nodes) = graph.get("nodes").and_then(|n| n.as_array()) else {
         return pretty_json(graph);
     };
     if nodes.is_empty() {
