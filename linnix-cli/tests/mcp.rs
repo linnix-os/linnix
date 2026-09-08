@@ -351,24 +351,45 @@ fn every_tool_has_three_tiers_that_actually_differ() {
 #[test]
 fn detail_raw_hands_back_what_the_daemon_actually_sent() {
     // The raw tier is what a caller quotes. Decoding into this crate's structs
-    // and re-serialising would silently drop every field cognitod sends that
-    // the CLI does not declare — `blame_score` here, plus the top-level
-    // `victim` and `window_minutes` — while still calling itself raw.
+    // and re-serialising drops every field cognitod sends that the CLI does
+    // not declare, while still calling itself raw — so each case below names a
+    // field that no struct in this crate declares, which is the only kind of
+    // field that catches the mistake.
     let server = full_daemon();
     let mut client = McpClient::spawn(&server.base_url());
 
+    let cases: [(&str, Value, &[&str]); 4] = [
+        (
+            "linnix_system_health",
+            json!({}),
+            &["disk_read_bytes", "net_rx_bytes"],
+        ),
+        (
+            "linnix_investigate_contention",
+            json!({"namespace": "payments", "pod": "payment-api"}),
+            &["blame_score", "window_minutes"],
+        ),
+        ("linnix_explain_process", json!({"pid": 4242}), &["gid"]),
+        ("linnix_recent_incidents", json!({}), &["load_avg"]),
+    ];
+
+    for (tool, base_args, undeclared) in cases {
+        let mut args = base_args;
+        args["detail"] = json!("raw");
+        let (raw, _) = client.call_tool(tool, args);
+        for field in undeclared {
+            assert!(
+                raw.contains(&format!("\"{field}\"")),
+                "{tool} dropped {field} from its raw tier: {raw}"
+            );
+        }
+    }
+
+    // The permalink is part of the evidence, not garnish: the window slides,
+    // so these rows stop being reachable by the same question within minutes.
     let (raw, _) = client.call_tool(
         "linnix_investigate_contention",
         json!({"namespace": "payments", "pod": "payment-api", "detail": "raw"}),
-    );
-
-    assert!(
-        raw.contains("\"blame_score\""),
-        "dropped blame_score: {raw}"
-    );
-    assert!(
-        raw.contains("\"window_minutes\""),
-        "dropped the envelope: {raw}"
     );
     assert!(raw.contains("\"attributed_stall_us\": 700000"), "{raw}");
     assert!(

@@ -233,16 +233,38 @@ impl LinnixMcp {
         &self,
         Parameters(params): Parameters<HealthParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let status: Status = match self.get("/status", &[]).await {
-            Ok(s) => s,
+        // Fetched undecoded and decoded afterwards, so the raw tier can hand
+        // back what cognitod actually sent. Rebuilding the JSON from the
+        // structs below would drop every field this crate does not declare —
+        // the byte and timestamp counters `/system` carries among them —
+        // while still calling itself raw.
+        let status_json: serde_json::Value = match self.get("/status", &[]).await {
+            Ok(v) => v,
             Err(msg) => return Ok(tool_error(msg)),
         };
-        let system: SystemSnapshot = match self.get("/system", &[]).await {
-            Ok(s) => s,
+        let system_json: serde_json::Value = match self.get("/system", &[]).await {
+            Ok(v) => v,
             Err(msg) => return Ok(tool_error(msg)),
         };
 
-        Ok(text(render_health(&status, &system, params.detail)))
+        let status: Status = match serde_json::from_value(status_json.clone()) {
+            Ok(s) => s,
+            Err(e) => return Ok(tool_error(format!("could not decode /status: {e}"))),
+        };
+        let system: SystemSnapshot = match serde_json::from_value(system_json.clone()) {
+            Ok(s) => s,
+            Err(e) => return Ok(tool_error(format!("could not decode /system: {e}"))),
+        };
+
+        let mut out = render_health(&status, &system, params.detail);
+        if params.detail == Detail::Raw {
+            out.push_str("\n/status, as the daemon sent it:\n");
+            out.push_str(&pretty_json(&status_json));
+            out.push_str("\n\n/system, as the daemon sent it:\n");
+            out.push_str(&pretty_json(&system_json));
+            out.push('\n');
+        }
+        Ok(text(out))
     }
 
     #[tool(
@@ -577,26 +599,6 @@ fn render_health(status: &Status, system: &SystemSnapshot, detail: Detail) -> St
         );
     }
 
-    if detail == Detail::Raw {
-        out.push_str("\nRaw readings:\n");
-        out.push_str(&pretty_json(&serde_json::json!({
-            "cpu_percent": system.cpu_percent,
-            "mem_percent": system.mem_percent,
-            "load_avg": system.load_avg,
-            "psi_cpu_some_avg10": system.psi_cpu_some_avg10,
-            "psi_memory_some_avg10": system.psi_memory_some_avg10,
-            "psi_memory_full_avg10": system.psi_memory_full_avg10,
-            "psi_io_some_avg10": system.psi_io_some_avg10,
-            "psi_io_full_avg10": system.psi_io_full_avg10,
-            "daemon_cpu_pct": status.cpu_pct,
-            "daemon_rss_mb": status.rss_mb,
-            "events_per_sec": status.events_per_sec,
-            "rb_overflows": status.rb_overflows,
-            "rate_limited": status.rate_limited,
-            "offline": status.offline,
-        })));
-        out.push('\n');
-    }
     out
 }
 
@@ -708,6 +710,16 @@ fn render_tree(graph: &serde_json::Value) -> String {
         return "  (no related processes)\n".to_string();
     }
 
+    // Levels are signed and relative to the queried process: ancestors are
+    // negative, descendants positive. Indenting by absolute value would put an
+    // ancestor and a descendant at the same depth, which inverts half the
+    // tree, so the shallowest level becomes column zero.
+    let shallowest = nodes
+        .iter()
+        .filter_map(|node| node.get("level").and_then(|v| v.as_i64()))
+        .min()
+        .unwrap_or(0);
+
     let mut out = String::new();
     for node in nodes {
         let level = node.get("level").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -718,9 +730,10 @@ fn render_tree(graph: &serde_json::Value) -> String {
         let comm = node.get("comm").and_then(|v| v.as_str()).unwrap_or("?");
         let pid = node.get("pid").and_then(|v| v.as_i64()).unwrap_or(-1);
         let ppid = node.get("ppid").and_then(|v| v.as_i64()).unwrap_or(-1);
-        // Indent by depth so the shape of the tree survives, but clamp it: a
-        // deep chain must not push the text off the right of a transcript.
-        let indent = "  ".repeat((level.unsigned_abs() as usize).min(8) + 1);
+        // Clamped: a deep chain must not push the text off the right of a
+        // transcript, and the `[relationship]` tag still says which way it ran.
+        let depth = level.saturating_sub(shallowest).unsigned_abs() as usize;
+        let indent = "  ".repeat(depth.min(8) + 1);
         out.push_str(&format!(
             "{indent}[{relationship}] pid {pid} `{}` (parent {ppid})\n",
             single_line(comm)
