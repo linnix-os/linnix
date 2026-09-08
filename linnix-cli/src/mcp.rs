@@ -460,6 +460,13 @@ impl LinnixMcp {
             if let Some(link) = permalink {
                 out.push_str(&format!("\n\nThese exact rows: {link}\n"));
             }
+            // The raw tier can hand back an empty attributions array just as
+            // legitimately-but-misleadingly as summary/evidence can, so it
+            // needs the same warning, not just the same bytes.
+            let note = readiness_note(&self.readiness().await);
+            if !note.is_empty() {
+                out = format!("{note}{out}");
+            }
             return Ok(text(out));
         }
 

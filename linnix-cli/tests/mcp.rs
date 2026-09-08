@@ -1222,6 +1222,42 @@ fn an_empty_investigation_with_probes_detached_is_not_presented_as_all_clear() {
 }
 
 #[test]
+fn the_raw_tier_of_contention_also_carries_the_readiness_warning() {
+    // The summary/evidence fix reads /readyz after building the report, but
+    // detail=raw returns before that point, so it kept handing back an
+    // apparently authoritative empty attributions array with no warning that
+    // nothing was actually collected.
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/attribution");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"attributions": [], "permalink": null}"#);
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/readyz");
+        then.status(503)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"ready":false,"kernel_instrumentation":"unavailable",
+                    "transport":"userspace","btf_available":false,"rss_probe":"disabled",
+                    "reason":"eBPF probes are not attached; running userspace-only, so no per-process stall attribution is being produced."}"#,
+            );
+    });
+
+    let mut client = McpClient::spawn(&server.base_url());
+    let (raw, _) = client.call_tool(
+        "linnix_investigate_contention",
+        json!({"namespace": "payments", "pod": "payment-api", "detail": "raw"}),
+    );
+
+    assert!(
+        raw.starts_with("WARNING: eBPF probes are not attached"),
+        "the raw tier must carry the readiness warning too: {raw}"
+    );
+}
+
+#[test]
 fn a_readiness_endpoint_that_cannot_be_read_is_not_silence() {
     // A proxy error page parses as JSON perfectly well and says nothing about
     // the daemon. Treating that as "no warning" would put this tool right back
