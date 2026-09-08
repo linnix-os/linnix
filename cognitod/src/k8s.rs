@@ -1,4 +1,4 @@
-use log::{debug, info, warn};
+use log::{debug, info, trace, warn};
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -226,7 +226,13 @@ impl K8sContext {
 
     pub fn get_metadata_for_pid(&self, pid: u32) -> Option<K8sMetadata> {
         // Read /proc/<pid>/cgroup
-        let content = std::fs::read_to_string(format!("/proc/{}/cgroup", pid)).ok()?;
+        let Ok(content) = std::fs::read_to_string(format!("/proc/{}/cgroup", pid)) else {
+            // Expected for pids that have already exited (e.g. a fork-bomb
+            // child that lived microseconds) -- not itself evidence of a
+            // container-map race.
+            trace!("[k8s] pid {pid} has no /proc/<pid>/cgroup (already exited?)");
+            return None;
+        };
 
         // Parse cgroup to find container ID
         // Format: 0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod<uid>.slice/cri-containerd-<id>.scope
@@ -245,7 +251,18 @@ impl K8sContext {
                 };
 
                 if id.len() == 64 {
-                    return self.get_metadata(id);
+                    let meta = self.get_metadata(id);
+                    if meta.is_none() {
+                        // The pid resolved to a real container ID, but that
+                        // ID isn't (yet) in the watcher's container map --
+                        // the container-map race: the pod's process started
+                        // before the last 30s poll picked up its containerID.
+                        debug!(
+                            "[k8s] pid {pid} -> container {id} has no entry in container_map ({} entries tracked)",
+                            self.container_map.read().unwrap().len()
+                        );
+                    }
+                    return meta;
                 }
             }
         }

@@ -1,0 +1,171 @@
+{
+  "version": "0.3",
+  "episode_id": "01fa0b77-d0f9-4bce-8bea-234a3ee8f2c2",
+  "captured_at": "2026-09-08T20:16:35.391281307+00:00",
+  "source": "vm_capture",
+  "scenario": "fork_storm",
+  "trigger": {
+    "rule_name": "psi_stall_attribution",
+    "rule_version": "1"
+  },
+  "victim": {
+    "namespace": "prod",
+    "pod": "fork-bomb"
+  },
+  "victim_stall_us": 772440,
+  "cell": {
+    "kernel_release": "7.0.0-1012-aws",
+    "arch": "x86_64",
+    "btf_present": true,
+    "cgroup_driver": "cgroupv2",
+    "k3s_version": "k3s version v1.36.4+k3s1 (4dedb15b)"
+  },
+  "candidates": [
+    {
+      "pod": {
+        "namespace": "prod",
+        "pod": "fork-bomb"
+      },
+      "owner_kind": null,
+      "owner_name": null,
+      "pre_window": {
+        "cpu_stall_us": [
+          869209.0,
+          810476.0,
+          853589.0,
+          827446.0,
+          879118.0,
+          818131.0,
+          852778.0,
+          888806.0,
+          779287.0,
+          804490.0,
+          859513.0,
+          820089.0,
+          836211.0,
+          849889.0,
+          823956.0,
+          858876.0,
+          891373.0,
+          805795.0,
+          878308.0,
+          801419.0,
+          781186.0,
+          830991.0,
+          817522.0,
+          790552.0,
+          886912.0,
+          769654.0,
+          819853.0,
+          744272.0,
+          749461.0,
+          805165.0,
+          772440.0
+        ],
+        "io_stall_us": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          5.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "memory_stall_us": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "post_window": {},
+      "sample_interval_ms": 1000,
+      "first_deviation_offset_ms": -15544
+    },
+    {
+      "pod": {
+        "namespace": "prod",
+        "pod": "payment-api"
+      },
+      "owner_kind": null,
+      "owner_name": null,
+      "pre_window": {
+        "cpu_percent": [
+          0.0
+        ],
+        "fork_count": [
+          4.0
+        ],
+        "short_job_count": [
+          2.0
+        ]
+      },
+      "post_window": {},
+      "sample_interval_ms": 1000,
+      "first_deviation_offset_ms": null
+    }
+  ],
+  "pod_graph": [],
+  "diagnosis": null,
+  "ground_truth": {
+    "culprit": {
+      "namespace": "prod",
+      "pod": "fork-bomb"
+    },
+    "reason_code": "fork_storm",
+    "corrected": false
+  },
+  "evidence_cited": [],
+  "outcome": null
+}

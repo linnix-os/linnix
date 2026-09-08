@@ -46,17 +46,16 @@ $SSH "$KUBECTL wait --for=condition=Ready pod/payment-api -n prod --timeout=120s
 echo "=== [$CELL_NAME] snapshotting episode dir before injection ==="
 BEFORE=$($SSH "sudo ls /var/lib/linnix/episodes 2>/dev/null || true")
 
-echo "=== [$CELL_NAME] injecting $SCENARIO ==="
-$SSH "$KUBECTL apply -f -" < "$SCRIPT_DIR/scenarios/$SCENARIO_FILE"
-
-# From here on the offender is live on the cell. A Ctrl-C (or any failure)
-# during the sleep below would otherwise exit under set -e and leave it
-# running -- a later run of a different scenario only applies/deletes its
-# own manifest, so the stray offender keeps faulting the victim underneath
-# the new capture while every new episode gets stamped with the new
-# scenario's ground truth, silently corrupting the corpus. The trap deletes
-# the same manifest on any exit path; it's disarmed right after the normal
-# delete below so that expected path doesn't run it twice.
+# Arm cleanup before the apply that makes it necessary, not after: `set -e`
+# means a multi-document manifest that partially applies (e.g. the first pod
+# accepted, the second rejected) exits this script immediately, and if the
+# trap weren't armed yet that failure path would leave the accepted pod(s)
+# running with nothing to clean them up. A later run of a different scenario
+# only applies/deletes its own manifest, so the stray offender keeps faulting
+# the victim underneath the new capture while every new episode gets stamped
+# with the new scenario's ground truth, silently corrupting the corpus. The
+# trap deletes the same manifest on any exit path; it's disarmed right after
+# the normal delete below so that expected path doesn't run it twice.
 CLEANUP_ARMED=1
 cleanup_offender() {
     if [ "$CLEANUP_ARMED" = "1" ]; then
@@ -65,6 +64,9 @@ cleanup_offender() {
     fi
 }
 trap cleanup_offender EXIT INT TERM
+
+echo "=== [$CELL_NAME] injecting $SCENARIO ==="
+$SSH "$KUBECTL apply -f -" < "$SCRIPT_DIR/scenarios/$SCENARIO_FILE"
 
 echo "=== [$CELL_NAME] letting the fault run for ${INJECT_DURATION_SECONDS}s ==="
 sleep "$INJECT_DURATION_SECONDS"

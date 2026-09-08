@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use log::{debug, trace};
 use tokio::sync::broadcast;
 
 use crate::ProcessEvent;
@@ -41,6 +42,48 @@ pub struct ProcessMemorySummary {
     pub pid: u32,
     pub comm: String,
     pub mem_percent: f32,
+}
+
+/// Looks up `pid`'s cached k8s metadata in the live map, and if it's cached
+/// as unresolved, retries resolution against `ctx` right now and backfills
+/// the live entry on success.
+///
+/// Metadata is normally attached once, at Fork/Exec time, from
+/// `/proc/<pid>/cgroup` + the watcher's container map. When a pod is created
+/// moments before its first process forks/execs, the watcher (polling every
+/// 30s) hasn't necessarily learned the pod's container IDs yet, so that
+/// first resolution attempt can fail -- permanently, since nothing used to
+/// revisit it. Every other event for that pid (exits, later forks of its
+/// children) just re-read the same stale `None` from the live map, so a
+/// process born in that window stayed attributionless for its whole life.
+/// Retrying here means the *next* event for the pid heals it as soon as the
+/// watcher catches up, instead of the gap being permanent.
+fn resolve_live_metadata(
+    ctx: &K8sContext,
+    live: &mut HashMap<u32, ProcessEntry>,
+    pid: u32,
+) -> Option<Arc<K8sMetadata>> {
+    match live.get(&pid) {
+        Some((_, Some(meta))) => Some(meta.clone()),
+        Some((_, None)) => {
+            trace!("[context] retrying k8s metadata resolution for live pid {pid}");
+            match ctx.get_metadata_for_pid(pid) {
+                Some(meta) => {
+                    let meta = Arc::new(meta);
+                    if let Some(entry) = live.get_mut(&pid) {
+                        entry.1 = Some(meta.clone());
+                    }
+                    debug!(
+                        "[context] resolved previously-unattributed pid {pid} to {}/{}",
+                        meta.namespace, meta.pod_name
+                    );
+                    Some(meta)
+                }
+                None => None,
+            }
+        }
+        None => None,
+    }
 }
 
 impl ContextStore {
@@ -92,28 +135,31 @@ impl ContextStore {
                     // Exec or Fork: try to get fresh metadata
                     if let Some(meta) = ctx.get_metadata_for_pid(event.pid) {
                         metadata = Some(Arc::new(meta));
-                    } else if event.event_type == 1 {
-                        // Fork fallback: inherit parent's metadata if we can't find child's yet
-                        // (race condition: process created but cgroup not yet populated)
-                        let live = self.live.lock().unwrap();
-                        if let Some((_, parent_meta)) = live.get(&event.ppid) {
-                            metadata = parent_meta.clone();
+                    } else {
+                        trace!(
+                            "[context] no k8s metadata yet for pid {} (event_type={})",
+                            event.pid, event.event_type
+                        );
+                        if event.event_type == 1 {
+                            // Fork fallback: inherit parent's metadata if we can't find
+                            // child's yet (race condition: process created but cgroup
+                            // not yet populated). Re-resolve rather than trusting a
+                            // stale cached `None` -- the watcher may have caught up
+                            // with the parent's pod since the parent's own Exec/Fork.
+                            let mut live = self.live.lock().unwrap();
+                            metadata = resolve_live_metadata(ctx, &mut live, event.ppid);
                         }
                     }
                 }
                 2 => {
-                    // Exit: check if we have it in live map
-                    let live = self.live.lock().unwrap();
-                    if let Some((_, meta)) = live.get(&event.pid) {
-                        metadata = meta.clone();
-                    }
+                    // Exit: check if we have it in live map, re-resolving if unresolved
+                    let mut live = self.live.lock().unwrap();
+                    metadata = resolve_live_metadata(ctx, &mut live, event.pid);
                 }
                 _ => {
-                    // Other events: try to lookup in live map first
-                    let live = self.live.lock().unwrap();
-                    if let Some((_, meta)) = live.get(&event.pid) {
-                        metadata = meta.clone();
-                    }
+                    // Other events: try to lookup in live map first, re-resolving if unresolved
+                    let mut live = self.live.lock().unwrap();
+                    metadata = resolve_live_metadata(ctx, &mut live, event.pid);
                 }
             }
         }
@@ -180,6 +226,28 @@ impl ContextStore {
 
         event.seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let _ = self.broadcaster.send(event);
+    }
+
+    /// Retries k8s metadata resolution for every live process still cached
+    /// as unattributed. Belt-and-suspenders alongside the per-event retries
+    /// in [`Self::add`]: a process whose Fork/Exec lost the resolution race
+    /// and then never triggers another event (no children, no exit yet)
+    /// would otherwise stay unattributed for its whole life. Meant to be
+    /// polled periodically (e.g. alongside `update_process_stats`), well
+    /// under the k8s watcher's own refresh cadence.
+    pub fn rescan_unresolved_k8s_metadata(&self) {
+        let Some(ctx) = &self.k8s_ctx else {
+            return;
+        };
+        let mut live = self.live.lock().unwrap();
+        let pending: Vec<u32> = live
+            .iter()
+            .filter(|(_, (_, meta))| meta.is_none())
+            .map(|(pid, _)| *pid)
+            .collect();
+        for pid in pending {
+            resolve_live_metadata(ctx, &mut live, pid);
+        }
     }
 
     pub fn get_recent(&self) -> Vec<ProcessEvent> {
@@ -438,7 +506,6 @@ impl ContextStore {
     }
 
     /// Get pod activity stats within a time window
-    /// Get pod activity stats within a time window
     pub fn get_pod_activity_window(
         &self,
         window: Duration,
@@ -452,6 +519,30 @@ impl ContextStore {
         let mut fork_counts: HashMap<String, u64> = HashMap::new();
         let mut short_job_counts: HashMap<String, u64> = HashMap::new();
 
+        // The metadata cached on a history entry is a point-in-time snapshot
+        // from when the event was pushed (see `add`): if resolution raced
+        // the k8s watcher and lost, it's stamped `None` forever, even after
+        // `resolve_live_metadata`/`rescan_unresolved_k8s_metadata` heal the
+        // live map. Snapshot the live map's current (possibly since-healed)
+        // metadata here -- locked and dropped before `inner`, so the two
+        // locks are never held at once -- and fall back to it below.
+        //
+        // Also snapshot each entry's process start time (`ProcessEvent::ts_ns`,
+        // which `add` normalizes to start time for every event type,
+        // including Exit). A pid is reused often enough under a fork-storm
+        // workload that joining fallback metadata by pid alone can attribute
+        // a dead process's fork/exit to whatever unrelated pod now owns that
+        // pid (confirmed against a real capture: a deleted pod's stale
+        // cpu/fork counters leaked into a later, unrelated episode). Reject
+        // the join unless the live entry's start time is consistent with
+        // being the same incarnation the historical event belongs to.
+        let live_meta: HashMap<u32, (u64, Arc<K8sMetadata>)> = {
+            let live = self.live.lock().unwrap();
+            live.iter()
+                .filter_map(|(pid, (proc, meta))| meta.clone().map(|m| (*pid, (proc.ts_ns, m))))
+                .collect()
+        };
+
         let queue = self.inner.lock().unwrap();
 
         // Scan history for relevant events
@@ -460,8 +551,29 @@ impl ContextStore {
                 continue;
             }
 
-            // Use the metadata cached at time of event
-            if let Some(meta) = meta_opt {
+            // Prefer the metadata cached at event time; fall back to the
+            // live map's current view of the event's own pid, then its
+            // parent's -- a Fork event recorded before its parent's pod was
+            // known can still be attributed once the parent heals. Both
+            // fallbacks are gated on start-time consistency so a reused pid
+            // can't borrow an unrelated (later) incarnation's identity:
+            // the event's own pid must match the live entry's start time
+            // exactly (same incarnation), and a parent lookup only counts
+            // if the parent's live incarnation already existed when this
+            // event (a Fork, born from that parent) occurred.
+            let meta = meta_opt.clone().or_else(|| {
+                live_meta
+                    .get(&event.pid)
+                    .filter(|(start_ts, _)| *start_ts == event.ts_ns)
+                    .or_else(|| {
+                        live_meta
+                            .get(&event.ppid)
+                            .filter(|(start_ts, _)| *start_ts <= event.ts_ns)
+                    })
+                    .map(|(_, meta)| meta.clone())
+            });
+
+            if let Some(meta) = meta {
                 let key = format!("{}/{}", meta.namespace, meta.pod_name);
 
                 // Count forks
