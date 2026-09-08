@@ -804,3 +804,93 @@ fn a_grandchild_is_not_reparented_onto_its_parents_sibling() {
     );
     assert!(indent("`child-a`") < indent("`grandchild-a`"), "{evidence}");
 }
+
+#[test]
+fn a_sibling_does_not_adopt_the_queried_processs_children() {
+    // `get_graph` emits self, ancestors, siblings, descendants — so a sibling
+    // arrives between the queried process and its own children. A sibling
+    // shares the queried process's indent, so leaving it there makes every one
+    // of those children appear to hang off the sibling, a tree that
+    // contradicts the `ppid` printed on the same rows.
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/processes/100");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"pid":100,"ppid":50,"uid":0,"gid":0,"comm":"parent","event_type":"exec","k8s":null}"#);
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/graph/100");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"root":100,"nodes":[
+                    {"pid":100,"ppid":50,"comm":"queried","uid":0,"gid":0,
+                     "event_type":"exec","relationship":"self","level":0},
+                    {"pid":50,"ppid":0,"comm":"shared-parent","uid":0,"gid":0,
+                     "event_type":"exec","relationship":"ancestor","level":-1},
+                    {"pid":60,"ppid":50,"comm":"the-sibling","uid":0,"gid":0,
+                     "event_type":"exec","relationship":"sibling","level":0},
+                    {"pid":200,"ppid":100,"comm":"my-child","uid":0,"gid":0,
+                     "event_type":"exec","relationship":"descendant","level":1}]}"#,
+            );
+    });
+
+    let mut client = McpClient::spawn(&server.base_url());
+    let (evidence, _) = client.call_tool("linnix_explain_process", json!({"pid": 100}));
+
+    let names: Vec<&str> = evidence
+        .lines()
+        .filter(|line| line.contains("] pid "))
+        .map(|line| line.split('`').nth(1).expect("comm in backticks"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["shared-parent", "the-sibling", "queried", "my-child"],
+        "the queried process must be adjacent to its own subtree: {evidence}"
+    );
+}
+
+#[test]
+fn offenders_with_no_comparable_attribution_are_not_ranked() {
+    // Rows predating `attributed_stall_us` leave every offender at zero, so
+    // `summarise` falls back to sorting by name for reproducibility. Calling
+    // the first of those the "largest contender" invents a ranking out of
+    // alphabetical order — the same mistake as rendering an unknown share as
+    // 0%, which the CLI already refuses to make, pointed the other way.
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/attribution");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"permalink":null,"attributions":[
+                    {"offender_pod":"aardvark","offender_namespace":"a",
+                     "stall_us":1000000,"attributed_stall_us":null,
+                     "timestamp":100,"cpu_share":0.10,"fork_count":1,
+                     "short_job_count":0,"reason":"noisy_neighbor","event_id":"e1"},
+                    {"offender_pod":"zebra","offender_namespace":"z",
+                     "stall_us":1000000,"attributed_stall_us":null,
+                     "timestamp":100,"cpu_share":0.90,"fork_count":9,
+                     "short_job_count":0,"reason":"fork_storm","event_id":"e1"}]}"#,
+            );
+    });
+
+    let mut client = McpClient::spawn(&server.base_url());
+    let (summary, _) = client.call_tool(
+        "linnix_investigate_contention",
+        json!({"namespace": "payments", "pod": "payment-api", "detail": "summary"}),
+    );
+
+    assert!(
+        !summary.contains("largest contender"),
+        "alphabetical order is not a ranking: {summary}"
+    );
+    assert!(summary.contains("cannot be ranked"), "{summary}");
+    // Both are still named — they are evidence of contention, just not of
+    // which one contended more.
+    assert!(
+        summary.contains("a/aardvark") && summary.contains("z/zebra"),
+        "{summary}"
+    );
+}

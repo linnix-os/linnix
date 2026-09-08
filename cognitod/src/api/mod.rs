@@ -145,10 +145,12 @@ struct GraphNode {
     uid: u32,
     gid: u32,
     event_type: EventKind,
-    /// One of "self" (the queried process), "ancestor", "descendant", or
-    /// "virtual_root" (a parent this daemon never saw start). Said exactly,
-    /// because a client that renders on these strings gets no error from
-    /// guessing one wrong — it just draws the wrong tree.
+    /// One of "self" (the queried process), "ancestor", "sibling",
+    /// "descendant", or "virtual_root" (a parent this daemon never saw
+    /// start). Said exactly, because a client that renders on these strings
+    /// gets no error from guessing one wrong — it just draws the wrong tree.
+    /// The first version of this comment omitted "sibling" and a client
+    /// promptly drew siblings as children.
     relationship: String,
     level: isize, // 0 for root, increasing away from root
 }

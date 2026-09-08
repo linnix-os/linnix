@@ -671,14 +671,46 @@ fn contention_headline(
         );
     };
 
+    // When no offender in the window carries a per-offender split, `summarise`
+    // has nothing to order by and falls back to sorting by name for
+    // reproducibility. Calling the first of those the "largest contender"
+    // would invent a ranking out of alphabetical order — the same mistake as
+    // rendering an unknown share as 0%, which the CLI already refuses to do,
+    // pointed the other way.
+    if investigation
+        .offenders
+        .iter()
+        .all(|offender| offender.share.is_none())
+    {
+        let names = investigation
+            .offenders
+            .iter()
+            .map(|offender| format!("{}/{}", offender.namespace, offender.pod))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!(
+            "{namespace}/{pod} stalled across {} detection window(s) in the last {since}. \
+             {} contended with it — {names} — but these rows predate per-offender \
+             attribution, so they cannot be ranked against each other. This is contention \
+             attribution, not proven cause.\n",
+            investigation.windows,
+            if investigation.offenders.len() == 1 {
+                "One workload".to_string()
+            } else {
+                format!("{} workloads", investigation.offenders.len())
+            },
+        );
+    }
+
     let share = match primary.share {
         Some(share) => format!(
             "{:.0}% of the stall attributed to neighbours",
             share * 100.0
         ),
-        // An offender whose rows all predate the per-offender split
-        // contributed an unknown amount, not zero, and must not be rendered
-        // as a percentage that reads like an exoneration.
+        // An offender whose own rows all predate the split contributed an
+        // unknown amount, not zero, and must not be rendered as a percentage
+        // that reads like an exoneration. Reachable here only when some other
+        // offender *did* carry a split, which is what makes the order real.
         None => "an unrecorded share of the attributed stall".to_string(),
     };
 
@@ -772,25 +804,42 @@ fn render_tree(graph: &serde_json::Value) -> String {
         .min()
         .unwrap_or(0);
 
-    // `get_graph` emits the queried process first, then ancestors from the
-    // immediate parent outward, then descendants depth-first. Only the first
-    // two parts are out of display order, so only they are moved:
+    // `get_graph` emits, in this order: the queried process at level 0, its
+    // ancestors from the immediate parent outward, any siblings (also level
+    // 0), then descendants depth-first. Rendering that array as-is gets two
+    // things wrong and one thing right, so this moves exactly two groups.
     //
-    //   ancestors arrive -1, -2, -3 and read correctly as -3, -2, -1;
-    //   descendants arrive child, grandchild, sibling — which is already the
-    //   order a tree is drawn in, and sorting them by level would separate a
-    //   grandchild from its parent and reparent it under the next sibling.
+    // Ancestors arrive -1, -2, -3 and read correctly as -3, -2, -1.
     //
-    // Sorting the whole array by level was the first attempt and does exactly
-    // that, which is why this partitions instead.
+    // Siblings arrive *between* the queried process and its own children.
+    // Since a sibling shares the queried process's indent, every one of those
+    // children then appears to hang off the sibling — a tree that contradicts
+    // the `ppid` in the same rows. They move ahead of the queried process,
+    // where a tree renderer puts them: all of one parent's children, then the
+    // subtree under the one being asked about.
+    //
+    // Descendants are already right. `collect_descendants` recurses the moment
+    // it pushes a child, so they arrive child, grandchild, sibling — which is
+    // the order a tree is drawn in. Sorting the whole array by level was the
+    // first attempt at the ancestor fix and broke exactly this, separating a
+    // grandchild from its parent and reparenting it under the next branch.
     let level_of =
         |node: &serde_json::Value| node.get("level").and_then(|v| v.as_i64()).unwrap_or(0);
+    let is_sibling = |node: &serde_json::Value| {
+        node.get("relationship").and_then(|v| v.as_str()) == Some("sibling")
+    };
+
     let mut ancestors: Vec<&serde_json::Value> =
         nodes.iter().filter(|node| level_of(node) < 0).collect();
     ancestors.reverse();
     let nodes: Vec<&serde_json::Value> = ancestors
         .into_iter()
-        .chain(nodes.iter().filter(|node| level_of(node) >= 0))
+        .chain(nodes.iter().filter(|node| is_sibling(node)))
+        .chain(
+            nodes
+                .iter()
+                .filter(|node| level_of(node) >= 0 && !is_sibling(node)),
+        )
         .collect();
 
     let mut out = String::new();
