@@ -723,3 +723,84 @@ fn a_503_on_a_live_route_is_not_blamed_on_a_missing_store() {
     );
     assert!(text.contains("503"), "{text}");
 }
+
+#[test]
+fn a_grandchild_is_not_reparented_onto_its_parents_sibling() {
+    // `collect_descendants` recurses as soon as it pushes a child, so the
+    // daemon emits child A, grandchild A, child B — already tree order.
+    // Sorting the whole array by level (the first fix for the ancestor
+    // ordering) turns that into child A, child B, grandchild A, and the
+    // indentation then says the grandchild belongs to B. That is not a
+    // cosmetic defect: it reports a process tree that never existed, and a
+    // fork storm is exactly the thing an agent reads this tree to find.
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/processes/100");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"pid":100,"ppid":50,"uid":0,"gid":0,"comm":"parent","event_type":"exec","k8s":null}"#);
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/graph/100");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"root":100,"nodes":[
+                    {"pid":100,"ppid":50,"comm":"parent","uid":0,"gid":0,
+                     "event_type":"exec","relationship":"self","level":0},
+                    {"pid":50,"ppid":10,"comm":"grandparent","uid":0,"gid":0,
+                     "event_type":"exec","relationship":"ancestor","level":-1},
+                    {"pid":10,"ppid":0,"comm":"init","uid":0,"gid":0,
+                     "event_type":"exec","relationship":"ancestor","level":-2},
+                    {"pid":200,"ppid":100,"comm":"child-a","uid":0,"gid":0,
+                     "event_type":"exec","relationship":"descendant","level":1},
+                    {"pid":300,"ppid":200,"comm":"grandchild-a","uid":0,"gid":0,
+                     "event_type":"exec","relationship":"descendant","level":2},
+                    {"pid":400,"ppid":100,"comm":"child-b","uid":0,"gid":0,
+                     "event_type":"exec","relationship":"descendant","level":1}]}"#,
+            );
+    });
+
+    let mut client = McpClient::spawn(&server.base_url());
+    let (evidence, is_error) = client.call_tool("linnix_explain_process", json!({"pid": 100}));
+    assert!(!is_error, "{evidence}");
+
+    let tree: Vec<&str> = evidence
+        .lines()
+        .filter(|line| line.contains("] pid "))
+        .collect();
+
+    // Ancestors read outermost-first; descendants keep the daemon's
+    // depth-first order, so the grandchild stays adjacent to its own parent.
+    let names: Vec<&str> = tree
+        .iter()
+        .map(|line| line.split('`').nth(1).expect("comm in backticks"))
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "init",
+            "grandparent",
+            "parent",
+            "child-a",
+            "grandchild-a",
+            "child-b"
+        ],
+        "{evidence}"
+    );
+
+    let indent = |needle: &str| {
+        tree.iter()
+            .find(|line| line.contains(needle))
+            .map(|line| line.len() - line.trim_start().len())
+            .unwrap_or_else(|| panic!("no line for {needle}: {evidence}"))
+    };
+    assert_eq!(indent("`init`"), 2, "the outermost ancestor is column zero");
+    assert!(indent("`grandparent`") < indent("`parent`"), "{evidence}");
+    assert_eq!(
+        indent("`child-a`"),
+        indent("`child-b`"),
+        "siblings must share a column: {evidence}"
+    );
+    assert!(indent("`child-a`") < indent("`grandchild-a`"), "{evidence}");
+}

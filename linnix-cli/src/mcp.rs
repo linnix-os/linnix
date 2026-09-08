@@ -772,13 +772,26 @@ fn render_tree(graph: &serde_json::Value) -> String {
         .min()
         .unwrap_or(0);
 
-    // The daemon appends the queried process first and then walks ancestors
-    // from the immediate parent outward, so the array arrives with a level 0
-    // node ahead of its own parents. Rendered in that order the tree reads
-    // upside down: the deepest indent first, then a chain that un-indents.
-    // Sorting by level is stable, so siblings keep the daemon's order.
-    let mut nodes: Vec<&serde_json::Value> = nodes.iter().collect();
-    nodes.sort_by_key(|node| node.get("level").and_then(|v| v.as_i64()).unwrap_or(0));
+    // `get_graph` emits the queried process first, then ancestors from the
+    // immediate parent outward, then descendants depth-first. Only the first
+    // two parts are out of display order, so only they are moved:
+    //
+    //   ancestors arrive -1, -2, -3 and read correctly as -3, -2, -1;
+    //   descendants arrive child, grandchild, sibling — which is already the
+    //   order a tree is drawn in, and sorting them by level would separate a
+    //   grandchild from its parent and reparent it under the next sibling.
+    //
+    // Sorting the whole array by level was the first attempt and does exactly
+    // that, which is why this partitions instead.
+    let level_of =
+        |node: &serde_json::Value| node.get("level").and_then(|v| v.as_i64()).unwrap_or(0);
+    let mut ancestors: Vec<&serde_json::Value> =
+        nodes.iter().filter(|node| level_of(node) < 0).collect();
+    ancestors.reverse();
+    let nodes: Vec<&serde_json::Value> = ancestors
+        .into_iter()
+        .chain(nodes.iter().filter(|node| level_of(node) >= 0))
+        .collect();
 
     let mut out = String::new();
     for node in nodes {
