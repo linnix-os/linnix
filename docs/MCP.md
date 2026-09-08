@@ -45,7 +45,17 @@ first and pay for evidence only when it decides the answer matters.
 |------------|---------|----------|
 | `summary`  | ~100 tokens | One or two sentences: the conclusion and the single strongest number behind it. |
 | `evidence` | ~500 tokens | The compiled facts — ranked offenders, shares, windows, peak CPU share, dominant signal. The default. |
-| `raw`      | unbounded | The daemon's own JSON, plus a permalink that re-runs the exact query. |
+| `raw`      | unbounded | The daemon's own JSON, **verbatim**, plus a permalink that re-runs the exact query. |
+
+`raw` is passed through undecoded rather than round-tripped through this
+crate's structs. That is not an implementation detail: a decode-and-re-encode
+would silently drop every field cognitod sends that the CLI does not happen to
+declare, and the one tier whose entire purpose is to be quotable would be
+handing back a filtered view while calling itself raw.
+
+The tiers are enforced by a test that loops over every tool, because a tool
+whose `summary` quietly equals its `evidence` fails silently: a caller that
+obeys the instruction to start cheap pays full price and never learns why.
 
 `summary` is what an agent should call when it is triaging and does not yet
 know whether this host is even relevant. `raw` is what it should call when it

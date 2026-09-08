@@ -271,18 +271,38 @@ impl LinnixMcp {
             Ok(w) => w,
             Err(msg) => return Ok(tool_error(msg)),
         };
+        let query = [
+            ("pod", params.pod.clone()),
+            ("namespace", params.namespace.clone()),
+            ("window", window.to_string()),
+        ];
 
-        let body: AttributionResponse = match self
-            .get(
-                "/attribution",
-                &[
-                    ("pod", params.pod.clone()),
-                    ("namespace", params.namespace.clone()),
-                    ("window", window.to_string()),
-                ],
-            )
-            .await
-        {
+        // The raw tier promises the daemon's own words, so it has to be the
+        // daemon's own bytes. Decoding into `AttributionResponse` first would
+        // silently drop every field cognitod sends that this crate does not
+        // declare — `blame_score` and the top-level `victim` and
+        // `window_minutes` among them — while still calling itself raw. A
+        // caller quoting a filtered view believing it complete is worse off
+        // than one who asked for prose.
+        if params.detail == Detail::Raw {
+            let raw: serde_json::Value = match self.get("/attribution", &query).await {
+                Ok(v) => v,
+                Err(msg) => return Ok(tool_error(msg)),
+            };
+            let permalink = raw
+                .get("permalink")
+                .and_then(|v| v.as_str())
+                .map(|path| format!("{}{}", self.base, path));
+            let mut out = pretty_json(&raw);
+            // The window slides, so these rows stop being reachable by the
+            // same question within minutes. The link is evidence, not garnish.
+            if let Some(link) = permalink {
+                out.push_str(&format!("\n\nThese exact rows: {link}\n"));
+            }
+            return Ok(text(out));
+        }
+
+        let body: AttributionResponse = match self.get("/attribution", &query).await {
             Ok(b) => b,
             Err(msg) => return Ok(tool_error(msg)),
         };
@@ -305,7 +325,7 @@ impl LinnixMcp {
             ),
             // Reusing the CLI's renderer is the point: a caller comparing this
             // answer against `linnix-cli investigate` output sees the same words.
-            Detail::Evidence => investigate::render(
+            Detail::Evidence | Detail::Raw => investigate::render(
                 &investigation,
                 &params.namespace,
                 &params.pod,
@@ -313,7 +333,6 @@ impl LinnixMcp {
                 false,
                 permalink.as_deref(),
             ),
-            Detail::Raw => raw_json(&body.attributions, permalink.as_deref()),
         };
         Ok(text(out))
     }
@@ -347,15 +366,22 @@ impl LinnixMcp {
             self.get(&format!("/graph/{}", params.pid), &[]).await.ok();
 
         let mut out = process_headline(params.pid, &proc);
-        out.push('\n');
-        out.push_str(&pretty_json(&proc));
+        if params.detail == Detail::Raw {
+            out.push('\n');
+            out.push_str(&pretty_json(&proc));
+            out.push('\n');
+        }
         match &graph {
-            Some(g) => {
-                out.push_str("\n\nProcess tree around this PID:\n");
-                out.push_str(&pretty_json(g));
+            Some(graph) => {
+                out.push_str("\nProcess tree around this PID:\n");
+                out.push_str(&match params.detail {
+                    Detail::Raw => pretty_json(graph),
+                    _ => render_tree(graph),
+                });
             }
-            None => out
-                .push_str("\n\nThe process tree could not be read; the process may have exited.\n"),
+            None => {
+                out.push_str("\nThe process tree could not be read; the process may have exited.\n")
+            }
         }
         Ok(text(out))
     }
@@ -430,7 +456,16 @@ impl LinnixMcp {
         // were chosen by whoever started the process. An MCP client is not a
         // terminal, but the same strings are what a model will quote back into
         // one, so the boundary is still the right place to clean them.
-        Ok(text(explain::render(&view.sanitized(), params.id, false)))
+        let view = view.sanitized();
+
+        // A stored investigation runs to hundreds of tokens. A caller told to
+        // start at `summary` must not be charged for one just to find out
+        // whether this incident is the one it is looking for.
+        if params.detail == Detail::Summary {
+            return Ok(text(incident_headline(&view, params.id)));
+        }
+
+        Ok(text(explain::render(&view, params.id, false)))
     }
 }
 
@@ -481,18 +516,6 @@ fn text(body: String) -> CallToolResult {
 fn pretty_json<T: serde::Serialize>(value: &T) -> String {
     serde_json::to_string_pretty(value)
         .unwrap_or_else(|e| format!("(could not serialise cognitod's reply: {e})"))
-}
-
-/// The raw attribution rows plus the query that reproduces them.
-///
-/// The permalink is part of the evidence, not a convenience: the window slides,
-/// so the rows below stop being reachable by the same question within minutes.
-fn raw_json(attributions: &[investigate::Attribution], permalink: Option<&str>) -> String {
-    let mut out = pretty_json(&attributions);
-    if let Some(link) = permalink {
-        out.push_str(&format!("\n\nThese exact rows: {link}\n"));
-    }
-    out
 }
 
 fn render_health(status: &Status, system: &SystemSnapshot, detail: Detail) -> String {
@@ -644,6 +667,66 @@ fn process_headline(pid: u32, proc: &serde_json::Value) -> String {
     }
     line.push_str(".\n");
     line
+}
+
+/// One line naming an incident: enough to decide whether to ask for it in
+/// full, and nothing more.
+fn incident_headline(view: &IncidentView, id: i64) -> String {
+    let mut line = format!("Incident #{id}: {} → {}", view.event_type, view.action);
+    if let Some(target) = &view.target_name {
+        line.push_str(&format!(" on `{target}`"));
+        if let Some(pid) = view.target_pid {
+            line.push_str(&format!(" (pid {pid})"));
+        }
+    }
+    line.push_str(&format!(
+        ", cpu {:.1}%, psi_cpu {:.1}%, at epoch {}.",
+        view.cpu_percent, view.psi_cpu, view.timestamp
+    ));
+    // Whether the daemon reached a conclusion at all decides whether asking
+    // for the full rendering is worth anything, so it belongs in the one line
+    // that decides that.
+    match &view.investigation_rendered {
+        Some(Some(_)) => line.push_str(" A stored investigation exists; ask for detail=evidence."),
+        Some(None) => line.push_str(" The stored investigation could not be read by this daemon."),
+        None => line.push_str(" No stored investigation."),
+    }
+    line.push('\n');
+    line
+}
+
+/// The process tree as one line per process rather than as JSON.
+///
+/// This is the whole difference between the evidence and raw tiers here: a
+/// fork storm is visible in twenty short lines and buried in the same twenty
+/// nodes rendered as objects.
+fn render_tree(graph: &serde_json::Value) -> String {
+    let Some(nodes) = graph.as_array() else {
+        return pretty_json(graph);
+    };
+    if nodes.is_empty() {
+        return "  (no related processes)\n".to_string();
+    }
+
+    let mut out = String::new();
+    for node in nodes {
+        let level = node.get("level").and_then(|v| v.as_i64()).unwrap_or(0);
+        let relationship = node
+            .get("relationship")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let comm = node.get("comm").and_then(|v| v.as_str()).unwrap_or("?");
+        let pid = node.get("pid").and_then(|v| v.as_i64()).unwrap_or(-1);
+        let ppid = node.get("ppid").and_then(|v| v.as_i64()).unwrap_or(-1);
+        // Indent by depth so the shape of the tree survives, but clamp it: a
+        // deep chain must not push the text off the right of a transcript.
+        let indent = "  ".repeat((level.unsigned_abs() as usize).min(8) + 1);
+        out.push_str(&format!(
+            "{indent}[{relationship}] pid {pid} `{}` (parent {ppid})\n",
+            single_line(comm)
+        ));
+    }
+    out
 }
 
 fn incident_line(incident: &serde_json::Value, detail: Detail) -> String {

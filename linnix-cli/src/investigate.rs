@@ -13,13 +13,13 @@
 
 use colored::*;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 
 /// One stored attribution row: a single offender's share of one victim stall
 /// window, as served by cognitod's `/attribution`.
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct Attribution {
     pub offender_pod: String,
     pub offender_namespace: String,

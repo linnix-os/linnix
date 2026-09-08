@@ -135,6 +135,9 @@ impl Drop for McpClient {
     }
 }
 
+/// `blame_score` is here on purpose: the CLI's `Attribution` struct does not
+/// declare it, so it is exactly the kind of field a raw tier that re-serialises
+/// a decoded struct would silently drop.
 fn attribution_body() -> &'static str {
     r#"{
         "victim": {"pod": "payment-api", "namespace": "payments"},
@@ -142,15 +145,97 @@ fn attribution_body() -> &'static str {
         "permalink": "/attribution?pod=payment-api&namespace=payments&window=15",
         "attributions": [
             {"offender_pod":"image-resizer","offender_namespace":"media",
-             "stall_us":1000000,"attributed_stall_us":700000,
+             "stall_us":1000000,"attributed_stall_us":700000,"blame_score":2.0,
              "timestamp":100,"cpu_share":0.62,"fork_count":186,
              "short_job_count":42,"reason":"noisy_neighbor","event_id":"e1"},
             {"offender_pod":"etl-runner","offender_namespace":"batch",
-             "stall_us":1000000,"attributed_stall_us":300000,
+             "stall_us":1000000,"attributed_stall_us":300000,"blame_score":1.0,
              "timestamp":100,"cpu_share":0.20,"fork_count":4,
              "short_job_count":2,"reason":"fork_storm","event_id":"e1"}
         ]
     }"#
+}
+
+/// A cognitod with an answer for every route the tools reach, so one test can
+/// exercise all five without five fixtures.
+fn full_daemon() -> MockServer {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/status");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"cpu_pct":1.2,"rss_mb":41,"events_per_sec":900,
+                    "rb_overflows":0,"rate_limited":0,"offline":false}"#,
+            );
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/system");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"timestamp":100,"cpu_percent":81.5,"mem_percent":62.0,
+                    "load_avg":[4.1,3.2,2.0],"disk_read_bytes":0,"disk_write_bytes":0,
+                    "net_rx_bytes":0,"net_tx_bytes":0,
+                    "psi_cpu_some_avg10":51.0,"psi_memory_some_avg10":0.2,
+                    "psi_memory_full_avg10":0.0,"psi_io_some_avg10":1.1,
+                    "psi_io_full_avg10":0.0}"#,
+            );
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/attribution");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(attribution_body());
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/processes/4242");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"pid":4242,"ppid":1,"uid":0,"gid":0,"comm":"feature-builder",
+                    "event_type":"exec","cpu_pct":97.5,"mem_pct":12.0,"age_sec":31,
+                    "state":"running","k8s":null}"#,
+            );
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/graph/4242");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"[{"pid":1,"ppid":0,"comm":"systemd","uid":0,"gid":0,
+                     "event_type":"exec","relationship":"ancestor","level":-1},
+                    {"pid":4242,"ppid":1,"comm":"feature-builder","uid":0,"gid":0,
+                     "event_type":"exec","relationship":"root","level":0},
+                    {"pid":4301,"ppid":4242,"comm":"python","uid":0,"gid":0,
+                     "event_type":"exec","relationship":"descendant","level":1}]"#,
+            );
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/incidents");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"[{"id":7,"timestamp":1732242135,"event_type":"circuit_breaker_cpu",
+                     "psi_cpu":75.2,"psi_memory":0.0,"cpu_percent":96.3,
+                     "load_avg":"4.1,3.2,2.0","action":"auto_kill",
+                     "target_pid":472693,"target_name":"aggressive-stress.sh"}]"#,
+            );
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/incidents/7");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"id":7,"timestamp":1732242135,"event_type":"circuit_breaker_cpu",
+                    "action":"auto_kill","target_name":"aggressive-stress.sh",
+                    "target_pid":472693,"psi_cpu":75.2,"cpu_percent":96.3,
+                    "investigation_rendered":"1. [cpu_spin] A runaway loop\n   supports:    CPU usage was 96.3%\n",
+                    "investigation":{"hypotheses":[]},"llm_analysis":"...",
+                    "psi_after":null,"recovery_time_ms":null}"#,
+            );
+    });
+    server
 }
 
 #[test]
@@ -214,56 +299,77 @@ fn an_unreachable_daemon_is_a_tool_error_that_says_what_to_do() {
 }
 
 #[test]
-fn detail_summary_costs_a_fraction_of_detail_raw() {
-    let server = MockServer::start();
-    let _m = server.mock(|when, then| {
-        when.method(GET).path("/attribution");
-        then.status(200)
-            .header("content-type", "application/json")
-            .body(attribution_body());
-    });
-
+fn every_tool_has_three_tiers_that_actually_differ() {
+    // The server's own instructions tell a model to "start at `summary` and go
+    // deeper only once you have decided the host matters". A tool whose
+    // summary is its evidence charges a caller that obeys that instruction the
+    // full price for a triage call — and the failure is silent, which is why
+    // this loops over every tool rather than checking one.
+    let server = full_daemon();
     let mut client = McpClient::spawn(&server.base_url());
-    let args = json!({"namespace": "payments", "pod": "payment-api"});
 
-    let (summary, _) = client.call_tool(
-        "linnix_investigate_contention",
-        json!({"namespace": "payments", "pod": "payment-api", "detail": "summary"}),
-    );
-    let (evidence, _) = client.call_tool("linnix_investigate_contention", args);
+    let cases: [(&str, Value); 5] = [
+        ("linnix_system_health", json!({})),
+        (
+            "linnix_investigate_contention",
+            json!({"namespace": "payments", "pod": "payment-api"}),
+        ),
+        ("linnix_explain_process", json!({"pid": 4242})),
+        ("linnix_recent_incidents", json!({})),
+        ("linnix_explain_incident", json!({"id": 7})),
+    ];
+
+    for (tool, base_args) in cases {
+        let with_detail = |detail: &str| {
+            let mut args = base_args.clone();
+            args["detail"] = json!(detail);
+            args
+        };
+
+        let (summary, summary_error) = client.call_tool(tool, with_detail("summary"));
+        let (evidence, evidence_error) = client.call_tool(tool, with_detail("evidence"));
+        let (raw, raw_error) = client.call_tool(tool, with_detail("raw"));
+
+        assert!(
+            !summary_error && !evidence_error && !raw_error,
+            "{tool} should have answered from the mocked daemon: {summary}"
+        );
+        assert!(
+            summary.len() < evidence.len(),
+            "{tool}: summary ({}) must cost less than evidence ({})",
+            summary.len(),
+            evidence.len()
+        );
+        assert_ne!(
+            evidence.trim(),
+            raw.trim(),
+            "{tool}: raw must carry something evidence does not"
+        );
+    }
+}
+
+#[test]
+fn detail_raw_hands_back_what_the_daemon_actually_sent() {
+    // The raw tier is what a caller quotes. Decoding into this crate's structs
+    // and re-serialising would silently drop every field cognitod sends that
+    // the CLI does not declare — `blame_score` here, plus the top-level
+    // `victim` and `window_minutes` — while still calling itself raw.
+    let server = full_daemon();
+    let mut client = McpClient::spawn(&server.base_url());
+
     let (raw, _) = client.call_tool(
         "linnix_investigate_contention",
         json!({"namespace": "payments", "pod": "payment-api", "detail": "raw"}),
     );
 
-    // The tiers exist to let a caller pay for depth only once it wants depth.
-    // If they do not actually differ in size, the whole argument is decoration.
     assert!(
-        summary.len() < evidence.len(),
-        "summary ({}) should be shorter than evidence ({})",
-        summary.len(),
-        evidence.len()
+        raw.contains("\"blame_score\""),
+        "dropped blame_score: {raw}"
     );
-    // Deliberately not asserting `evidence.len() < raw.len()`. Prose costs
-    // more per fact than JSON does, so on a two-row window the raw tier is the
-    // smaller string; it is unbounded and the prose is not, so the ordering
-    // only holds once there is real volume. What separates the tiers is what
-    // they carry, which is what the assertions below check.
     assert!(
-        !evidence.contains("attributed_stall_us"),
-        "evidence should read as prose, not as the daemon's field names: {evidence}"
+        raw.contains("\"window_minutes\""),
+        "dropped the envelope: {raw}"
     );
-
-    // Summary names the loudest offender and refuses to call it the cause.
-    assert!(summary.contains("media/image-resizer"), "{summary}");
-    assert!(summary.contains("70%"), "{summary}");
-    assert!(summary.contains("not proven cause"), "{summary}");
-
-    // Evidence is the CLI's own rendering, so both offenders appear.
-    assert!(evidence.contains("media/image-resizer"), "{evidence}");
-    assert!(evidence.contains("batch/etl-runner"), "{evidence}");
-
-    // Raw is quotable: the daemon's rows, and a link that returns exactly them.
     assert!(raw.contains("\"attributed_stall_us\": 700000"), "{raw}");
     assert!(
         raw.contains(&format!(
@@ -271,6 +377,31 @@ fn detail_summary_costs_a_fraction_of_detail_raw() {
             server.base_url()
         )),
         "raw must carry an absolute permalink: {raw}"
+    );
+}
+
+#[test]
+fn the_contention_tiers_say_progressively_more() {
+    let server = full_daemon();
+    let mut client = McpClient::spawn(&server.base_url());
+    let args =
+        |detail: &str| json!({"namespace": "payments", "pod": "payment-api", "detail": detail});
+
+    let (summary, _) = client.call_tool("linnix_investigate_contention", args("summary"));
+    let (evidence, _) = client.call_tool("linnix_investigate_contention", args("evidence"));
+
+    // Summary names the loudest offender and refuses to call it the cause.
+    assert!(summary.contains("media/image-resizer"), "{summary}");
+    assert!(summary.contains("70%"), "{summary}");
+    assert!(summary.contains("not proven cause"), "{summary}");
+
+    // Evidence is the CLI's own rendering, so both offenders appear — and it
+    // reads as prose rather than as the daemon's field names.
+    assert!(evidence.contains("media/image-resizer"), "{evidence}");
+    assert!(evidence.contains("batch/etl-runner"), "{evidence}");
+    assert!(
+        !evidence.contains("attributed_stall_us"),
+        "evidence should not read as JSON: {evidence}"
     );
 }
 
