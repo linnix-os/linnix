@@ -251,6 +251,13 @@ fn humanise_reason(reason: Option<&str>) -> &str {
     }
 }
 
+/// The sentence this whole command exists to keep attached to its numbers.
+/// Held in one place so no exit path can print the findings without it.
+const CAUSALITY_CAVEAT: &str =
+    "\nThis is contention attribution, not proven causality. To confirm, change \
+     one thing — move the offender, or give it a CPU limit — and check whether \
+     the victim's stall falls.\n";
+
 /// Renders the investigation. Returns the report so tests can assert on it
 /// without going through stdout.
 pub fn render(
@@ -316,23 +323,43 @@ pub fn render(
         format_stall(total_attributed)
     ));
 
-    // A window whose every row predates per-offender splitting leaves every
-    // offender at zero attributed stall, so `summarise` has nothing to order
-    // by and falls back to sorting by name for reproducibility. Naming the
-    // first of those the likely offender would rank on alphabetical order —
-    // the same mistake as rendering an unknown share as 0%, which this
-    // renderer already refuses to make, pointed the other way.
-    if investigation
+    // An offender whose rows all predate per-offender splitting contributed an
+    // unknown amount, not zero. One such offender is enough to make the whole
+    // ordering unsound: it could outweigh every measured contender, so nothing
+    // above it can be called the likely offender. Ranking a window that
+    // contains one — whether it is the only kind present or sits alongside
+    // measured rows — would be the same mistake as rendering an unknown share
+    // as 0%, which this renderer already refuses to make, pointed the other
+    // way.
+    let (measured, unmeasured): (Vec<&OffenderSummary>, Vec<&OffenderSummary>) = investigation
         .offenders
         .iter()
-        .all(|offender| offender.share.is_none())
-    {
+        .partition(|offender| offender.share.is_some());
+
+    if !unmeasured.is_empty() {
+        if !measured.is_empty() {
+            out.push_str(&format!("{}\n", heading("Measured contributors, ranked:")));
+            for offender in &measured {
+                out.push_str(&format!(
+                    "  {}/{} — {:.0}% of attributed stall ({} across {} window{}, {})\n",
+                    offender.namespace,
+                    offender.pod,
+                    offender.share.expect("partitioned on Some") * 100.0,
+                    format_stall(offender.attributed_stall_us),
+                    offender.windows,
+                    if offender.windows == 1 { "" } else { "s" },
+                    humanise_reason(offender.reason.as_deref()),
+                ));
+            }
+            out.push('\n');
+        }
+
         out.push_str(&format!(
-            "{} these rows predate per-offender stall splitting, so they cannot be \
-             ranked against each other.\n",
-            heading("Contended with, unranked:")
+            "{} their rows predate per-offender stall splitting, so their contribution is \
+             unknown and may exceed any figure above.\n",
+            heading("Unmeasured contenders:")
         ));
-        for offender in &investigation.offenders {
+        for offender in &unmeasured {
             out.push_str(&format!(
                 "  {}/{} — {}, blamed in {} window{}, peak CPU share {:.2}\n",
                 offender.namespace,
@@ -343,6 +370,16 @@ pub fn render(
                 offender.peak_cpu_share,
             ));
         }
+        out.push_str(
+            "\nNo single offender can be named while an unmeasured contender remains: it \
+             cannot be ranked against the rest.\n",
+        );
+        // The count note the ranked path prints is deliberately omitted: every
+        // unmeasured contender is named individually just above, which says
+        // the same thing more precisely. The causality caveat is not omitted —
+        // it is the most important sentence this command prints, and an early
+        // return that dropped it would be a worse bug than the ranking.
+        out.push_str(CAUSALITY_CAVEAT);
         push_permalink(&mut out, &heading, permalink);
         return out;
     }
@@ -423,11 +460,7 @@ pub fn render(
         ));
     }
 
-    out.push_str(
-        "\nThis is contention attribution, not proven causality. To confirm, change \
-         one thing — move the offender, or give it a CPU limit — and check whether \
-         the victim's stall falls.\n",
-    );
+    out.push_str(CAUSALITY_CAVEAT);
 
     push_permalink(&mut out, &heading, permalink);
 
@@ -731,14 +764,23 @@ mod tests {
         assert_eq!(legacy.share, None);
         assert_eq!(legacy.unsplit_rows, 1);
 
+        // Rendering changed here: an unmeasurable offender used to be listed
+        // under "Also contributing", below a "Likely offender" chosen from the
+        // measured ones. That ranking is unsound for exactly the reason this
+        // test names — an offender we cannot measure may outweigh every one we
+        // can — so the window is now split into measured and unmeasured
+        // groups with no offender named. The assertion that matters is
+        // unchanged: it is listed, and never as a percentage.
         let report = render(&out, "payments", "api", "20m", false, None);
         let legacy_line = report
             .lines()
             .find(|l| l.contains("media/legacy"))
             .expect("the unmeasurable offender is still listed");
-        assert!(legacy_line.contains("share unknown"));
-        assert!(!legacy_line.contains('%'));
-        assert!(report.contains("1 attribution predates"));
+        assert!(!legacy_line.contains('%'), "{report}");
+        assert!(!report.contains("Likely offender"), "{report}");
+        assert!(report.contains("may exceed any figure above"), "{report}");
+        assert!(report.contains("media/modern"), "{report}");
+        assert!(report.contains(CAUSALITY_CAVEAT.trim()), "{report}");
     }
 
     #[test]

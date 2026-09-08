@@ -687,6 +687,13 @@ fn offline_mode_is_not_reported_as_a_detached_event_source() {
             );
     });
 
+    server.mock(|when, then| {
+        when.method(GET).path("/readyz");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"ready":true,"reason":null}"#);
+    });
+
     let mut client = McpClient::spawn(&server.base_url());
     let (text, _) = client.call_tool("linnix_system_health", json!({"detail": "summary"}));
 
@@ -720,6 +727,13 @@ fn a_503_on_a_live_route_is_not_blamed_on_a_missing_store() {
     server.mock(|when, then| {
         when.method(GET).path("/system");
         then.status(503).body("upstream unavailable");
+    });
+
+    server.mock(|when, then| {
+        when.method(GET).path("/readyz");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"ready":true,"reason":null}"#);
     });
 
     let mut client = McpClient::spawn(&server.base_url());
@@ -895,7 +909,7 @@ fn offenders_with_no_comparable_attribution_are_not_ranked() {
         !summary.contains("largest contender"),
         "alphabetical order is not a ranking: {summary}"
     );
-    assert!(summary.contains("cannot be ranked"), "{summary}");
+    assert!(summary.contains("No offender can be named"), "{summary}");
     // Both are still named — they are evidence of contention, just not of
     // which one contended more.
     assert!(
@@ -991,9 +1005,102 @@ fn the_evidence_tier_does_not_rank_what_the_summary_refuses_to_rank() {
         !evidence.contains("Likely offender"),
         "alphabetical order is not a ranking: {evidence}"
     );
-    assert!(evidence.contains("cannot be"), "{evidence}");
+    assert!(
+        evidence.contains("may exceed any figure above"),
+        "{evidence}"
+    );
     assert!(
         evidence.contains("a/aardvark") && evidence.contains("z/zebra"),
         "{evidence}"
     );
+}
+
+#[test]
+fn one_unmeasurable_contender_stops_the_whole_window_being_ranked() {
+    // The mixed case: one offender carries a per-offender split and another
+    // carries only rows that predate it. Ranking on the measured one alone
+    // would relegate a contender whose contribution is unknown and could be
+    // the larger of the two.
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/attribution");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"permalink":null,"attributions":[
+                    {"offender_pod":"measured","offender_namespace":"m",
+                     "stall_us":1000000,"attributed_stall_us":300000,
+                     "timestamp":100,"cpu_share":0.30,"fork_count":1,
+                     "short_job_count":0,"reason":"noisy_neighbor","event_id":"e1"},
+                    {"offender_pod":"legacy","offender_namespace":"l",
+                     "stall_us":1000000,"attributed_stall_us":null,
+                     "timestamp":100,"cpu_share":0.90,"fork_count":9,
+                     "short_job_count":0,"reason":"fork_storm","event_id":"e1"}]}"#,
+            );
+    });
+
+    let mut client = McpClient::spawn(&server.base_url());
+    let (evidence, _) = client.call_tool(
+        "linnix_investigate_contention",
+        json!({"namespace": "payments", "pod": "payment-api"}),
+    );
+
+    assert!(!evidence.contains("Likely offender"), "{evidence}");
+    // The measured share is still reported — it is real, just not enough to
+    // rank the window.
+    assert!(evidence.contains("m/measured"), "{evidence}");
+    assert!(evidence.contains("100%"), "{evidence}");
+    assert!(evidence.contains("l/legacy"), "{evidence}");
+    assert!(
+        evidence.contains("may exceed any figure above"),
+        "{evidence}"
+    );
+    assert!(
+        evidence.contains("not proven causality"),
+        "the caveat must survive every exit path: {evidence}"
+    );
+}
+
+#[test]
+fn a_readiness_endpoint_that_cannot_be_read_is_not_silence() {
+    // A proxy error page parses as JSON perfectly well and says nothing about
+    // the daemon. Treating that as "no warning" would put this tool right back
+    // where the false-offline fix found it: presenting a possibly blind daemon
+    // as healthy, only now without even the wrong warning to give it away.
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/status");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"cpu_pct":0.4,"rss_mb":30,"events_per_sec":0,
+                    "rb_overflows":0,"rate_limited":0,"offline":false}"#,
+            );
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/system");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"timestamp":100,"cpu_percent":9.0,"mem_percent":11.0,
+                    "load_avg":[0.0,0.0,0.0],"disk_read_bytes":0,"disk_write_bytes":0,
+                    "net_rx_bytes":0,"net_tx_bytes":0,
+                    "psi_cpu_some_avg10":0.0,"psi_memory_some_avg10":0.0,
+                    "psi_memory_full_avg10":0.0,"psi_io_some_avg10":0.0,
+                    "psi_io_full_avg10":0.0}"#,
+            );
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/readyz");
+        then.status(502)
+            .header("content-type", "application/json")
+            .body(r#"{"error":"bad gateway"}"#);
+    });
+
+    let mut client = McpClient::spawn(&server.base_url());
+    let (summary, _) = client.call_tool("linnix_system_health", json!({"detail": "summary"}));
+
+    assert!(summary.starts_with("WARNING:"), "{summary}");
+    assert!(summary.contains("without a `ready` verdict"), "{summary}");
+    assert!(summary.contains("unconfirmed"), "{summary}");
 }

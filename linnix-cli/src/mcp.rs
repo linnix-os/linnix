@@ -51,6 +51,22 @@ pub enum Detail {
     Raw,
 }
 
+/// What `/readyz` said, and the daemon's own reply when it sent one.
+struct Readiness {
+    /// Kept for the raw tier. `None` when nothing parseable came back.
+    body: Option<serde_json::Value>,
+    verdict: Verdict,
+}
+
+/// Deliberately three-valued. "Not ready" and "could not tell" lead an agent
+/// to different next steps, and collapsing either into "ready" is the failure
+/// this endpoint is consulted to prevent.
+enum Verdict {
+    Ready,
+    NotReady(String),
+    Unknown(String),
+}
+
 /// A failed fetch, and whether the daemon simply had no such record.
 ///
 /// The distinction exists for exactly one caller: `explain_process` fetches a
@@ -260,18 +276,62 @@ impl LinnixMcp {
     /// so the body has to be read past the status code rather than through
     /// `get`, which treats a 503 as a failure.
     ///
-    /// `None` when the daemon could not be reached or answered something
-    /// unparseable — the health tool has already reported that through
-    /// `/status`, and inventing a readiness verdict here would be the exact
-    /// error this whole endpoint exists to prevent.
-    async fn readiness(&self) -> Option<serde_json::Value> {
-        let resp = self
+    /// A reply this client cannot read is reported as *unknown*, never as
+    /// ready. Silence is the one answer that must not be possible here: this
+    /// endpoint is the only thing standing between an agent and a blind daemon
+    /// that looks healthy, so a proxy 404, a truncated body or a JSON object
+    /// with no `ready` key all have to reach the caller as "we could not
+    /// establish this" rather than as nothing at all.
+    async fn readiness(&self) -> Readiness {
+        let resp = match self
             .client
             .get(format!("{}/readyz", self.base))
             .send()
             .await
-            .ok()?;
-        resp.json::<serde_json::Value>().await.ok()
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                return Readiness {
+                    body: None,
+                    verdict: Verdict::Unknown(format!("/readyz could not be reached: {e}")),
+                };
+            }
+        };
+
+        let status = resp.status();
+        let body = match resp.json::<serde_json::Value>().await {
+            Ok(body) => body,
+            Err(e) => {
+                return Readiness {
+                    body: None,
+                    verdict: Verdict::Unknown(format!(
+                        "/readyz answered {status} with something this client could not \
+                         parse: {e}"
+                    )),
+                };
+            }
+        };
+
+        let verdict = match body.get("ready").and_then(|v| v.as_bool()) {
+            Some(true) => Verdict::Ready,
+            Some(false) => Verdict::NotReady(
+                body.get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("cognitod reports that it is not ready.")
+                    .to_string(),
+            ),
+            // Something answered on this URL, and it was not cognitod's
+            // readiness endpoint. A proxy error page parses as JSON perfectly
+            // well and says nothing about the daemon.
+            None => Verdict::Unknown(format!(
+                "/readyz answered {status} without a `ready` verdict, so whether cognitod is \
+                 instrumenting this host could not be established"
+            )),
+        };
+        Readiness {
+            body: Some(body),
+            verdict,
+        }
     }
 
     #[tool(
@@ -314,11 +374,11 @@ impl LinnixMcp {
         };
 
         let readiness = self.readiness().await;
-        let mut out = render_health(&status, &system, readiness.as_ref(), params.detail);
+        let mut out = render_health(&status, &system, &readiness, params.detail);
         if params.detail == Detail::Raw {
-            if let Some(readiness) = &readiness {
+            if let Some(body) = &readiness.body {
                 out.push_str("\n/readyz, as the daemon sent it:\n");
-                out.push_str(&pretty_json(readiness));
+                out.push_str(&pretty_json(body));
                 out.push('\n');
             }
             out.push_str("\n/status, as the daemon sent it:\n");
@@ -621,7 +681,7 @@ fn pretty_json<T: serde::Serialize>(value: &T) -> String {
 fn render_health(
     status: &Status,
     system: &SystemSnapshot,
-    readiness: Option<&serde_json::Value>,
+    readiness: &Readiness,
     detail: Detail,
 ) -> String {
     // Reported before anything else and at every tier. A daemon whose probes
@@ -629,15 +689,15 @@ fn render_health(
     // only those concludes the box is fine when the truth is that nothing is
     // attributing anything to a process. The daemon writes the explanation
     // itself, including what to check, so it is quoted rather than restated.
-    let readiness_note = match readiness {
-        Some(readiness) if readiness.get("ready").and_then(|v| v.as_bool()) == Some(false) => {
-            let reason = readiness
-                .get("reason")
-                .and_then(|v| v.as_str())
-                .unwrap_or("cognitod reports that it is not ready.");
-            format!("WARNING: {}\n", single_line(reason))
-        }
-        _ => String::new(),
+    let readiness_note = match &readiness.verdict {
+        Verdict::Ready => String::new(),
+        Verdict::NotReady(reason) => format!("WARNING: {}\n", single_line(reason)),
+        Verdict::Unknown(why) => format!(
+            "WARNING: {}. Treat the readings below as unconfirmed: a daemon whose probes \
+             never attached serves plausible host numbers while attributing nothing to any \
+             process.\n",
+            single_line(why)
+        ),
     };
 
     // `/status.offline` is `runtime.offline`, which gates *outbound* sinks —
@@ -732,7 +792,7 @@ fn contention_headline(
     if investigation
         .offenders
         .iter()
-        .all(|offender| offender.share.is_none())
+        .any(|offender| offender.share.is_none())
     {
         let names = investigation
             .offenders
@@ -742,9 +802,11 @@ fn contention_headline(
             .join(", ");
         return format!(
             "{namespace}/{pod} stalled across {} detection window(s) in the last {since}. \
-             {} contended with it — {names} — but these rows predate per-offender \
-             attribution, so they cannot be ranked against each other. This is contention \
-             attribution, not proven cause.\n",
+             {} contended with it — {names} — but at least one carries only rows that \
+             predate per-offender attribution, so its contribution is unknown and could \
+             exceed the others'. No offender can be named while that is true. Ask for \
+             detail=evidence to see which are measured. This is contention attribution, \
+             not proven cause.\n",
             investigation.windows,
             if investigation.offenders.len() == 1 {
                 "One workload".to_string()
