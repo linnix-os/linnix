@@ -523,6 +523,33 @@ fn a_process_name_cannot_forge_a_line_of_the_report() {
 }
 
 #[test]
+fn the_pod_line_names_its_namespace_too() {
+    // Two namespaces can each run a pod named the same thing. "in pod
+    // payment-api" alone is ambiguous about which one; "in pod payments/
+    // payment-api" is not, and /processes/{pid} already supplies the
+    // namespace to say so.
+    let server = MockServer::start();
+    let _m = server.mock(|when, then| {
+        when.method(GET).path("/processes/4242");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"pid":4242,"ppid":1,"uid":0,"gid":0,"comm":"worker",
+                    "event_type":"exec","cpu_pct":10.0,
+                    "k8s":{"pod_name":"payment-api","namespace":"payments"}}"#,
+            );
+    });
+
+    let mut client = McpClient::spawn(&server.base_url());
+    let (text, _) = client.call_tool(
+        "linnix_explain_process",
+        json!({"pid": 4242, "detail": "summary"}),
+    );
+
+    assert!(text.contains("in pod payments/payment-api"), "{text}");
+}
+
+#[test]
 fn the_process_tree_reads_as_lines_not_as_json() {
     // `/graph/{pid}` answers with a `{"root", "nodes"}` envelope. Reading the
     // envelope as the node array falls back to dumping JSON at the very tier
@@ -1114,6 +1141,83 @@ fn one_unmeasurable_contender_stops_the_whole_window_being_ranked() {
     assert!(
         evidence.contains("not proven causality"),
         "the caveat must survive every exit path: {evidence}"
+    );
+}
+
+#[test]
+fn a_partially_split_offender_is_not_named_the_largest_contender_in_the_summary() {
+    // One offender, two rows: one carries a split, one predates it. Its share
+    // is knowable from the split row alone, but the unsplit row could still
+    // be hiding more, so the summary must not call it "the largest
+    // contender" -- that requires the whole window to be measured, and it
+    // isn't. The evidence tier already refuses to rank this window (see
+    // one_unmeasurable_contender_stops_the_whole_window_being_ranked); the
+    // summary tier must agree.
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/attribution");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"permalink":null,"attributions":[
+                    {"offender_pod":"mixed","offender_namespace":"m",
+                     "stall_us":1000000,"attributed_stall_us":300000,
+                     "timestamp":100,"cpu_share":0.30,"fork_count":1,
+                     "short_job_count":0,"reason":"noisy_neighbor","event_id":"e1"},
+                    {"offender_pod":"mixed","offender_namespace":"m",
+                     "stall_us":1000000,"attributed_stall_us":null,
+                     "timestamp":200,"cpu_share":0.30,"fork_count":1,
+                     "short_job_count":0,"reason":"noisy_neighbor","event_id":"e2"}]}"#,
+            );
+    });
+
+    let mut client = McpClient::spawn(&server.base_url());
+    let (summary, _) = client.call_tool(
+        "linnix_investigate_contention",
+        json!({"namespace": "payments", "pod": "payment-api", "detail": "summary"}),
+    );
+
+    assert!(
+        !summary.contains("largest contender"),
+        "a partially split offender must not be ranked as fully measured: {summary}"
+    );
+    assert!(summary.contains("m/mixed"), "{summary}");
+}
+
+#[test]
+fn an_empty_investigation_with_probes_detached_is_not_presented_as_all_clear() {
+    // cognitod running userspace-only legitimately returns zero /attribution
+    // rows -- it produces no per-process attribution in that state. Without
+    // checking /readyz, an empty result reads as "neighbours ruled out",
+    // which claims the collector looked and found nothing rather than that
+    // it never looked at all.
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/attribution");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"attributions": [], "permalink": null}"#);
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/readyz");
+        then.status(503)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"ready":false,"kernel_instrumentation":"unavailable",
+                    "transport":"userspace","btf_available":false,"rss_probe":"disabled",
+                    "reason":"eBPF probes are not attached; running userspace-only, so no per-process stall attribution is being produced."}"#,
+            );
+    });
+
+    let mut client = McpClient::spawn(&server.base_url());
+    let (summary, _) = client.call_tool(
+        "linnix_investigate_contention",
+        json!({"namespace": "payments", "pod": "payment-api", "detail": "summary"}),
+    );
+
+    assert!(
+        summary.starts_with("WARNING: eBPF probes are not attached"),
+        "readiness must lead, same as linnix_system_health: {summary}"
     );
 }
 

@@ -477,7 +477,7 @@ impl LinnixMcp {
             .as_ref()
             .map(|path| format!("{}{}", self.base, path));
 
-        let out = match params.detail {
+        let mut out = match params.detail {
             Detail::Summary => contention_headline(
                 &investigation,
                 &params.namespace,
@@ -495,6 +495,16 @@ impl LinnixMcp {
                 permalink.as_deref(),
             ),
         };
+
+        // A daemon running userspace-only produces no per-process attribution
+        // at all, so an empty result here can mean "genuinely no contention"
+        // or "nothing was ever observed" -- claims this tool must not
+        // conflate, same as linnix_system_health.
+        let note = readiness_note(&self.readiness().await);
+        if !note.is_empty() {
+            out = format!("{note}{out}");
+        }
+
         Ok(text(out))
     }
 
@@ -694,18 +704,15 @@ fn pretty_json<T: serde::Serialize>(value: &T) -> String {
         .unwrap_or_else(|e| format!("(could not serialise cognitod's reply: {e})"))
 }
 
-fn render_health(
-    status: &Status,
-    system: &SystemSnapshot,
-    readiness: &Readiness,
-    detail: Detail,
-) -> String {
-    // Reported before anything else and at every tier. A daemon whose probes
-    // never attached still serves plausible host readings, so an agent shown
-    // only those concludes the box is fine when the truth is that nothing is
-    // attributing anything to a process. The daemon writes the explanation
-    // itself, including what to check, so it is quoted rather than restated.
-    let readiness_note = match &readiness.verdict {
+/// Reported before anything else built from live data. A daemon whose probes
+/// never attached still serves plausible readings — host stats in
+/// `render_health`'s case, a genuinely empty result in
+/// `investigate_contention`'s — so a caller shown only those concludes the
+/// box is fine, or the neighbours are cleared, when the truth is that
+/// nothing was observed. The daemon writes its own explanation, including
+/// what to check, so it is quoted rather than restated.
+fn readiness_note(readiness: &Readiness) -> String {
+    match &readiness.verdict {
         Verdict::Ready => {
             // `ready:true` can mean the operator turned off
             // require_kernel_instrumentation, not that probes are attached.
@@ -727,7 +734,16 @@ fn render_health(
              process.\n",
             single_line(why)
         ),
-    };
+    }
+}
+
+fn render_health(
+    status: &Status,
+    system: &SystemSnapshot,
+    readiness: &Readiness,
+    detail: Detail,
+) -> String {
+    let readiness_note = readiness_note(readiness);
 
     // `/status.offline` is `runtime.offline`, which gates *outbound* sinks —
     // it is what stops telemetry leaving the host. It says nothing about
@@ -820,11 +836,14 @@ fn contention_headline(
     // reproducibility. Calling the first of those the "largest contender"
     // would invent a ranking out of alphabetical order — the same mistake as
     // rendering an unknown share as 0%, which the CLI already refuses to do,
-    // pointed the other way.
+    // pointed the other way. share.is_none() alone misses an offender with
+    // both a split row and an unsplit one: its share is knowable from the
+    // split row, but the unsplit row could still hide more, so it must count
+    // as unmeasured here too (see investigate::render's identical partition).
     if investigation
         .offenders
         .iter()
-        .any(|offender| offender.share.is_none())
+        .any(|offender| offender.share.is_none() || offender.unsplit_rows > 0)
     {
         let names = investigation
             .offenders
@@ -876,14 +895,20 @@ fn process_headline(pid: u32, proc: &serde_json::Value) -> String {
     let field = |key: &str| proc.get(key).cloned().unwrap_or(serde_json::Value::Null);
     let comm = field("comm");
     let comm = comm.as_str().unwrap_or("?");
-    let pod = proc
-        .get("k8s")
-        .and_then(|k| k.get("pod_name"))
-        .and_then(|p| p.as_str());
+    let k8s = proc.get("k8s");
+    let pod = k8s.and_then(|k| k.get("pod_name")).and_then(|p| p.as_str());
+    let namespace = k8s
+        .and_then(|k| k.get("namespace"))
+        .and_then(|n| n.as_str());
 
     let mut line = format!("PID {pid} is `{}`", single_line(comm));
     if let Some(pod) = pod {
-        line.push_str(&format!(" in pod {}", single_line(pod)));
+        // Two namespaces can run same-named pods, so the pod name alone does
+        // not identify the workload.
+        match namespace {
+            Some(ns) => line.push_str(&format!(" in pod {}/{}", single_line(ns), single_line(pod))),
+            None => line.push_str(&format!(" in pod {}", single_line(pod))),
+        }
     }
     if let Some(cpu) = field("cpu_pct").as_f64() {
         line.push_str(&format!(", {cpu:.1}% CPU"));
