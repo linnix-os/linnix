@@ -316,6 +316,37 @@ pub fn render(
         format_stall(total_attributed)
     ));
 
+    // A window whose every row predates per-offender splitting leaves every
+    // offender at zero attributed stall, so `summarise` has nothing to order
+    // by and falls back to sorting by name for reproducibility. Naming the
+    // first of those the likely offender would rank on alphabetical order —
+    // the same mistake as rendering an unknown share as 0%, which this
+    // renderer already refuses to make, pointed the other way.
+    if investigation
+        .offenders
+        .iter()
+        .all(|offender| offender.share.is_none())
+    {
+        out.push_str(&format!(
+            "{} these rows predate per-offender stall splitting, so they cannot be \
+             ranked against each other.\n",
+            heading("Contended with, unranked:")
+        ));
+        for offender in &investigation.offenders {
+            out.push_str(&format!(
+                "  {}/{} — {}, blamed in {} window{}, peak CPU share {:.2}\n",
+                offender.namespace,
+                offender.pod,
+                humanise_reason(offender.reason.as_deref()),
+                offender.windows,
+                if offender.windows == 1 { "" } else { "s" },
+                offender.peak_cpu_share,
+            ));
+        }
+        push_permalink(&mut out, &heading, permalink);
+        return out;
+    }
+
     let (primary, rest) = investigation.offenders.split_first().expect("non-empty");
     let share = primary
         .share
@@ -475,6 +506,61 @@ pub async fn run_investigate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Legacy rows carry no per-offender split, so every offender sums to
+    /// zero and the tie breaks on name. Presenting the alphabetical winner as
+    /// the likely offender would be a ranking invented from sort order.
+    #[test]
+    fn offenders_with_no_comparable_split_are_not_ranked() {
+        let rows = vec![
+            Attribution {
+                offender_pod: "zebra".into(),
+                offender_namespace: "z".into(),
+                stall_us: 1_000_000,
+                attributed_stall_us: None,
+                timestamp: 100,
+                cpu_share: 0.9,
+                fork_count: 9,
+                short_job_count: 0,
+                reason: Some("fork_storm".into()),
+                event_id: Some("e1".into()),
+            },
+            Attribution {
+                offender_pod: "aardvark".into(),
+                offender_namespace: "a".into(),
+                stall_us: 1_000_000,
+                attributed_stall_us: None,
+                timestamp: 100,
+                cpu_share: 0.1,
+                fork_count: 1,
+                short_job_count: 0,
+                reason: Some("noisy_neighbor".into()),
+                event_id: Some("e1".into()),
+            },
+        ];
+
+        let out = render(
+            &summarise(&rows),
+            "payments",
+            "payment-api",
+            "15m",
+            false,
+            None,
+        );
+
+        assert!(!out.contains("Likely offender"), "{out}");
+        assert!(
+            out.contains(
+                "cannot be \\
+             ranked"
+            ) || out.contains("cannot be ranked"),
+            "{out}"
+        );
+        assert!(
+            out.contains("a/aardvark") && out.contains("z/zebra"),
+            "{out}"
+        );
+    }
 
     fn attr(pod: &str, ts: u64, attributed: Option<u64>, stall: u64) -> Attribution {
         Attribution {

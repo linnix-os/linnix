@@ -170,6 +170,15 @@ fn full_daemon() -> MockServer {
             );
     });
     server.mock(|when, then| {
+        when.method(GET).path("/readyz");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"ready":true,"kernel_instrumentation":"active","transport":"ringbuf",
+                    "btf_available":true,"rss_probe":"attached","reason":null}"#,
+            );
+    });
+    server.mock(|when, then| {
         when.method(GET).path("/system");
         then.status(200)
             .header("content-type", "application/json")
@@ -892,5 +901,99 @@ fn offenders_with_no_comparable_attribution_are_not_ranked() {
     assert!(
         summary.contains("a/aardvark") && summary.contains("z/zebra"),
         "{summary}"
+    );
+}
+
+#[test]
+fn a_daemon_with_no_probes_attached_is_not_presented_as_healthy() {
+    // The degraded userspace-only state serves entirely plausible host
+    // readings while attributing nothing to any process, and `events_per_sec`
+    // is zero on a quiet healthy host too — so it cannot carry this. `/readyz`
+    // is the authoritative signal and answers 503 when it fires, which is why
+    // its body has to be read past the status code.
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/status");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"cpu_pct":0.4,"rss_mb":30,"events_per_sec":0,
+                    "rb_overflows":0,"rate_limited":0,"offline":true}"#,
+            );
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/system");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"timestamp":100,"cpu_percent":9.0,"mem_percent":11.0,
+                    "load_avg":[0.0,0.0,0.0],"disk_read_bytes":0,"disk_write_bytes":0,
+                    "net_rx_bytes":0,"net_tx_bytes":0,
+                    "psi_cpu_some_avg10":0.0,"psi_memory_some_avg10":0.0,
+                    "psi_memory_full_avg10":0.0,"psi_io_some_avg10":0.0,
+                    "psi_io_full_avg10":0.0}"#,
+            );
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/readyz");
+        then.status(503)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"ready":false,"kernel_instrumentation":"unavailable",
+                    "transport":"userspace","btf_available":false,"rss_probe":"disabled",
+                    "reason":"eBPF probes are not attached; running userspace-only, so no per-process stall attribution is being produced."}"#,
+            );
+    });
+
+    let mut client = McpClient::spawn(&server.base_url());
+    let (summary, _) = client.call_tool("linnix_system_health", json!({"detail": "summary"}));
+
+    // Quoted from the daemon, not restated: it knows what to check.
+    assert!(
+        summary.starts_with("WARNING: eBPF probes are not attached"),
+        "readiness must lead: {summary}"
+    );
+    assert!(
+        summary.contains("no per-process stall attribution is being produced"),
+        "{summary}"
+    );
+}
+
+#[test]
+fn the_evidence_tier_does_not_rank_what_the_summary_refuses_to_rank() {
+    // The default tier is `evidence`, so fixing only the summary would leave
+    // the invented ranking in the answer most callers actually get.
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/attribution");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"permalink":null,"attributions":[
+                    {"offender_pod":"aardvark","offender_namespace":"a",
+                     "stall_us":1000000,"attributed_stall_us":null,
+                     "timestamp":100,"cpu_share":0.10,"fork_count":1,
+                     "short_job_count":0,"reason":"noisy_neighbor","event_id":"e1"},
+                    {"offender_pod":"zebra","offender_namespace":"z",
+                     "stall_us":1000000,"attributed_stall_us":null,
+                     "timestamp":100,"cpu_share":0.90,"fork_count":9,
+                     "short_job_count":0,"reason":"fork_storm","event_id":"e1"}]}"#,
+            );
+    });
+
+    let mut client = McpClient::spawn(&server.base_url());
+    let (evidence, _) = client.call_tool(
+        "linnix_investigate_contention",
+        json!({"namespace": "payments", "pod": "payment-api"}),
+    );
+
+    assert!(
+        !evidence.contains("Likely offender"),
+        "alphabetical order is not a ranking: {evidence}"
+    );
+    assert!(evidence.contains("cannot be"), "{evidence}");
+    assert!(
+        evidence.contains("a/aardvark") && evidence.contains("z/zebra"),
+        "{evidence}"
     );
 }

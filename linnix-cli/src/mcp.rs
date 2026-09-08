@@ -251,6 +251,29 @@ impl LinnixMcp {
         })
     }
 
+    /// The daemon's own answer to "am I actually instrumenting this host?".
+    ///
+    /// Read separately from `/status` because it is the only authoritative
+    /// signal: `events_per_sec` is zero on a quiet healthy host and on a
+    /// daemon whose probes never attached, and those two need to reach an
+    /// agent as different facts. `/readyz` answers 503 when it is the second,
+    /// so the body has to be read past the status code rather than through
+    /// `get`, which treats a 503 as a failure.
+    ///
+    /// `None` when the daemon could not be reached or answered something
+    /// unparseable — the health tool has already reported that through
+    /// `/status`, and inventing a readiness verdict here would be the exact
+    /// error this whole endpoint exists to prevent.
+    async fn readiness(&self) -> Option<serde_json::Value> {
+        let resp = self
+            .client
+            .get(format!("{}/readyz", self.base))
+            .send()
+            .await
+            .ok()?;
+        resp.json::<serde_json::Value>().await.ok()
+    }
+
     #[tool(
         name = "linnix_system_health",
         description = "Is this Linux host under resource pressure right now? Returns live CPU, \
@@ -258,8 +281,10 @@ impl LinnixMcp {
                        on, plus whether the daemon itself is healthy. PSI avg10 is the share of \
                        the last ten seconds in which at least one task was stalled waiting on \
                        that resource; it stays near zero on a busy but healthy host, which is \
-                       what plain utilisation cannot tell you. Call this first when triaging a \
-                       host you know nothing about."
+                       what plain utilisation cannot tell you. Warns first if cognitod's kernel \
+                       probes are not attached, since a daemon in that state still serves \
+                       plausible host readings while attributing nothing to any process. Call \
+                       this first when triaging a host you know nothing about."
     )]
     async fn system_health(
         &self,
@@ -288,8 +313,14 @@ impl LinnixMcp {
             Err(e) => return Ok(tool_error(format!("could not decode /system: {e}"))),
         };
 
-        let mut out = render_health(&status, &system, params.detail);
+        let readiness = self.readiness().await;
+        let mut out = render_health(&status, &system, readiness.as_ref(), params.detail);
         if params.detail == Detail::Raw {
+            if let Some(readiness) = &readiness {
+                out.push_str("\n/readyz, as the daemon sent it:\n");
+                out.push_str(&pretty_json(readiness));
+                out.push('\n');
+            }
             out.push_str("\n/status, as the daemon sent it:\n");
             out.push_str(&pretty_json(&status_json));
             out.push_str("\n\n/system, as the daemon sent it:\n");
@@ -587,7 +618,28 @@ fn pretty_json<T: serde::Serialize>(value: &T) -> String {
         .unwrap_or_else(|e| format!("(could not serialise cognitod's reply: {e})"))
 }
 
-fn render_health(status: &Status, system: &SystemSnapshot, detail: Detail) -> String {
+fn render_health(
+    status: &Status,
+    system: &SystemSnapshot,
+    readiness: Option<&serde_json::Value>,
+    detail: Detail,
+) -> String {
+    // Reported before anything else and at every tier. A daemon whose probes
+    // never attached still serves plausible host readings, so an agent shown
+    // only those concludes the box is fine when the truth is that nothing is
+    // attributing anything to a process. The daemon writes the explanation
+    // itself, including what to check, so it is quoted rather than restated.
+    let readiness_note = match readiness {
+        Some(readiness) if readiness.get("ready").and_then(|v| v.as_bool()) == Some(false) => {
+            let reason = readiness
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("cognitod reports that it is not ready.");
+            format!("WARNING: {}\n", single_line(reason))
+        }
+        _ => String::new(),
+    };
+
     // `/status.offline` is `runtime.offline`, which gates *outbound* sinks —
     // it is what stops telemetry leaving the host. It says nothing about
     // whether the daemon is ingesting events, and it defaults to true, so
@@ -612,10 +664,10 @@ fn render_health(status: &Status, system: &SystemSnapshot, detail: Detail) -> St
     );
 
     if detail == Detail::Summary {
-        return format!("{offline_note}{headline}");
+        return format!("{readiness_note}{offline_note}{headline}");
     }
 
-    let mut out = format!("{offline_note}{headline}");
+    let mut out = format!("{readiness_note}{offline_note}{headline}");
     out.push_str(&format!(
         "Load average: {:.2}, {:.2}, {:.2}\n",
         system.load_avg[0], system.load_avg[1], system.load_avg[2]
