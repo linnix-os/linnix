@@ -216,11 +216,15 @@ impl LinnixMcp {
                     not_found: true,
                 });
             }
-            // The daemon returns this for every route backed by a store it was
-            // started without. Saying so is the difference between "there were
-            // no incidents" and "this daemon cannot answer that question" —
-            // an agent told the former would wrongly rule the host out.
-            reqwest::StatusCode::SERVICE_UNAVAILABLE => {
+            // Only the two history routes are backed by the optional incident
+            // store. For those, saying so is the difference between "there
+            // were no incidents" and "this daemon cannot answer that question"
+            // — an agent told the former would wrongly rule the host out. For
+            // the live routes, which have no store behind them, a 503 is an
+            // ordinary outage, usually a proxy, and claiming a deliberate
+            // configuration would send an operator to edit a config that is
+            // not the problem.
+            reqwest::StatusCode::SERVICE_UNAVAILABLE if store_backed(path) => {
                 return Err(FetchError::fatal(format!(
                     "cognitod is running without the store that backs {path}, so no history \
                      exists to query. This is a daemon configuration, not an absence of events."
@@ -561,6 +565,15 @@ impl ServerHandler for LinnixMcp {
 /// A tool-level error rather than a JSON-RPC one: the request was well-formed
 /// and reached the tool, and the message is something the calling model should
 /// read and act on — usually by starting a daemon or fixing a URL.
+/// Whether a route is served from the optional incident store.
+///
+/// These two are the only routes cognitod answers with a 503 when it was
+/// started without that store; the live routes have nothing behind them that
+/// can be configured away.
+fn store_backed(path: &str) -> bool {
+    path.starts_with("/incidents") || path.starts_with("/attribution")
+}
+
 fn tool_error(message: String) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message)])
 }
@@ -575,13 +588,15 @@ fn pretty_json<T: serde::Serialize>(value: &T) -> String {
 }
 
 fn render_health(status: &Status, system: &SystemSnapshot, detail: Detail) -> String {
-    // Reported before anything else, and at every detail level: a daemon with
-    // no event source attached makes every reading below a statement about
-    // Linnix rather than about the host.
+    // `/status.offline` is `runtime.offline`, which gates *outbound* sinks —
+    // it is what stops telemetry leaving the host. It says nothing about
+    // whether the daemon is ingesting events, and it defaults to true, so
+    // reading it as "not observing this host" would put a false alarm on the
+    // top line of every default health call. Whether the daemon is actually
+    // seeing the machine is `events_per_sec`, reported below.
     let offline_note = if status.offline {
-        "WARNING: cognitod is offline — its event source is not attached, so it is not \
-         currently observing this host. The readings below are the host's, but no process \
-         attribution is being recorded.\n"
+        "Note: cognitod is in offline mode, so nothing is sent to external sinks. Local \
+         observation and attribution are unaffected.\n"
     } else {
         ""
     };
@@ -756,6 +771,14 @@ fn render_tree(graph: &serde_json::Value) -> String {
         .filter_map(|node| node.get("level").and_then(|v| v.as_i64()))
         .min()
         .unwrap_or(0);
+
+    // The daemon appends the queried process first and then walks ancestors
+    // from the immediate parent outward, so the array arrives with a level 0
+    // node ahead of its own parents. Rendered in that order the tree reads
+    // upside down: the deepest indent first, then a chain that un-indents.
+    // Sorting by level is stable, so siblings keep the daemon's order.
+    let mut nodes: Vec<&serde_json::Value> = nodes.iter().collect();
+    nodes.sort_by_key(|node| node.get("level").and_then(|v| v.as_i64()).unwrap_or(0));
 
     let mut out = String::new();
     for node in nodes {

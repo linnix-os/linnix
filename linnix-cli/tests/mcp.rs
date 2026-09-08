@@ -202,12 +202,18 @@ fn full_daemon() -> MockServer {
         when.method(GET).path("/graph/4242");
         then.status(200)
             .header("content-type", "application/json")
+            // Emission order and relationship strings copied from
+            // `get_graph` in cognitod/src/api/mod.rs, not guessed: the queried
+            // process is appended first with relationship "self", then
+            // ancestors from the immediate parent outward, then descendants.
+            // A fixture in tidy ancestor-first order cannot catch a renderer
+            // that trusts the array order.
             .body(
                 r#"{"root":4242,"nodes":[
+                    {"pid":4242,"ppid":1,"comm":"feature-builder","uid":0,"gid":0,
+                     "event_type":"exec","relationship":"self","level":0},
                     {"pid":1,"ppid":0,"comm":"systemd","uid":0,"gid":0,
                      "event_type":"exec","relationship":"ancestor","level":-1},
-                    {"pid":4242,"ppid":1,"comm":"feature-builder","uid":0,"gid":0,
-                     "event_type":"exec","relationship":"root","level":0},
                     {"pid":4301,"ppid":4242,"comm":"python","uid":0,"gid":0,
                      "event_type":"exec","relationship":"descendant","level":1}]}"#,
             );
@@ -544,13 +550,29 @@ fn the_process_tree_reads_as_lines_not_as_json() {
     };
     // Matched on the `[relationship]` tag, not the process name: the headline
     // above the tree names the queried process too, and it sits at column 0.
+    // Matched on the `[relationship]` tag, not the process name: the headline
+    // above the tree names the queried process too, and it sits at column 0.
     assert!(
-        indent("[ancestor] pid 1") < indent("[root] pid 4242"),
+        indent("[ancestor] pid 1") < indent("[self] pid 4242"),
         "an ancestor must sit shallower than the queried process: {evidence}"
     );
     assert!(
-        indent("[root] pid 4242") < indent("[descendant] pid 4301"),
+        indent("[self] pid 4242") < indent("[descendant] pid 4301"),
         "a descendant must sit deeper than the queried process: {evidence}"
+    );
+
+    // The daemon sends the queried process ahead of its own parents, so a
+    // renderer that trusts the array order draws the tree upside down: the
+    // deepest indent first, then a chain that un-indents.
+    let line_of = |needle: &str| {
+        evidence
+            .lines()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no line for {needle}: {evidence}"))
+    };
+    assert!(
+        line_of("[ancestor] pid 1") < line_of("[self] pid 4242"),
+        "ancestors must be printed before the process they lead to: {evidence}"
     );
 }
 
@@ -624,4 +646,80 @@ fn url_is_accepted_on_either_side_of_the_subcommand() {
             .unwrap_or_else(|e| panic!("{args:?} did not start the server: {line} ({e})"));
         assert_eq!(reply["result"]["serverInfo"]["name"], "linnix", "{args:?}");
     }
+}
+
+#[test]
+fn offline_mode_is_not_reported_as_a_detached_event_source() {
+    // `/status.offline` is `runtime.offline`, which gates outbound sinks and
+    // defaults to TRUE. Reading it as "cognitod is not watching this host"
+    // would put a false alarm on the top line of every default health call —
+    // the one sentence in this tool an agent is most likely to act on.
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/status");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"cpu_pct":1.2,"rss_mb":41,"events_per_sec":900,
+                    "rb_overflows":0,"rate_limited":0,"offline":true}"#,
+            );
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/system");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"timestamp":100,"cpu_percent":10.0,"mem_percent":20.0,
+                    "load_avg":[0.1,0.2,0.3],"disk_read_bytes":0,"disk_write_bytes":0,
+                    "net_rx_bytes":0,"net_tx_bytes":0,
+                    "psi_cpu_some_avg10":0.0,"psi_memory_some_avg10":0.0,
+                    "psi_memory_full_avg10":0.0,"psi_io_some_avg10":0.0,
+                    "psi_io_full_avg10":0.0}"#,
+            );
+    });
+
+    let mut client = McpClient::spawn(&server.base_url());
+    let (text, _) = client.call_tool("linnix_system_health", json!({"detail": "summary"}));
+
+    assert!(
+        !text.contains("not currently observing")
+            && !text.contains("no process attribution is being recorded"),
+        "offline mode must not read as a detached event source: {text}"
+    );
+    assert!(
+        text.contains("external sinks"),
+        "what offline actually means should still be said: {text}"
+    );
+}
+
+#[test]
+fn a_503_on_a_live_route_is_not_blamed_on_a_missing_store() {
+    // Only /incidents and /attribution are backed by the optional incident
+    // store. A 503 from a proxy in front of /system is an ordinary outage, and
+    // calling it a deliberate daemon configuration sends an operator to edit a
+    // config that is not the problem.
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/status");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"cpu_pct":1.0,"rss_mb":40,"events_per_sec":1,
+                    "rb_overflows":0,"rate_limited":0,"offline":false}"#,
+            );
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/system");
+        then.status(503).body("upstream unavailable");
+    });
+
+    let mut client = McpClient::spawn(&server.base_url());
+    let (text, is_error) = client.call_tool("linnix_system_health", json!({}));
+
+    assert!(is_error, "{text}");
+    assert!(
+        !text.contains("without the store"),
+        "/system has no store behind it: {text}"
+    );
+    assert!(text.contains("503"), "{text}");
 }
