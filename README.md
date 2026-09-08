@@ -177,6 +177,22 @@ This is contention **attribution**, not proven causality. The evidence says thes
 
 ---
 
+## Give your AI agent the machine
+
+The same investigation is available to Claude Code, Codex, or any other MCP client:
+
+```bash
+claude mcp add linnix -- linnix-cli mcp serve --url http://127.0.0.1:3000
+```
+
+An agent can read your code, your diff and your deployment. What it cannot do is look at the running kernel — so when the tests pass locally and the deployed service is slow, it guesses. `linnix-cli mcp serve` closes that gap: it exposes what cognitod observed as MCP tools, so the model reasons over what actually happened on the box instead of over its priors.
+
+Every tool takes a `detail` argument — `summary` to triage, `evidence` to reason from, `raw` to quote — so an agent pays for depth only once it has decided the host matters. No tool returns a confidence score: an attribution is evidence, and a float labelled "confidence" that nothing calibrated would be read as more than that.
+
+See [docs/MCP.md](docs/MCP.md) for the tool reference.
+
+---
+
 ## Kubernetes Features
 
 Linnix has first-class Kubernetes support:
