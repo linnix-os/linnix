@@ -1036,6 +1036,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     tokio::spawn(async move {
         loop {
             ctx_clone.update_process_stats();
+            // Heals live processes whose k8s metadata resolution raced the
+            // pod watcher at Fork/Exec time and lost (see context.rs).
+            ctx_clone.rescan_unresolved_k8s_metadata();
 
             sleep(sample_interval).await;
         }
