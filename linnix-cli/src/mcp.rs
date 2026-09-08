@@ -56,6 +56,12 @@ struct Readiness {
     /// Kept for the raw tier. `None` when nothing parseable came back.
     body: Option<serde_json::Value>,
     verdict: Verdict,
+    /// Whether eBPF probes are attached, read independently of `verdict`.
+    /// `verdict` folds in `require_kernel_instrumentation`, so a daemon
+    /// deliberately run with that policy off answers `ready:true` even with
+    /// probes unattached -- that policy says the operator accepts running
+    /// degraded, not that this client should stop saying so.
+    probes_attached: Option<bool>,
 }
 
 /// Deliberately three-valued. "Not ready" and "could not tell" lead an agent
@@ -294,6 +300,7 @@ impl LinnixMcp {
                 return Readiness {
                     body: None,
                     verdict: Verdict::Unknown(format!("/readyz could not be reached: {e}")),
+                    probes_attached: None,
                 };
             }
         };
@@ -308,6 +315,7 @@ impl LinnixMcp {
                         "/readyz answered {status} with something this client could not \
                          parse: {e}"
                     )),
+                    probes_attached: None,
                 };
             }
         };
@@ -328,9 +336,17 @@ impl LinnixMcp {
                  instrumenting this host could not be established"
             )),
         };
+        // Read independently of `ready`: the daemon folds
+        // require_kernel_instrumentation into `ready`, so this must not be
+        // inferred from the verdict above.
+        let probes_attached = body
+            .get("kernel_instrumentation")
+            .and_then(|v| v.as_str())
+            .map(|s| s == "active");
         Readiness {
             body: Some(body),
             verdict,
+            probes_attached,
         }
     }
 
@@ -690,7 +706,20 @@ fn render_health(
     // attributing anything to a process. The daemon writes the explanation
     // itself, including what to check, so it is quoted rather than restated.
     let readiness_note = match &readiness.verdict {
-        Verdict::Ready => String::new(),
+        Verdict::Ready => {
+            // `ready:true` can mean the operator turned off
+            // require_kernel_instrumentation, not that probes are attached.
+            // That policy says degraded operation is accepted; it does not
+            // mean this warning should go silent.
+            if readiness.probes_attached == Some(false) {
+                "WARNING: eBPF probes are not attached; running userspace-only, so no \
+                 per-process stall attribution is being produced. cognitod is configured to \
+                 report ready anyway (require_kernel_instrumentation is off).\n"
+                    .to_string()
+            } else {
+                String::new()
+            }
+        }
         Verdict::NotReady(reason) => format!("WARNING: {}\n", single_line(reason)),
         Verdict::Unknown(why) => format!(
             "WARNING: {}. Treat the readings below as unconfirmed: a daemon whose probes \
@@ -776,10 +805,13 @@ fn contention_headline(
     since: &str,
 ) -> String {
     let Some(primary) = investigation.offenders.first() else {
+        // The result that most strongly rules workloads out is exactly the
+        // one that most needs the causality qualification attached.
         return format!(
             "No contention was attributed to any neighbour of {namespace}/{pod} in the last \
              {since}. That rules out other workloads on the node; it does not rule out the \
-             pod's own limits, throttling or workload.\n"
+             pod's own limits, throttling or workload.\n{}",
+            investigate::CAUSALITY_CAVEAT
         );
     };
 

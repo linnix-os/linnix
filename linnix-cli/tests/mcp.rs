@@ -467,6 +467,9 @@ fn a_window_with_no_attributed_contention_does_not_read_as_an_all_clear() {
     // contention found" would report the pod as healthy.
     assert!(text.contains("rules out other workloads"), "{text}");
     assert!(text.contains("does not rule out"), "{text}");
+    // The result that most strongly rules a workload out is exactly the one
+    // that most needs the causality qualification attached.
+    assert!(text.contains("not proven causality"), "{text}");
 }
 
 #[test]
@@ -971,6 +974,59 @@ fn a_daemon_with_no_probes_attached_is_not_presented_as_healthy() {
         summary.contains("no per-process stall attribution is being produced"),
         "{summary}"
     );
+}
+
+#[test]
+fn a_daemon_not_requiring_probes_still_warns_when_they_are_unattached() {
+    // With require_kernel_instrumentation=false, cognitod answers `ready:true`
+    // by policy even when its probes never attached -- that policy exists so
+    // an operator can run degraded on purpose, not so this warning goes
+    // silent. The client must inspect kernel_instrumentation independently of
+    // the policy-gated `ready` verdict.
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/status");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"cpu_pct":0.4,"rss_mb":30,"events_per_sec":0,
+                    "rb_overflows":0,"rate_limited":0,"offline":true}"#,
+            );
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/system");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"timestamp":100,"cpu_percent":9.0,"mem_percent":11.0,
+                    "load_avg":[0.0,0.0,0.0],"disk_read_bytes":0,"disk_write_bytes":0,
+                    "net_rx_bytes":0,"net_tx_bytes":0,
+                    "psi_cpu_some_avg10":0.0,"psi_memory_some_avg10":0.0,
+                    "psi_memory_full_avg10":0.0,"psi_io_some_avg10":0.0,
+                    "psi_io_full_avg10":0.0}"#,
+            );
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/readyz");
+        // 200, ready:true -- require_kernel_instrumentation=false -- but the
+        // probes are still unattached.
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"ready":true,"kernel_instrumentation":"unavailable",
+                    "transport":"userspace","btf_available":false,"rss_probe":"disabled",
+                    "reason":null}"#,
+            );
+    });
+
+    let mut client = McpClient::spawn(&server.base_url());
+    let (summary, _) = client.call_tool("linnix_system_health", json!({"detail": "summary"}));
+
+    assert!(
+        summary.starts_with("WARNING:"),
+        "policy-gated readiness must not suppress the probe warning: {summary}"
+    );
+    assert!(summary.contains("not attached"), "{summary}");
 }
 
 #[test]

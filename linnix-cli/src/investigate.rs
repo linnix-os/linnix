@@ -253,7 +253,7 @@ fn humanise_reason(reason: Option<&str>) -> &str {
 
 /// The sentence this whole command exists to keep attached to its numbers.
 /// Held in one place so no exit path can print the findings without it.
-const CAUSALITY_CAVEAT: &str =
+pub(crate) const CAUSALITY_CAVEAT: &str =
     "\nThis is contention attribution, not proven causality. To confirm, change \
      one thing — move the offender, or give it a CPU limit — and check whether \
      the victim's stall falls.\n";
@@ -292,6 +292,9 @@ pub fn render(
              the node as the cause. Look at the pod's own limits, throttling and \
              workload next.\n",
         );
+        // The result that most strongly rules workloads out is exactly the
+        // one that most needs the causality qualification attached.
+        out.push_str(CAUSALITY_CAVEAT);
         // "Nothing was attributed here" is a finding worth citing too — it is
         // what rules the neighbours out, and it stops being reproducible the
         // moment the window slides.
@@ -334,7 +337,11 @@ pub fn render(
     let (measured, unmeasured): (Vec<&OffenderSummary>, Vec<&OffenderSummary>) = investigation
         .offenders
         .iter()
-        .partition(|offender| offender.share.is_some());
+        // share.is_some() alone isn't enough: an offender with both a split
+        // row and an unsplit one has a knowable share for its split rows,
+        // but the unsplit row could still hide more, so it must land in the
+        // unmeasured group rather than be ranked as fully measured.
+        .partition(|offender| offender.share.is_some() && offender.unsplit_rows == 0);
 
     if !unmeasured.is_empty() {
         if !measured.is_empty() {
@@ -784,12 +791,40 @@ mod tests {
     }
 
     #[test]
+    fn an_offender_with_both_split_and_unsplit_rows_stays_unmeasured() {
+        // "modern" has one split row and one unsplit (legacy) row. Its share
+        // is knowable (attributed_stall_us > 0), but part of its true
+        // contribution is still unaccounted for -- the unsplit row could
+        // carry any amount. Partitioning on share.is_some() would rank it
+        // as fully measured and let it be named "Likely offender" with a
+        // percentage that understates it.
+        let rows = vec![
+            attr("modern", 100, Some(300_000), 300_000),
+            attr("modern", 200, None, 500_000),
+        ];
+        let out = summarise(&rows);
+        let modern = out.offenders.iter().find(|o| o.pod == "modern").unwrap();
+        assert_eq!(modern.unsplit_rows, 1);
+        assert!(modern.share.is_some(), "share is knowable in isolation");
+
+        let report = render(&out, "payments", "api", "20m", false, None);
+        assert!(
+            !report.contains("Likely offender"),
+            "an offender with an unsplit row must not be ranked as fully measured: {report}"
+        );
+        assert!(report.contains("media/modern"), "{report}");
+    }
+
+    #[test]
     fn no_offenders_reports_absence_rather_than_accusing() {
         let out = summarise(&[]);
         assert!(out.offenders.is_empty());
         let report = render(&out, "payments", "api", "20m", false, None);
         assert!(report.contains("No contention attributed"));
         assert!(!report.contains("Likely offender"));
+        // The window that most strongly rules a workload out is exactly the
+        // one that most needs the causality qualification attached.
+        assert!(report.contains(CAUSALITY_CAVEAT.trim()), "{report}");
     }
 
     #[test]
