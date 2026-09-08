@@ -11,11 +11,13 @@ metadata:
 spec:
   containers:
     - name: stress
-      image: polinux/stress
+      # polinux/stress has no arm64 image ("exec format error" on the arm64
+      # matrix cell); stress-ng ships multi-arch and accepts the same flags.
+      image: ghcr.io/colinianking/stress-ng
       command: ["/bin/sh", "-c"]
       # $(nproc) rather than a fixed worker count: cells vary instance_type,
       # and this only needs to saturate whatever core count the cell has.
-      args: ["stress --cpu $(nproc) --timeout 3600s"]
+      args: ["stress-ng --cpu $(nproc) --timeout 3600s"]
       resources:
         requests:
           cpu: "500m"

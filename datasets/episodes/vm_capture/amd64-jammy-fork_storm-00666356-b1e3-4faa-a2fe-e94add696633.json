@@ -1,0 +1,126 @@
+{
+  "version": "0.3",
+  "episode_id": "00666356-b1e3-4faa-a2fe-e94add696633",
+  "captured_at": "2026-09-08T19:35:25.299165217+00:00",
+  "source": "vm_capture",
+  "scenario": "fork_storm",
+  "trigger": {
+    "rule_name": "psi_stall_attribution",
+    "rule_version": "1"
+  },
+  "victim": {
+    "namespace": "prod",
+    "pod": "steady-worker"
+  },
+  "victim_stall_us": 765559,
+  "cell": {
+    "kernel_release": "6.8.0-1063-aws",
+    "arch": "x86_64",
+    "btf_present": true,
+    "cgroup_driver": "cgroupv2",
+    "k3s_version": "k3s version v1.36.4+k3s1 (4dedb15b)"
+  },
+  "candidates": [
+    {
+      "pod": {
+        "namespace": "prod",
+        "pod": "steady-worker"
+      },
+      "owner_kind": null,
+      "owner_name": null,
+      "pre_window": {
+        "cpu_stall_us": [
+          674161.0,
+          834390.0,
+          815001.0,
+          666575.0,
+          816464.0,
+          803677.0,
+          820812.0,
+          506047.0,
+          701087.0,
+          776736.0,
+          802225.0,
+          809623.0,
+          704793.0,
+          795671.0,
+          582844.0,
+          765559.0
+        ],
+        "io_stall_us": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "memory_stall_us": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "post_window": {},
+      "sample_interval_ms": 1000,
+      "first_deviation_offset_ms": -15373
+    },
+    {
+      "pod": {
+        "namespace": "prod",
+        "pod": "fork-bomb"
+      },
+      "owner_kind": null,
+      "owner_name": null,
+      "pre_window": {
+        "cpu_percent": [
+          19.288999557495117
+        ],
+        "fork_count": [
+          437.0
+        ],
+        "short_job_count": [
+          546.0
+        ]
+      },
+      "post_window": {},
+      "sample_interval_ms": 1000,
+      "first_deviation_offset_ms": -41832
+    }
+  ],
+  "pod_graph": [],
+  "diagnosis": null,
+  "ground_truth": {
+    "culprit": {
+      "namespace": "prod",
+      "pod": "fork-bomb"
+    },
+    "reason_code": "fork_storm",
+    "corrected": false
+  },
+  "evidence_cited": [],
+  "outcome": null
+}
