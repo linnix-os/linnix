@@ -526,10 +526,20 @@ impl ContextStore {
         // live map. Snapshot the live map's current (possibly since-healed)
         // metadata here -- locked and dropped before `inner`, so the two
         // locks are never held at once -- and fall back to it below.
-        let live_meta: HashMap<u32, Arc<K8sMetadata>> = {
+        //
+        // Also snapshot each entry's process start time (`ProcessEvent::ts_ns`,
+        // which `add` normalizes to start time for every event type,
+        // including Exit). A pid is reused often enough under a fork-storm
+        // workload that joining fallback metadata by pid alone can attribute
+        // a dead process's fork/exit to whatever unrelated pod now owns that
+        // pid (confirmed against a real capture: a deleted pod's stale
+        // cpu/fork counters leaked into a later, unrelated episode). Reject
+        // the join unless the live entry's start time is consistent with
+        // being the same incarnation the historical event belongs to.
+        let live_meta: HashMap<u32, (u64, Arc<K8sMetadata>)> = {
             let live = self.live.lock().unwrap();
             live.iter()
-                .filter_map(|(pid, (_, meta))| meta.clone().map(|m| (*pid, m)))
+                .filter_map(|(pid, (proc, meta))| meta.clone().map(|m| (*pid, (proc.ts_ns, m))))
                 .collect()
         };
 
@@ -544,11 +554,24 @@ impl ContextStore {
             // Prefer the metadata cached at event time; fall back to the
             // live map's current view of the event's own pid, then its
             // parent's -- a Fork event recorded before its parent's pod was
-            // known can still be attributed once the parent heals.
-            let meta = meta_opt
-                .clone()
-                .or_else(|| live_meta.get(&event.pid).cloned())
-                .or_else(|| live_meta.get(&event.ppid).cloned());
+            // known can still be attributed once the parent heals. Both
+            // fallbacks are gated on start-time consistency so a reused pid
+            // can't borrow an unrelated (later) incarnation's identity:
+            // the event's own pid must match the live entry's start time
+            // exactly (same incarnation), and a parent lookup only counts
+            // if the parent's live incarnation already existed when this
+            // event (a Fork, born from that parent) occurred.
+            let meta = meta_opt.clone().or_else(|| {
+                live_meta
+                    .get(&event.pid)
+                    .filter(|(start_ts, _)| *start_ts == event.ts_ns)
+                    .or_else(|| {
+                        live_meta
+                            .get(&event.ppid)
+                            .filter(|(start_ts, _)| *start_ts <= event.ts_ns)
+                    })
+                    .map(|(_, meta)| meta.clone())
+            });
 
             if let Some(meta) = meta {
                 let key = format!("{}/{}", meta.namespace, meta.pod_name);
