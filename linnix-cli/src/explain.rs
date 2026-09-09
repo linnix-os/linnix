@@ -68,7 +68,7 @@ impl IncidentView {
     /// at the boundary means a field added later cannot reintroduce the hole,
     /// and it keeps the intended styling below safe, since that is applied
     /// after this runs rather than being stripped by it.
-    fn sanitized(self) -> Self {
+    pub(crate) fn sanitized(self) -> Self {
         Self {
             // Header fields are interpolated into single lines, so a break in
             // one forges a line: a process named "x\n  Afterwards: recovered"

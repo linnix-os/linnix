@@ -12,6 +12,7 @@ mod explain;
 mod export;
 mod http;
 mod investigate;
+mod mcp;
 mod pretty;
 mod processes;
 mod sse;
@@ -23,7 +24,12 @@ use pretty::PrettyEvent;
 #[derive(clap::Parser, Debug)]
 struct Args {
     /// Base URL of the Cognitod service
-    #[clap(long, default_value = "http://127.0.0.1:3000")]
+    ///
+    /// Global, so it is accepted on either side of a subcommand. An MCP client
+    /// is configured with one command line — `linnix-cli mcp serve --url ...`
+    /// is the order anyone writes it in, and a flag clap rejects there would
+    /// fail inside a client that shows the operator nothing but a dead server.
+    #[clap(long, global = true, default_value = "http://127.0.0.1:3000")]
     url: String,
 
     /// Show daemon status and exit
@@ -90,10 +96,26 @@ enum Command {
         #[clap(rename_all = "snake_case")]
         rating: FeedbackRating,
     },
+    /// Serve Linnix over the Model Context Protocol
+    ///
+    /// Exposes what cognitod observed to any MCP client — Claude Code, Codex,
+    /// an SRE agent — so a model can look at the machine instead of guessing
+    /// about it. Speaks stdio; stdout is the transport, so this subcommand
+    /// logs to stderr only.
+    Mcp {
+        #[clap(subcommand)]
+        command: McpCommand,
+    },
     /// Check system health and connectivity
     Doctor,
     /// List running processes with priority
     Processes,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum McpCommand {
+    /// Serve over stdio, for a client that launches this process itself
+    Serve,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug, serde::Serialize)]
@@ -161,6 +183,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!("Feedback submitted successfully.");
         } else {
             eprintln!("Failed to submit feedback: {}", resp.status());
+        }
+        return Ok(());
+    }
+
+    if let Some(Command::Mcp { command }) = args.command.clone() {
+        match command {
+            McpCommand::Serve => {
+                mcp::serve(&client, &args.url).await?;
+            }
         }
         return Ok(());
     }
