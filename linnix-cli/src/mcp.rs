@@ -352,14 +352,21 @@ impl LinnixMcp {
 
     /// Everything that can make an attribution result look emptier or
     /// cleaner than it really is: probes never attached, or events the
-    /// kernel produced that never reached cognitod. Best-effort -- a
-    /// `/status` fetch failing here does not fail the tool call, since the
-    /// attribution query it qualifies already succeeded or failed on its
-    /// own terms.
+    /// kernel produced that never reached cognitod. A `/status` fetch
+    /// failing here does not fail the tool call, since the attribution
+    /// query it qualifies already succeeded or failed on its own terms --
+    /// but it must not go silent either: "could not check" is a different
+    /// fact from "no loss" and has to reach the caller as such.
     async fn contention_caveats(&self) -> String {
         let mut out = readiness_note(&self.readiness().await);
-        if let Ok(status) = self.get::<Status>("/status", &[]).await {
-            out.push_str(&event_loss_note(&status));
+        match self.get::<Status>("/status", &[]).await {
+            Ok(status) => out.push_str(&event_loss_note(&status)),
+            Err(e) => out.push_str(&format!(
+                "WARNING: event loss unknown -- /status could not be read ({}), so whether \
+                 kernel events were dropped before reaching cognitod could not be \
+                 established.\n",
+                single_line(&e.message)
+            )),
         }
         out
     }
@@ -597,7 +604,12 @@ impl LinnixMcp {
             Err(e) => return Ok(tool_error(e.message)),
         };
 
-        if incidents.is_empty() {
+        // The raw tier's promise is the daemon's own bytes, and `[]` is a
+        // perfectly valid one -- prose here would break a caller parsing
+        // this as JSON in exactly the case that is easiest to hit, a quiet
+        // host. The substitution only makes sense for the tiers that were
+        // already prose.
+        if incidents.is_empty() && params.detail != Detail::Raw {
             return Ok(text(
                 "cognitod has recorded no incidents on this host in its retained history.\n"
                     .to_string(),
@@ -761,10 +773,15 @@ fn event_loss_note(status: &Status) -> String {
     if status.rb_overflows == 0 && status.rate_limited == 0 {
         return String::new();
     }
+    // rb_overflows/rate_limited are lifetime counters since cognitod
+    // started, not scoped to any particular query's window -- a single
+    // overflow from days ago would otherwise make every later query claim
+    // *its* result may be incomplete, which the counters cannot support.
     format!(
-        "WARNING: {} ring-buffer overflow(s) and {} rate-limited event(s) recorded: some \
-         kernel events never reached cognitod, so an empty or partial result here may reflect \
-         dropped events rather than an absence of contention.\n",
+        "WARNING: {} ring-buffer overflow(s) and {} rate-limited event(s) since cognitod \
+         started (lifetime totals, not scoped to this query's window): some kernel events \
+         have been dropped before reaching cognitod, so a result may be incomplete if loss \
+         happened to occur during the queried window.\n",
         status.rb_overflows, status.rate_limited
     )
 }
@@ -775,7 +792,11 @@ fn render_health(
     readiness: &Readiness,
     detail: Detail,
 ) -> String {
-    let readiness_note = readiness_note(readiness);
+    // Rate-limited events are discarded before reaching the context store
+    // just as overflowed ones are, so both belong in the same warning --
+    // gating it on rb_overflows alone silently dropped the rate_limited-only
+    // case, at every tier including summary.
+    let readiness_note = format!("{}{}", readiness_note(readiness), event_loss_note(status));
 
     // `/status.offline` is `runtime.offline`, which gates *outbound* sinks —
     // it is what stops telemetry leaving the host. It says nothing about
@@ -828,14 +849,8 @@ fn render_health(
         status.rate_limited,
         status.offline,
     ));
-    // Overflows mean events the kernel produced and the daemon never saw, so
-    // an absence of attribution during an overflow is not evidence of absence.
-    if status.rb_overflows > 0 {
-        out.push_str(
-            "Ring-buffer overflows are nonzero: some kernel events were dropped before \
-             cognitod read them, so attribution over this period may be incomplete.\n",
-        );
-    }
+    // The warning itself already led via readiness_note above (event_loss_note
+    // covers both counters, at every tier); this is just the raw numbers.
 
     out
 }

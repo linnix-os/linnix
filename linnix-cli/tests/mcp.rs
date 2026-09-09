@@ -1303,6 +1303,154 @@ fn dropped_events_qualify_an_empty_contention_result_even_with_probes_attached()
 }
 
 #[test]
+fn an_unreadable_status_endpoint_says_so_rather_than_going_silent_on_loss() {
+    // If /status 5xxs or comes back malformed, silently skipping the
+    // event-loss check would let an empty result claim contention is ruled
+    // out when the tool actually has no idea whether events were dropped.
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/attribution");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"attributions": [], "permalink": null}"#);
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/readyz");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"ready":true,"kernel_instrumentation":"active","transport":"ringbuf",
+                    "btf_available":true,"rss_probe":"attached","reason":null}"#,
+            );
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/status");
+        then.status(500);
+    });
+
+    let mut client = McpClient::spawn(&server.base_url());
+    let (summary, _) = client.call_tool(
+        "linnix_investigate_contention",
+        json!({"namespace": "payments", "pod": "payment-api", "detail": "summary"}),
+    );
+
+    assert!(
+        summary.contains("event loss") && summary.to_lowercase().contains("unknown"),
+        "an unreadable /status must not read as zero loss: {summary}"
+    );
+}
+
+#[test]
+fn the_loss_warning_does_not_claim_lifetime_counters_describe_this_window() {
+    // rb_overflows/rate_limited are cumulative since cognitod started, not
+    // scoped to the queried window. A single overflow last week must not
+    // make every later query claim *this* result may be incomplete.
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/attribution");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"attributions": [], "permalink": null}"#);
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/readyz");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"ready":true,"kernel_instrumentation":"active","transport":"ringbuf",
+                    "btf_available":true,"rss_probe":"attached","reason":null}"#,
+            );
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/status");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"cpu_pct":1.2,"rss_mb":41,"events_per_sec":900,
+                    "rb_overflows":7,"rate_limited":0,"offline":false}"#,
+            );
+    });
+
+    let mut client = McpClient::spawn(&server.base_url());
+    let (summary, _) = client.call_tool(
+        "linnix_investigate_contention",
+        json!({"namespace": "payments", "pod": "payment-api", "detail": "summary"}),
+    );
+
+    assert!(
+        summary.contains("since cognitod started") || summary.contains("lifetime"),
+        "the warning must not imply the lifetime counters describe this query's window: \
+         {summary}"
+    );
+}
+
+#[test]
+fn an_empty_incident_history_still_serialises_as_json_in_the_raw_tier() {
+    // The raw tier's promise is the daemon's own bytes. Substituting prose
+    // for [] in the empty case breaks a caller parsing this as JSON, in
+    // exactly the case that is valid and easy to hit -- a quiet host.
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/incidents");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body("[]");
+    });
+
+    let mut client = McpClient::spawn(&server.base_url());
+    let (raw, _) = client.call_tool("linnix_recent_incidents", json!({"detail": "raw"}));
+
+    assert_eq!(raw.trim(), "[]", "{raw}");
+}
+
+#[test]
+fn system_health_warns_on_rate_limiting_even_without_ring_buffer_overflows() {
+    // Rate-limited events are discarded before reaching the context store
+    // just as overflowed ones are. Gating the warning on rb_overflows alone
+    // let a purely rate_limited daemon report as loss-free.
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/status");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"cpu_pct":1.2,"rss_mb":41,"events_per_sec":900,
+                    "rb_overflows":0,"rate_limited":50,"offline":false}"#,
+            );
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/readyz");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"ready":true,"kernel_instrumentation":"active","transport":"ringbuf",
+                    "btf_available":true,"rss_probe":"attached","reason":null}"#,
+            );
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/system");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"timestamp":100,"cpu_percent":9.0,"mem_percent":11.0,
+                    "load_avg":[0.0,0.0,0.0],"disk_read_bytes":0,"disk_write_bytes":0,
+                    "net_rx_bytes":0,"net_tx_bytes":0,
+                    "psi_cpu_some_avg10":0.0,"psi_memory_some_avg10":0.0,
+                    "psi_memory_full_avg10":0.0,"psi_io_some_avg10":0.0,
+                    "psi_io_full_avg10":0.0}"#,
+            );
+    });
+
+    let mut client = McpClient::spawn(&server.base_url());
+    let (summary, _) = client.call_tool("linnix_system_health", json!({"detail": "summary"}));
+
+    assert!(
+        summary.starts_with("WARNING:") && summary.contains("rate-limited"),
+        "rate limiting alone must still warn, at the summary tier: {summary}"
+    );
+}
+
+#[test]
 fn a_readiness_endpoint_that_cannot_be_read_is_not_silence() {
     // A proxy error page parses as JSON perfectly well and says nothing about
     // the daemon. Treating that as "no warning" would put this tool right back
