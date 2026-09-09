@@ -1493,3 +1493,36 @@ fn a_readiness_endpoint_that_cannot_be_read_is_not_silence() {
     assert!(summary.contains("without a `ready` verdict"), "{summary}");
     assert!(summary.contains("unconfirmed"), "{summary}");
 }
+
+#[test]
+fn a_pid_only_incident_target_is_not_dropped_from_the_headline() {
+    // `target_name` and `target_pid` are independently optional on the
+    // daemon's incident record. An incident circuit-breaker can act on a pid
+    // before `comm` is resolved, leaving target_name null. The headline must
+    // still say which process was acted on, the way the evidence tier already
+    // does with a bare "pid <n>".
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/incidents/9");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"id":9,"timestamp":1732242135,"event_type":"circuit_breaker_cpu",
+                    "action":"auto_kill","target_name":null,"target_pid":472693,
+                    "psi_cpu":75.2,"cpu_percent":96.3,
+                    "investigation":null,"llm_analysis":null,
+                    "psi_after":null,"recovery_time_ms":null}"#,
+            );
+    });
+
+    let mut client = McpClient::spawn(&server.base_url());
+    let (headline, _) = client.call_tool(
+        "linnix_explain_incident",
+        json!({"id": 9, "detail": "summary"}),
+    );
+
+    assert!(
+        headline.contains("472693"),
+        "a pid-only target must not vanish from the headline: {headline}"
+    );
+}

@@ -974,11 +974,11 @@ fn process_headline(pid: u32, proc: &serde_json::Value) -> String {
 /// full, and nothing more.
 fn incident_headline(view: &IncidentView, id: i64) -> String {
     let mut line = format!("Incident #{id}: {} → {}", view.event_type, view.action);
-    if let Some(target) = &view.target_name {
-        line.push_str(&format!(" on `{target}`"));
-        if let Some(pid) = view.target_pid {
-            line.push_str(&format!(" (pid {pid})"));
-        }
+    match (&view.target_name, view.target_pid) {
+        (Some(target), Some(pid)) => line.push_str(&format!(" on `{target}` (pid {pid})")),
+        (Some(target), None) => line.push_str(&format!(" on `{target}`")),
+        (None, Some(pid)) => line.push_str(&format!(" on pid {pid}")),
+        (None, None) => {}
     }
     line.push_str(&format!(
         ", cpu {:.1}%, psi_cpu {:.1}%, at epoch {}.",
