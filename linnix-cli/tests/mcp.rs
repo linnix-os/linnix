@@ -166,7 +166,7 @@ fn full_daemon() -> MockServer {
             .header("content-type", "application/json")
             .body(
                 r#"{"cpu_pct":1.2,"rss_mb":41,"events_per_sec":900,
-                    "rb_overflows":0,"rate_limited":0,"offline":false}"#,
+                    "rb_overflows":0,"rate_limited":0,"listener_queue_drops":0,"offline":false}"#,
             );
     });
     server.mock(|when, then| {
@@ -708,7 +708,7 @@ fn offline_mode_is_not_reported_as_a_detached_event_source() {
             .header("content-type", "application/json")
             .body(
                 r#"{"cpu_pct":1.2,"rss_mb":41,"events_per_sec":900,
-                    "rb_overflows":0,"rate_limited":0,"offline":true}"#,
+                    "rb_overflows":0,"rate_limited":0,"listener_queue_drops":0,"offline":true}"#,
             );
     });
     server.mock(|when, then| {
@@ -759,7 +759,7 @@ fn a_503_on_a_live_route_is_not_blamed_on_a_missing_store() {
             .header("content-type", "application/json")
             .body(
                 r#"{"cpu_pct":1.0,"rss_mb":40,"events_per_sec":1,
-                    "rb_overflows":0,"rate_limited":0,"offline":false}"#,
+                    "rb_overflows":0,"rate_limited":0,"listener_queue_drops":0,"offline":false}"#,
             );
     });
     server.mock(|when, then| {
@@ -970,7 +970,7 @@ fn a_daemon_with_no_probes_attached_is_not_presented_as_healthy() {
             .header("content-type", "application/json")
             .body(
                 r#"{"cpu_pct":0.4,"rss_mb":30,"events_per_sec":0,
-                    "rb_overflows":0,"rate_limited":0,"offline":true}"#,
+                    "rb_overflows":0,"rate_limited":0,"listener_queue_drops":0,"offline":true}"#,
             );
     });
     server.mock(|when, then| {
@@ -1025,7 +1025,7 @@ fn a_daemon_not_requiring_probes_still_warns_when_they_are_unattached() {
             .header("content-type", "application/json")
             .body(
                 r#"{"cpu_pct":0.4,"rss_mb":30,"events_per_sec":0,
-                    "rb_overflows":0,"rate_limited":0,"offline":true}"#,
+                    "rb_overflows":0,"rate_limited":0,"listener_queue_drops":0,"offline":true}"#,
             );
     });
     server.mock(|when, then| {
@@ -1294,7 +1294,7 @@ fn dropped_events_qualify_an_empty_contention_result_even_with_probes_attached()
             .header("content-type", "application/json")
             .body(
                 r#"{"cpu_pct":1.2,"rss_mb":41,"events_per_sec":900,
-                    "rb_overflows":7,"rate_limited":0,"offline":false}"#,
+                    "rb_overflows":7,"rate_limited":0,"listener_queue_drops":0,"offline":false}"#,
             );
     });
 
@@ -1375,7 +1375,7 @@ fn the_loss_warning_does_not_claim_lifetime_counters_describe_this_window() {
             .header("content-type", "application/json")
             .body(
                 r#"{"cpu_pct":1.2,"rss_mb":41,"events_per_sec":900,
-                    "rb_overflows":7,"rate_limited":0,"offline":false}"#,
+                    "rb_overflows":7,"rate_limited":0,"listener_queue_drops":0,"offline":false}"#,
             );
     });
 
@@ -1423,7 +1423,7 @@ fn system_health_warns_on_rate_limiting_even_without_ring_buffer_overflows() {
             .header("content-type", "application/json")
             .body(
                 r#"{"cpu_pct":1.2,"rss_mb":41,"events_per_sec":900,
-                    "rb_overflows":0,"rate_limited":50,"offline":false}"#,
+                    "rb_overflows":0,"rate_limited":50,"listener_queue_drops":0,"offline":false}"#,
             );
     });
     server.mock(|when, then| {
@@ -1516,6 +1516,54 @@ fn system_health_warns_on_queue_backpressure_drops_alone() {
 }
 
 #[test]
+fn a_daemon_predating_listener_queue_drops_reports_that_loss_as_unknown_not_zero() {
+    // A daemon built before listener_queue_drops existed simply omits the
+    // key; #[serde(default)] would otherwise turn that into a silent 0,
+    // reporting queue-backpressure loss as ruled out when it was never
+    // actually measured on this daemon.
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/status");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"cpu_pct":1.2,"rss_mb":41,"events_per_sec":900,
+                    "rb_overflows":0,"rate_limited":0,"offline":false}"#,
+            );
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/readyz");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"ready":true,"kernel_instrumentation":"active","transport":"ringbuf",
+                    "btf_available":true,"rss_probe":"attached","reason":null}"#,
+            );
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/system");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"timestamp":100,"cpu_percent":9.0,"mem_percent":11.0,
+                    "load_avg":[0.0,0.0,0.0],"disk_read_bytes":0,"disk_write_bytes":0,
+                    "net_rx_bytes":0,"net_tx_bytes":0,
+                    "psi_cpu_some_avg10":0.0,"psi_memory_some_avg10":0.0,
+                    "psi_memory_full_avg10":0.0,"psi_io_some_avg10":0.0,
+                    "psi_io_full_avg10":0.0}"#,
+            );
+    });
+
+    let mut client = McpClient::spawn(&server.base_url());
+    let (summary, _) = client.call_tool("linnix_system_health", json!({"detail": "summary"}));
+
+    assert!(
+        summary.starts_with("WARNING:") && summary.contains("unknown"),
+        "a daemon that never sent listener_queue_drops must not read as loss-free: {summary}"
+    );
+}
+
+#[test]
 fn a_readiness_endpoint_that_cannot_be_read_is_not_silence() {
     // A proxy error page parses as JSON perfectly well and says nothing about
     // the daemon. Treating that as "no warning" would put this tool right back
@@ -1528,7 +1576,7 @@ fn a_readiness_endpoint_that_cannot_be_read_is_not_silence() {
             .header("content-type", "application/json")
             .body(
                 r#"{"cpu_pct":0.4,"rss_mb":30,"events_per_sec":0,
-                    "rb_overflows":0,"rate_limited":0,"offline":false}"#,
+                    "rb_overflows":0,"rate_limited":0,"listener_queue_drops":0,"offline":false}"#,
             );
     });
     server.mock(|when, then| {

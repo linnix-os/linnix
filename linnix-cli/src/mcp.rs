@@ -173,11 +173,16 @@ struct Status {
     /// that counter also aggregates every rate-limited event and SSE
     /// subscriber-lag drops, so using it here would both double-count
     /// rate-limiting and warn on an unrelated slow subscriber even when
-    /// every event actually reached cognitod. Defaulted because a daemon
-    /// predating this counter simply won't send it, not because a missing
-    /// value should be assumed loss-free.
+    /// every event actually reached cognitod.
+    ///
+    /// `Option` rather than defaulted to zero: a daemon predating this
+    /// counter simply omits the key, and that absence means "unknown",
+    /// not "definitely zero". A daemon on that version can still have
+    /// dropped events via this exact path, visible only in its aggregate
+    /// `dropped_events_total` -- collapsing the missing key to 0 would
+    /// report that loss as ruled out rather than as unmeasured.
     #[serde(default)]
-    listener_queue_drops: u64,
+    listener_queue_drops: Option<u64>,
     /// True when the daemon is running without its event source attached, so
     /// every other number below describes a daemon that is not seeing the
     /// machine. Worth reporting first: it is the difference between "the host
@@ -781,7 +786,23 @@ fn readiness_note(readiness: &Readiness) -> String {
 /// with no attribution rows, and an agent reading that as "ruled out"
 /// would be as wrong as reading a detached probe that way.
 fn event_loss_note(status: &Status) -> String {
-    if status.rb_overflows == 0 && status.rate_limited == 0 && status.listener_queue_drops == 0 {
+    // A daemon predating listener_queue_drops omits the key rather than
+    // sending 0, and that absence means the queue-backpressure path is
+    // unmeasured, not that it definitely lost nothing -- collapsing it to a
+    // number here would either hide loss (no warning at all) or misreport
+    // an unmeasured counter as a confirmed zero inside a warning already
+    // firing for the other two reasons.
+    let queue_drops_unknown = status.listener_queue_drops.is_none();
+    let queue_drops = status.listener_queue_drops.unwrap_or(0);
+
+    if status.rb_overflows == 0 && status.rate_limited == 0 && queue_drops == 0 {
+        if queue_drops_unknown {
+            return "WARNING: this daemon predates the listener_queue_drops counter, so \
+                     whether it dropped events under listener-queue backpressure is unknown: a \
+                     result may be incomplete even though no ring-buffer overflow or \
+                     rate-limiting was reported.\n"
+                .to_string();
+        }
         return String::new();
     }
     // rb_overflows/rate_limited/listener_queue_drops are lifetime counters
@@ -790,12 +811,17 @@ fn event_loss_note(status: &Status) -> String {
     // claim *its* result may be incomplete, which the counters cannot
     // support. listener_queue_drops covers a third loss path the other two
     // don't: the listener's bounded worker queue filling under backpressure.
+    let queue_drops_str = if queue_drops_unknown {
+        "unknown".to_string()
+    } else {
+        queue_drops.to_string()
+    };
     format!(
         "WARNING: {} ring-buffer overflow(s), {} rate-limited event(s), and {} queue-dropped \
          event(s) since cognitod started (lifetime totals, not scoped to this query's window): \
          some kernel events have been dropped before reaching cognitod, so a result may be \
          incomplete if loss happened to occur during the queried window.\n",
-        status.rb_overflows, status.rate_limited, status.listener_queue_drops
+        status.rb_overflows, status.rate_limited, queue_drops_str
     )
 }
 
@@ -852,6 +878,10 @@ fn render_health(
          forward progress): memory {:.1}%, io {:.1}%\n",
         system.psi_memory_full_avg10, system.psi_io_full_avg10
     ));
+    let queue_drops_str = status
+        .listener_queue_drops
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
     out.push_str(&format!(
         "Daemon: {:.1}% CPU, {} MB RSS, {} events/s, {} ring-buffer overflows, \
          {} events rate-limited, {} events queue-dropped, offline={}\n",
@@ -860,7 +890,7 @@ fn render_health(
         status.events_per_sec,
         status.rb_overflows,
         status.rate_limited,
-        status.listener_queue_drops,
+        queue_drops_str,
         status.offline,
     ));
     // The warning itself already led via readiness_note above (event_loss_note
