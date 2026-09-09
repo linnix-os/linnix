@@ -167,13 +167,17 @@ struct Status {
     events_per_sec: u64,
     rb_overflows: u64,
     rate_limited: u64,
-    /// Events the listener's bounded worker queue dropped under backpressure
-    /// -- a third, independent source of loss from rb_overflows/rate_limited,
-    /// which only cover the ring buffer and the rate limiter. Defaulted
-    /// because a daemon predating this counter simply won't send it, not
-    /// because a missing value should be assumed loss-free.
+    /// Events the listener's bounded worker queue dropped specifically under
+    /// backpressure -- a third, independent source of loss from
+    /// rb_overflows/rate_limited. Deliberately *not* `dropped_events_total`:
+    /// that counter also aggregates every rate-limited event and SSE
+    /// subscriber-lag drops, so using it here would both double-count
+    /// rate-limiting and warn on an unrelated slow subscriber even when
+    /// every event actually reached cognitod. Defaulted because a daemon
+    /// predating this counter simply won't send it, not because a missing
+    /// value should be assumed loss-free.
     #[serde(default)]
-    dropped_events_total: u64,
+    listener_queue_drops: u64,
     /// True when the daemon is running without its event source attached, so
     /// every other number below describes a daemon that is not seeing the
     /// machine. Worth reporting first: it is the difference between "the host
@@ -777,21 +781,21 @@ fn readiness_note(readiness: &Readiness) -> String {
 /// with no attribution rows, and an agent reading that as "ruled out"
 /// would be as wrong as reading a detached probe that way.
 fn event_loss_note(status: &Status) -> String {
-    if status.rb_overflows == 0 && status.rate_limited == 0 && status.dropped_events_total == 0 {
+    if status.rb_overflows == 0 && status.rate_limited == 0 && status.listener_queue_drops == 0 {
         return String::new();
     }
-    // rb_overflows/rate_limited/dropped_events_total are lifetime counters
+    // rb_overflows/rate_limited/listener_queue_drops are lifetime counters
     // since cognitod started, not scoped to any particular query's window --
     // a single overflow from days ago would otherwise make every later query
     // claim *its* result may be incomplete, which the counters cannot
-    // support. dropped_events_total covers a third loss path the other two
+    // support. listener_queue_drops covers a third loss path the other two
     // don't: the listener's bounded worker queue filling under backpressure.
     format!(
         "WARNING: {} ring-buffer overflow(s), {} rate-limited event(s), and {} queue-dropped \
          event(s) since cognitod started (lifetime totals, not scoped to this query's window): \
          some kernel events have been dropped before reaching cognitod, so a result may be \
          incomplete if loss happened to occur during the queried window.\n",
-        status.rb_overflows, status.rate_limited, status.dropped_events_total
+        status.rb_overflows, status.rate_limited, status.listener_queue_drops
     )
 }
 
@@ -856,7 +860,7 @@ fn render_health(
         status.events_per_sec,
         status.rb_overflows,
         status.rate_limited,
-        status.dropped_events_total,
+        status.listener_queue_drops,
         status.offline,
     ));
     // The warning itself already led via readiness_note above (event_loss_note

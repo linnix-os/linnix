@@ -1456,15 +1456,22 @@ fn system_health_warns_on_rate_limiting_even_without_ring_buffer_overflows() {
         summary.starts_with("WARNING:") && summary.contains("rate-limited"),
         "rate limiting alone must still warn, at the summary tier: {summary}"
     );
+    assert!(
+        summary.contains("0 queue-dropped"),
+        "rate-limited events must not also be reported as queue drops -- \
+         dropped_events_total aggregates both and this field must not read from it: {summary}"
+    );
 }
 
 #[test]
 fn system_health_warns_on_queue_backpressure_drops_alone() {
     // The listener's bounded worker queue can drop events under backpressure
     // even when nothing overflowed the ring buffer and the rate limiter
-    // never engaged -- a third, independent loss path counted separately by
-    // the daemon as dropped_events_total. Gating the warning on the other
-    // two counters let a purely queue-dropping daemon report as loss-free.
+    // never engaged -- a third, independent loss path the daemon counts
+    // separately as listener_queue_drops (not dropped_events_total, which
+    // also aggregates rate-limited events and unrelated SSE subscriber-lag
+    // drops). Gating the warning on the other two counters let a purely
+    // queue-dropping daemon report as loss-free.
     let server = MockServer::start();
     server.mock(|when, then| {
         when.method(GET).path("/status");
@@ -1472,7 +1479,7 @@ fn system_health_warns_on_queue_backpressure_drops_alone() {
             .header("content-type", "application/json")
             .body(
                 r#"{"cpu_pct":1.2,"rss_mb":41,"events_per_sec":900,
-                    "rb_overflows":0,"rate_limited":0,"dropped_events_total":12,
+                    "rb_overflows":0,"rate_limited":0,"listener_queue_drops":12,
                     "offline":false}"#,
             );
     });

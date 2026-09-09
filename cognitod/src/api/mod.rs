@@ -289,6 +289,11 @@ struct StatusResponse {
     slack_stats: SlackStats,
     perf_poll_errors: u64,
     dropped_events_total: u64,
+    /// Events the listener's bounded worker queue dropped under
+    /// backpressure specifically -- unlike `dropped_events_total`, which
+    /// also aggregates rate-limited events and SSE-subscriber lag drops,
+    /// this counts only the queue-capacity path.
+    listener_queue_drops: u64,
 }
 
 #[derive(Serialize)]
@@ -413,6 +418,7 @@ async fn status_handler(State(app_state): State<Arc<AppState>>) -> Json<StatusRe
         dropped_events_total: metrics
             .dropped_events_total
             .load(std::sync::atomic::Ordering::Relaxed),
+        listener_queue_drops: metrics.listener_queue_drops(),
     };
     Json(resp)
 }
