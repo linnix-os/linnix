@@ -350,6 +350,20 @@ impl LinnixMcp {
         }
     }
 
+    /// Everything that can make an attribution result look emptier or
+    /// cleaner than it really is: probes never attached, or events the
+    /// kernel produced that never reached cognitod. Best-effort -- a
+    /// `/status` fetch failing here does not fail the tool call, since the
+    /// attribution query it qualifies already succeeded or failed on its
+    /// own terms.
+    async fn contention_caveats(&self) -> String {
+        let mut out = readiness_note(&self.readiness().await);
+        if let Ok(status) = self.get::<Status>("/status", &[]).await {
+            out.push_str(&event_loss_note(&status));
+        }
+        out
+    }
+
     #[tool(
         name = "linnix_system_health",
         description = "Is this Linux host under resource pressure right now? Returns live CPU, \
@@ -462,11 +476,8 @@ impl LinnixMcp {
             }
             // The raw tier can hand back an empty attributions array just as
             // legitimately-but-misleadingly as summary/evidence can, so it
-            // needs the same warning, not just the same bytes.
-            let note = readiness_note(&self.readiness().await);
-            if !note.is_empty() {
-                out = format!("{note}{out}");
-            }
+            // needs the same warnings, not just the same bytes.
+            out = format!("{}{out}", self.contention_caveats().await);
             return Ok(text(out));
         }
 
@@ -503,14 +514,11 @@ impl LinnixMcp {
             ),
         };
 
-        // A daemon running userspace-only produces no per-process attribution
-        // at all, so an empty result here can mean "genuinely no contention"
-        // or "nothing was ever observed" -- claims this tool must not
-        // conflate, same as linnix_system_health.
-        let note = readiness_note(&self.readiness().await);
-        if !note.is_empty() {
-            out = format!("{note}{out}");
-        }
+        // A daemon running userspace-only, or one that dropped events to an
+        // overflow or the rate limiter, produces no (or incomplete)
+        // per-process attribution -- claims this tool must not conflate with
+        // "genuinely no contention", same as linnix_system_health.
+        out = format!("{}{out}", self.contention_caveats().await);
 
         Ok(text(out))
     }
@@ -742,6 +750,23 @@ fn readiness_note(readiness: &Readiness) -> String {
             single_line(why)
         ),
     }
+}
+
+/// `/readyz` only says whether kernel instrumentation is attached, not
+/// whether every event it produced actually reached cognitod. A perf-buffer
+/// overflow or the rate limiter dropping events can also leave a window
+/// with no attribution rows, and an agent reading that as "ruled out"
+/// would be as wrong as reading a detached probe that way.
+fn event_loss_note(status: &Status) -> String {
+    if status.rb_overflows == 0 && status.rate_limited == 0 {
+        return String::new();
+    }
+    format!(
+        "WARNING: {} ring-buffer overflow(s) and {} rate-limited event(s) recorded: some \
+         kernel events never reached cognitod, so an empty or partial result here may reflect \
+         dropped events rather than an absence of contention.\n",
+        status.rb_overflows, status.rate_limited
+    )
 }
 
 fn render_health(

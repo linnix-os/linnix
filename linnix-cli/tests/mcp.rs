@@ -1258,6 +1258,51 @@ fn the_raw_tier_of_contention_also_carries_the_readiness_warning() {
 }
 
 #[test]
+fn dropped_events_qualify_an_empty_contention_result_even_with_probes_attached() {
+    // /readyz only reports whether kernel instrumentation is attached, not
+    // whether every event it produced actually reached cognitod. A ring
+    // buffer overflow or the rate-limiter dropping events can also leave a
+    // window with no attribution rows, and that must not read as "ruled
+    // out" either.
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/attribution");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"attributions": [], "permalink": null}"#);
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/readyz");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"ready":true,"kernel_instrumentation":"active","transport":"ringbuf",
+                    "btf_available":true,"rss_probe":"attached","reason":null}"#,
+            );
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/status");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"cpu_pct":1.2,"rss_mb":41,"events_per_sec":900,
+                    "rb_overflows":7,"rate_limited":0,"offline":false}"#,
+            );
+    });
+
+    let mut client = McpClient::spawn(&server.base_url());
+    let (summary, _) = client.call_tool(
+        "linnix_investigate_contention",
+        json!({"namespace": "payments", "pod": "payment-api", "detail": "summary"}),
+    );
+
+    assert!(
+        summary.contains("ring-buffer overflow"),
+        "an empty result with dropped events must not read as ruled-out: {summary}"
+    );
+}
+
+#[test]
 fn a_readiness_endpoint_that_cannot_be_read_is_not_silence() {
     // A proxy error page parses as JSON perfectly well and says nothing about
     // the daemon. Treating that as "no warning" would put this tool right back
