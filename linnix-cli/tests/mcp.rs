@@ -415,6 +415,14 @@ fn detail_raw_hands_back_what_the_daemon_actually_sent() {
         )),
         "raw must carry an absolute permalink: {raw}"
     );
+
+    // A healthy daemon with no loss warnings leaves nothing to prepend, so
+    // this is exactly the case where the raw tier's promise -- the daemon's
+    // own parseable bytes -- has to actually hold. Trailing prose appended
+    // after the serialized object (e.g. a "these exact rows: <link>" line)
+    // would make this fail even though nothing here looks wrong by eye.
+    serde_json::from_str::<Value>(&raw)
+        .unwrap_or_else(|e| panic!("raw tier must be valid JSON on a healthy daemon: {e}\n{raw}"));
 }
 
 #[test]
@@ -1447,6 +1455,56 @@ fn system_health_warns_on_rate_limiting_even_without_ring_buffer_overflows() {
     assert!(
         summary.starts_with("WARNING:") && summary.contains("rate-limited"),
         "rate limiting alone must still warn, at the summary tier: {summary}"
+    );
+}
+
+#[test]
+fn system_health_warns_on_queue_backpressure_drops_alone() {
+    // The listener's bounded worker queue can drop events under backpressure
+    // even when nothing overflowed the ring buffer and the rate limiter
+    // never engaged -- a third, independent loss path counted separately by
+    // the daemon as dropped_events_total. Gating the warning on the other
+    // two counters let a purely queue-dropping daemon report as loss-free.
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/status");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"cpu_pct":1.2,"rss_mb":41,"events_per_sec":900,
+                    "rb_overflows":0,"rate_limited":0,"dropped_events_total":12,
+                    "offline":false}"#,
+            );
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/readyz");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"ready":true,"kernel_instrumentation":"active","transport":"ringbuf",
+                    "btf_available":true,"rss_probe":"attached","reason":null}"#,
+            );
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/system");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"timestamp":100,"cpu_percent":9.0,"mem_percent":11.0,
+                    "load_avg":[0.0,0.0,0.0],"disk_read_bytes":0,"disk_write_bytes":0,
+                    "net_rx_bytes":0,"net_tx_bytes":0,
+                    "psi_cpu_some_avg10":0.0,"psi_memory_some_avg10":0.0,
+                    "psi_memory_full_avg10":0.0,"psi_io_some_avg10":0.0,
+                    "psi_io_full_avg10":0.0}"#,
+            );
+    });
+
+    let mut client = McpClient::spawn(&server.base_url());
+    let (summary, _) = client.call_tool("linnix_system_health", json!({"detail": "summary"}));
+
+    assert!(
+        summary.starts_with("WARNING:") && summary.contains("queue-dropped"),
+        "queue backpressure drops alone must still warn, at the summary tier: {summary}"
     );
 }
 

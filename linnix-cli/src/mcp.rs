@@ -167,6 +167,13 @@ struct Status {
     events_per_sec: u64,
     rb_overflows: u64,
     rate_limited: u64,
+    /// Events the listener's bounded worker queue dropped under backpressure
+    /// -- a third, independent source of loss from rb_overflows/rate_limited,
+    /// which only cover the ring buffer and the rate limiter. Defaulted
+    /// because a daemon predating this counter simply won't send it, not
+    /// because a missing value should be assumed loss-free.
+    #[serde(default)]
+    dropped_events_total: u64,
     /// True when the daemon is running without its event source attached, so
     /// every other number below describes a daemon that is not seeing the
     /// machine. Worth reporting first: it is the difference between "the host
@@ -467,24 +474,24 @@ impl LinnixMcp {
         // caller quoting a filtered view believing it complete is worse off
         // than one who asked for prose.
         if params.detail == Detail::Raw {
-            let raw: serde_json::Value = match self.get("/attribution", &query).await {
+            let mut raw: serde_json::Value = match self.get("/attribution", &query).await {
                 Ok(v) => v,
                 Err(e) => return Ok(tool_error(e.message)),
             };
-            let permalink = raw
-                .get("permalink")
-                .and_then(|v| v.as_str())
-                .map(|path| format!("{}{}", self.base, path));
-            let mut out = pretty_json(&raw);
             // The window slides, so these rows stop being reachable by the
-            // same question within minutes. The link is evidence, not garnish.
-            if let Some(link) = permalink {
-                out.push_str(&format!("\n\nThese exact rows: {link}\n"));
+            // same question within minutes. The link is evidence, not
+            // garnish -- but it has to stay inside the JSON, not appended as
+            // trailing prose, or a caller parsing this tier's documented
+            // payload gets a parse error on an otherwise-healthy response.
+            if let Some(path) = raw.get("permalink").and_then(|v| v.as_str()) {
+                let absolute = format!("{}{}", self.base, path);
+                raw["permalink"] = serde_json::Value::String(absolute);
             }
+            let out = pretty_json(&raw);
             // The raw tier can hand back an empty attributions array just as
             // legitimately-but-misleadingly as summary/evidence can, so it
             // needs the same warnings, not just the same bytes.
-            out = format!("{}{out}", self.contention_caveats().await);
+            let out = format!("{}{out}", self.contention_caveats().await);
             return Ok(text(out));
         }
 
@@ -770,19 +777,21 @@ fn readiness_note(readiness: &Readiness) -> String {
 /// with no attribution rows, and an agent reading that as "ruled out"
 /// would be as wrong as reading a detached probe that way.
 fn event_loss_note(status: &Status) -> String {
-    if status.rb_overflows == 0 && status.rate_limited == 0 {
+    if status.rb_overflows == 0 && status.rate_limited == 0 && status.dropped_events_total == 0 {
         return String::new();
     }
-    // rb_overflows/rate_limited are lifetime counters since cognitod
-    // started, not scoped to any particular query's window -- a single
-    // overflow from days ago would otherwise make every later query claim
-    // *its* result may be incomplete, which the counters cannot support.
+    // rb_overflows/rate_limited/dropped_events_total are lifetime counters
+    // since cognitod started, not scoped to any particular query's window --
+    // a single overflow from days ago would otherwise make every later query
+    // claim *its* result may be incomplete, which the counters cannot
+    // support. dropped_events_total covers a third loss path the other two
+    // don't: the listener's bounded worker queue filling under backpressure.
     format!(
-        "WARNING: {} ring-buffer overflow(s) and {} rate-limited event(s) since cognitod \
-         started (lifetime totals, not scoped to this query's window): some kernel events \
-         have been dropped before reaching cognitod, so a result may be incomplete if loss \
-         happened to occur during the queried window.\n",
-        status.rb_overflows, status.rate_limited
+        "WARNING: {} ring-buffer overflow(s), {} rate-limited event(s), and {} queue-dropped \
+         event(s) since cognitod started (lifetime totals, not scoped to this query's window): \
+         some kernel events have been dropped before reaching cognitod, so a result may be \
+         incomplete if loss happened to occur during the queried window.\n",
+        status.rb_overflows, status.rate_limited, status.dropped_events_total
     )
 }
 
@@ -841,16 +850,17 @@ fn render_health(
     ));
     out.push_str(&format!(
         "Daemon: {:.1}% CPU, {} MB RSS, {} events/s, {} ring-buffer overflows, \
-         {} events rate-limited, offline={}\n",
+         {} events rate-limited, {} events queue-dropped, offline={}\n",
         status.cpu_pct,
         status.rss_mb,
         status.events_per_sec,
         status.rb_overflows,
         status.rate_limited,
+        status.dropped_events_total,
         status.offline,
     ));
     // The warning itself already led via readiness_note above (event_loss_note
-    // covers both counters, at every tier); this is just the raw numbers.
+    // covers all three counters, at every tier); this is just the raw numbers.
 
     out
 }
