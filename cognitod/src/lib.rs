@@ -5,6 +5,7 @@ pub mod alerts;
 pub mod attribution;
 pub mod bpf_config;
 pub mod cell;
+pub mod cloud;
 pub mod collectors;
 pub mod config;
 pub mod context;
