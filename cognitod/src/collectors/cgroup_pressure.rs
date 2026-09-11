@@ -48,9 +48,12 @@ use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use walkdir::WalkDir;
+
+use crate::incidents::{Incident, IncidentStore};
 
 use super::psi::parse_psi_file;
 
@@ -352,6 +355,10 @@ pub struct CgroupPressureMonitor {
     /// `AttributionSink::claim_report_slot`: a cgroup flipping verdicts
     /// mid-incident is new information, not a repeat.
     last_warned: HashMap<(String, StallVerdict), Instant>,
+    /// Where stall findings are recorded so they are visible through the API
+    /// and MCP tools (`linnix_recent_incidents`, `linnix_explain_incident`),
+    /// not just the daemon logs. `None` keeps the monitor log-only.
+    incident_store: Option<Arc<IncidentStore>>,
 }
 
 impl CgroupPressureMonitor {
@@ -366,6 +373,7 @@ impl CgroupPressureMonitor {
             warn_cooldown: DEFAULT_WARN_COOLDOWN,
             exclude_kubepods_ancestors: false,
             last_warned: HashMap::new(),
+            incident_store: None,
         }
     }
 
@@ -400,6 +408,15 @@ impl CgroupPressureMonitor {
     /// root cgroup) instead of reporting the same stall twice.
     pub fn with_kubernetes(mut self, exists: bool) -> Self {
         self.exclude_kubepods_ancestors = exists;
+        self
+    }
+
+    /// Records stall findings as `cgroup_pressure` incidents so they surface
+    /// through `/incidents` and the MCP tools, not just the daemon logs.
+    /// Takes `Option` to mirror `PsiMonitor`: the store may be unavailable
+    /// (no DB path), in which case the monitor stays log-only.
+    pub fn with_incident_store(mut self, store: Option<Arc<IncidentStore>>) -> Self {
+        self.incident_store = store;
         self
     }
 
@@ -546,11 +563,8 @@ impl CgroupPressureMonitor {
         info!("[cgroup-pressure] starting generic cgroup pressure monitor");
         let mut iterations = 0u64;
         loop {
-            for stall in self.tick() {
-                if self.should_warn(&stall) {
-                    report(&stall);
-                }
-            }
+            let stalls = self.tick();
+            self.handle_stalls(&stalls).await;
             iterations += 1;
             if let Some(max) = self.max_iterations
                 && iterations >= max
@@ -559,6 +573,83 @@ impl CgroupPressureMonitor {
             }
             sleep(self.interval).await;
         }
+    }
+
+    /// Reports one scan's actionable findings: log the warning and, when an
+    /// incident store is configured, record it. Both are gated on
+    /// `should_warn`, so the 15-minute cooldown dedups incident rows exactly
+    /// like it dedups log lines — every logged warning has a matching
+    /// incident, and a verdict flip is new information in both places.
+    async fn handle_stalls(&mut self, stalls: &[CgroupStall]) {
+        for stall in stalls {
+            if self.should_warn(stall) {
+                report(stall);
+                self.record_incident(stall).await;
+            }
+        }
+    }
+
+    /// Best-effort: a failing store must not break the monitoring loop.
+    async fn record_incident(&self, stall: &CgroupStall) {
+        let Some(store) = &self.incident_store else {
+            return;
+        };
+        let incident = incident_from_stall(stall);
+        match store.insert(&incident).await {
+            Ok(id) => debug!("[cgroup-pressure] recorded incident #{id} for {}", stall.cgroup),
+            Err(e) => warn!(
+                "[cgroup-pressure] failed to record incident for {}: {e}",
+                stall.cgroup
+            ),
+        }
+    }
+}
+
+/// Builds the `cgroup_pressure` incident row for one stall finding.
+///
+/// Field mapping, kept honest about what this monitor measures:
+/// * `psi_cpu` / `psi_memory` carry the cgroup's own stall percentages — the
+///   triggering readings, and what `linnix_recent_incidents` shows.
+/// * `cpu_percent` / `load_avg` are host-level fields this monitor doesn't
+///   sample, so they're zero/empty; the per-cgroup truth lives in
+///   `system_snapshot`.
+fn incident_from_stall(stall: &CgroupStall) -> Incident {
+    let snapshot = serde_json::json!({
+        "cgroup": stall.cgroup,
+        "verdict": format!("{:?}", stall.verdict),
+        "cpu_stall_pct": stall.cpu_stall_pct,
+        "cpu_full_pct": stall.cpu_full_pct,
+        "mem_stall_pct": stall.mem_stall_pct,
+        "io_stall_pct": stall.io_stall_pct,
+        "throttled_secs": stall.throttled_secs,
+        "mem_high_events": stall.mem_high_events,
+        "oom_kills": stall.oom_kills,
+        // The percentages are measured kernel counters; the verdict is
+        // inferred from their combination.
+        "evidence": {
+            "stall_percentages": "measured",
+            "throttled_secs": "measured",
+            "event_counts": "measured",
+            "verdict": "inferred",
+        },
+    });
+    Incident {
+        id: None,
+        timestamp: chrono::Utc::now().timestamp(),
+        event_type: "cgroup_pressure".to_string(),
+        psi_cpu: stall.cpu_stall_pct as f32,
+        psi_memory: stall.mem_stall_pct as f32,
+        cpu_percent: 0.0,
+        load_avg: String::new(),
+        action: "alert".to_string(),
+        target_pid: None,
+        target_name: Some(stall.cgroup.clone()),
+        system_snapshot: serde_json::to_string(&snapshot).ok(),
+        llm_analysis: None,
+        llm_analyzed_at: None,
+        investigation: None,
+        recovery_time_ms: None,
+        psi_after: None,
     }
 }
 
@@ -1071,5 +1162,104 @@ mod tests {
                  PsiMonitor owns the kubepods pressure it contains"
             );
         }
+    }
+
+    #[test]
+    fn incident_from_stall_maps_fields() {
+        let stall = CgroupStall {
+            cgroup: "system.slice/nginx.service".to_string(),
+            cpu_stall_pct: 87.3,
+            cpu_full_pct: 12.1,
+            mem_stall_pct: 0.0,
+            io_stall_pct: 5.2,
+            throttled_secs: 0.0,
+            mem_high_events: 0,
+            oom_kills: 0,
+            verdict: StallVerdict::CpuContended,
+        };
+        let incident = incident_from_stall(&stall);
+        assert_eq!(incident.event_type, "cgroup_pressure");
+        assert_eq!(incident.action, "alert");
+        assert_eq!(
+            incident.target_name.as_deref(),
+            Some("system.slice/nginx.service")
+        );
+        assert_eq!(incident.target_pid, None);
+        // The triggering readings ride the psi scalars.
+        assert!((incident.psi_cpu - 87.3).abs() < 0.01);
+        let snapshot: serde_json::Value =
+            serde_json::from_str(incident.system_snapshot.as_deref().unwrap()).unwrap();
+        assert_eq!(snapshot["cgroup"], "system.slice/nginx.service");
+        assert_eq!(snapshot["verdict"], "CpuContended");
+        assert!((snapshot["cpu_stall_pct"].as_f64().unwrap() - 87.3).abs() < 1e-9);
+        assert_eq!(snapshot["evidence"]["verdict"], "inferred");
+        assert_eq!(snapshot["evidence"]["stall_percentages"], "measured");
+    }
+
+    #[tokio::test]
+    async fn contended_cgroup_is_recorded_as_incident() {
+        let tmp = fixture_tree();
+        let db_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            IncidentStore::new(db_dir.path().join("incidents.db"))
+                .await
+                .unwrap(),
+        );
+        let mut mon = CgroupPressureMonitor::new(Duration::from_secs(2))
+            .with_cgroup_root(tmp.path())
+            .with_max_depth(5)
+            .with_incident_store(Some(Arc::clone(&store)));
+        assert!(mon.tick().is_empty());
+        // nginx stalls hard on CPU.
+        write_cgroup(
+            &tmp.path().join("system.slice/nginx.service"),
+            2_000_000 + 9_000_000,
+            100_000,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        let stalls = mon.tick();
+        assert!(!stalls.is_empty());
+        mon.handle_stalls(&stalls).await;
+
+        let incidents = store
+            .recent_filtered(10, Some("cgroup_pressure"), None)
+            .await
+            .unwrap();
+        assert_eq!(incidents.len(), 1, "one stall finding, one incident");
+        let incident = &incidents[0];
+        assert_eq!(
+            incident.target_name.as_deref(),
+            Some("system.slice/nginx.service")
+        );
+        let snapshot: serde_json::Value =
+            serde_json::from_str(incident.system_snapshot.as_deref().unwrap()).unwrap();
+        assert_eq!(snapshot["verdict"], "CpuContended");
+
+        // The cooldown gates recording like it gates logging: handling the
+        // same stalls again must not write a second row.
+        mon.handle_stalls(&stalls).await;
+        let incidents = store
+            .recent_filtered(10, Some("cgroup_pressure"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            incidents.len(),
+            1,
+            "repeat findings inside the cooldown must not duplicate incidents"
+        );
+    }
+
+    #[tokio::test]
+    async fn monitor_without_store_stays_log_only() {
+        // No incident store configured: handle_stalls must not fail, just log.
+        let mut mon =
+            CgroupPressureMonitor::new(Duration::from_secs(2)).with_warn_cooldown(Duration::ZERO);
+        mon.handle_stalls(&[contended_stall("system.slice/nginx.service")])
+            .await;
     }
 }
