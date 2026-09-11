@@ -974,6 +974,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
     }
 
+    // Fork storm monitor: userspace fork-rate detection with no eBPF. The
+    // /proc/stat `processes` counter gives an exact system-wide fork rate
+    // (measured); per-parent attribution comes from PID-set diffs (inferred,
+    // best-effort). Runs on every host — fork storms are host-global, not
+    // cgroup-scoped.
+    {
+        let monitor = cognitod::collectors::fork_storm::ForkStormMonitor::new(
+            std::time::Duration::from_millis(500),
+        )
+        // Storm findings become queryable incidents for the API and MCP
+        // tools, not just log lines.
+        .with_incident_store(incident_store.clone());
+        tokio::spawn(async move {
+            monitor.run().await;
+        });
+    }
+
     // Initialize Slack Notifier
     let _slack_notifier = if let Some(ref notif_cfg) = config.notifications {
         if let Some(ref slack_cfg) = notif_cfg.slack {
