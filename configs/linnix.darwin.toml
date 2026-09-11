@@ -42,3 +42,9 @@ mode = "monitor"  # Options: monitor, enforce
 psi_threshold = 40.0
 cpu_threshold = 90.0
 sustained_seconds = 15
+
+[incidents]
+# Days of incident history to keep in the incident store. Rows older than
+# this are pruned once a day (and once shortly after startup). 0 or unset
+# disables pruning and keeps incidents forever.
+retention_days = 30

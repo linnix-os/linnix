@@ -1245,6 +1245,7 @@ pub async fn healthz(State(app_state): State<Arc<AppState>>) -> axum::Json<serde
         "status": "ok",
         "kernel_instrumentation": if instrumented { "active" } else { "unavailable" },
         "transport": app_state.transport,
+        "incident_retention_days": app_state.incident_retention_days,
     }))
 }
 
@@ -1824,6 +1825,9 @@ pub struct AppState {
     pub slack_signing_secret: Option<String>,
     pub enforcement: Option<Arc<crate::enforcement::EnforcementQueue>>,
     pub incident_store: Option<Arc<IncidentStore>>,
+    /// Configured incident retention in days (`[incidents] retention_days`).
+    /// `None` means pruning is disabled and incidents are kept forever.
+    pub incident_retention_days: Option<u64>,
     pub k8s: Option<Arc<cognitod::k8s::K8sContext>>,
     /// Noisy-neighbour counters fed by the PSI monitor's attribution sink.
     pub blame_metrics: Arc<cognitod::attribution::BlameMetrics>,
@@ -2783,6 +2787,7 @@ mod tests {
             auth_token,
             slack_signing_secret,
             incident_store: None,
+            incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         })
@@ -2805,6 +2810,7 @@ mod tests {
             auth_token: None,
             slack_signing_secret: None,
             incident_store: Some(store),
+            incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         })
@@ -3170,6 +3176,7 @@ mod tests {
             auth_token: None,
             slack_signing_secret: None,
             incident_store: None,
+            incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         })
@@ -3219,6 +3226,7 @@ mod tests {
             auth_token: None,
             slack_signing_secret: None,
             incident_store: None,
+            incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         });
@@ -3281,6 +3289,7 @@ mod tests {
             auth_token: None,
             slack_signing_secret: None,
             incident_store: None,
+            incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         });
@@ -3332,6 +3341,7 @@ mod tests {
             auth_token: None,
             slack_signing_secret: None,
             incident_store: None,
+            incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         });
@@ -3366,6 +3376,7 @@ mod tests {
             auth_token: None,
             slack_signing_secret: None,
             incident_store: None,
+            incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         });
@@ -3403,6 +3414,7 @@ mod tests {
             auth_token: None,
             slack_signing_secret: None,
             incident_store: None,
+            incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         });
@@ -3454,6 +3466,7 @@ mod tests {
             auth_token: None,
             slack_signing_secret: None,
             incident_store: None,
+            incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         });
@@ -3556,6 +3569,7 @@ mod tests {
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
             incident_store: None,
+            incident_retention_days: None,
             auth_token: Some("secret123".to_string()),
             slack_signing_secret: None,
             k8s: None,
@@ -3607,6 +3621,7 @@ mod tests {
             auth_token: Some("secret-from-kubernetes".to_string()),
             slack_signing_secret: None,
             incident_store: None,
+            incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         });
@@ -3674,6 +3689,7 @@ mod tests {
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
             incident_store: None,
+            incident_retention_days: None,
             auth_token: Some("secret123".to_string()),
             slack_signing_secret: None,
             k8s: None,
@@ -3711,6 +3727,7 @@ mod tests {
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
             incident_store: None,
+            incident_retention_days: None,
             auth_token: Some("secret123".to_string()),
             slack_signing_secret: None,
             k8s: None,
@@ -3748,6 +3765,7 @@ mod tests {
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
             incident_store: None,
+            incident_retention_days: None,
             auth_token: Some("secret123".to_string()),
             slack_signing_secret: None,
             k8s: None,
@@ -4026,6 +4044,7 @@ mod tests {
             auth_token: None,
             slack_signing_secret: None,
             incident_store: None,
+            incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::clone(&blame),
         });
@@ -4309,6 +4328,7 @@ mod tests {
             auth_token: None,
             slack_signing_secret: None,
             incident_store: Some(Arc::clone(&store)),
+            incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         });
@@ -4422,6 +4442,7 @@ mod tests {
             auth_token: None,
             slack_signing_secret: None,
             incident_store: Some(Arc::clone(&store)),
+            incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         });
@@ -4748,6 +4769,7 @@ mod tests {
             auth_token: None,
             slack_signing_secret: None,
             incident_store: Some(Arc::clone(&store)),
+            incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         });
@@ -4894,6 +4916,7 @@ mod tests {
             auth_token: None,
             slack_signing_secret: None,
             incident_store: Some(Arc::clone(&store)),
+            incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
         });
@@ -5001,6 +5024,7 @@ mod tests {
             prometheus_enabled: false,
             alert_history: Arc::new(AlertHistory::new(16)),
             incident_store: None,
+            incident_retention_days: None,
             auth_token: Some("secret123".to_string()),
             slack_signing_secret: None,
             k8s: None,

@@ -42,3 +42,8 @@ data:
     attribution_threshold_ms = 100
     # Quiet period before the same offender/victim pair is reported again.
     attribution_cooldown_seconds = 300
+
+    [incidents]
+    # Days of incident history to retain; older rows are pruned once a day.
+    # 0 (or the whole section absent) disables pruning entirely.
+    retention_days = 30

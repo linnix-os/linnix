@@ -215,6 +215,8 @@ pub struct Config {
     #[serde(default)]
     pub episode_capture: EpisodeCaptureConfig,
     #[serde(default)]
+    pub incidents: IncidentsConfig,
+    #[serde(default)]
     pub telemetry: TelemetrySettings,
     /// Top-level sections/keys no field matches. Captured so `--check-config`
     /// can name them; a typo'd `[reasner]` is otherwise indistinguishable from
@@ -353,6 +355,11 @@ impl Config {
                 "unrecognised key `{key}` in [telemetry] (not read by the daemon)"
             ));
         }
+        for key in config.incidents.unknown.keys() {
+            problems.push(format!(
+                "unrecognised key `{key}` in [incidents] (not read by the daemon)"
+            ));
+        }
         problems.extend(config.telemetry.range_problems());
         problems
     }
@@ -389,6 +396,16 @@ impl Config {
             log::warn!(
                 "[config] ignoring unrecognised key(s) in [reasoner]: {}. \
                  These are not read by the daemon and have no effect. \
+                 Run `cognitod --check-config` to validate.",
+                keys.join(", ")
+            );
+        }
+        if !self.incidents.unknown.is_empty() {
+            let keys: Vec<&str> = self.incidents.unknown.keys().map(String::as_str).collect();
+            log::warn!(
+                "[config] ignoring unrecognised key(s) in [incidents]: {}. \
+                 These are not read by the daemon and have no effect — a \
+                 typo'd `retention_day` leaves pruning disabled. \
                  Run `cognitod --check-config` to validate.",
                 keys.join(", ")
             );
@@ -691,6 +708,28 @@ fn default_episode_capture_output_dir() -> String {
     "/var/lib/linnix/episodes".to_string()
 }
 
+/// `[incidents]` — incident store retention.
+///
+/// The incident store would otherwise grow for the lifetime of the daemon.
+/// A background task prunes rows older than the configured TTL once a day
+/// (and once shortly after startup). Unset or 0 disables pruning entirely:
+/// retention is opt-in at the code level, so an existing config that never
+/// mentions this section can never lose rows to it. The shipped default
+/// config sets 30 days.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct IncidentsConfig {
+    /// Days of incident history to retain. `None` (key absent) or `Some(0)`
+    /// means "retain forever" — the prune task is not even spawned.
+    #[serde(default)]
+    pub retention_days: Option<u64>,
+    /// Keys present in `[incidents]` that no field matches. Captured rather
+    /// than discarded so `warn_unknown_keys` and `Config::check` can name
+    /// them — a typo'd `retention_day` is otherwise indistinguishable from
+    /// having configured nothing, and pruning would stay silently disabled.
+    #[serde(flatten)]
+    pub unknown: std::collections::BTreeMap<String, toml::Value>,
+}
+
 fn default_attribution_threshold_ms() -> u64 {
     100
 }
@@ -817,6 +856,35 @@ offline = true
         assert_eq!(cfg.runtime.event_queue_capacity, 4096);
         assert_eq!(cfg.api.listen_addr, "127.0.0.1:3000");
         assert!(cfg.api.auth_token.is_none());
+    }
+
+    #[test]
+    fn incident_retention_is_unset_by_default() {
+        // Absent means retain forever: an existing config that never mentions
+        // the section must not lose rows to pruning.
+        let toml = r#"[runtime]
+offline = true
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.incidents.retention_days, None);
+    }
+
+    #[test]
+    fn incident_retention_days_parses() {
+        let toml = r#"[incidents]
+retention_days = 30
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.incidents.retention_days, Some(30));
+    }
+
+    #[test]
+    fn incident_retention_zero_parses_as_disabled() {
+        let toml = r#"[incidents]
+retention_days = 0
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.incidents.retention_days, Some(0));
     }
 
     #[test]
@@ -1182,6 +1250,33 @@ timeout_ms = 30000
         assert_eq!(problems.len(), 2, "got: {problems:?}");
         assert!(problems.iter().any(|p| p.contains("reasner")));
         assert!(problems.iter().any(|p| p.contains("window_seconds")));
+    }
+
+    #[test]
+    fn check_flags_a_misspelled_incidents_key() {
+        // Without the unknown-key capture, a typo'd `retention_day` parses
+        // fine, `retention_days` stays `None`, and pruning stays silently
+        // disabled. The check must name the key.
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "[incidents]\nretention_day = 30").unwrap();
+
+        let problems = Config::check(file.path());
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("retention_day") && p.contains("[incidents]")),
+            "a typo'd [incidents] key must be flagged, got: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn check_passes_a_correct_incidents_section() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "[incidents]\nretention_days = 30").unwrap();
+        assert!(
+            Config::check(file.path()).is_empty(),
+            "a correct [incidents] section must be clean"
+        );
     }
 
     #[test]
