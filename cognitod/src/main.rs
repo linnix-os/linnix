@@ -1023,6 +1023,39 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
     }
 
+    // Memory leak trend monitor: per-process RSS from /proc/<pid>/statm
+    // sampled every 30s, least-squares fit over a 15-min window. Fires on a
+    // sustained positive trend (R² > 0.8, >50MB fitted growth) — reported
+    // as "consistent with a leak", never a leak (inferred).
+    {
+        let monitor = cognitod::collectors::memory_leak::MemoryLeakMonitor::new(
+            std::time::Duration::from_secs(30),
+        )
+        // Leak findings become queryable incidents for the API and MCP
+        // tools, not just log lines.
+        .with_incident_store(incident_store.clone());
+        tokio::spawn(async move {
+            monitor.run().await;
+        });
+    }
+
+    // OOM kill witness: /proc/vmstat oom_kill Δ (host-wide, measured) plus
+    // per-cgroup memory.events max Δ (deepest cgroup attributed), with
+    // best-effort victim identity from the kernel ring buffer. Complements
+    // the cgroup pressure monitor's OomKill stall verdict with a dedicated
+    // incident type and victim attribution.
+    {
+        let monitor = cognitod::collectors::oom_witness::OomWitnessMonitor::new(
+            std::time::Duration::from_secs(10),
+        )
+        // Kill findings become queryable incidents for the API and MCP
+        // tools, not just log lines.
+        .with_incident_store(incident_store.clone());
+        tokio::spawn(async move {
+            monitor.run().await;
+        });
+    }
+
     // Initialize Slack Notifier
     let _slack_notifier = if let Some(ref notif_cfg) = config.notifications {
         if let Some(ref slack_cfg) = notif_cfg.slack {
