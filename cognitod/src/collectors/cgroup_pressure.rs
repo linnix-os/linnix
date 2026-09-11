@@ -596,7 +596,10 @@ impl CgroupPressureMonitor {
         };
         let incident = incident_from_stall(stall);
         match store.insert(&incident).await {
-            Ok(id) => debug!("[cgroup-pressure] recorded incident #{id} for {}", stall.cgroup),
+            Ok(id) => debug!(
+                "[cgroup-pressure] recorded incident #{id} for {}",
+                stall.cgroup
+            ),
             Err(e) => warn!(
                 "[cgroup-pressure] failed to record incident for {}: {e}",
                 stall.cgroup
