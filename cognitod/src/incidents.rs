@@ -685,6 +685,14 @@ impl IncidentStore {
             .await
     }
 
+    /// Test-only: simulates a transient store outage by closing the pool,
+    /// so inserts and queries fail with `PoolClosed`. The pool cannot be
+    /// reopened — build a new store to recover.
+    #[cfg(test)]
+    pub(crate) async fn close_pool_for_test(&self) {
+        self.pool.close().await;
+    }
+
     /// Get recent incidents, optionally filtered by event type and analysis state
     pub async fn recent_filtered(
         &self,

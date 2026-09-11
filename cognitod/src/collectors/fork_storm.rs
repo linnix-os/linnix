@@ -11,7 +11,9 @@
 //! * **Rate (measured):** `/proc/stat` `processes` is sampled every 0.5s and
 //!   the rate is computed over a 10s sliding window. Warn at >= 15 forks/s,
 //!   critical at >= 60 forks/s — the prototype-validated defaults from the
-//!   userspace detector spec (D3).
+//!   userspace detector spec (D3). While the window is still filling
+//!   (startup, re-baseline) the delta is normalized against the full
+//!   window, so warm-up noise can't inflate into a storm verdict.
 //! * **Attribution (inferred, best-effort):** while the measured rate is
 //!   elevated, each poll diffs the PID set against the previous poll and
 //!   attributes new PIDs to their parents. Children that live less than the
@@ -186,6 +188,11 @@ pub struct ForkStormMonitor {
     /// parent+verdict, mirroring the cgroup pressure monitor: a verdict
     /// *change* is new information, not a repeat.
     last_warned: HashMap<(String, ForkVerdict), Instant>,
+    /// Whether the last incident-record attempt failed. A failing store
+    /// during a storm would otherwise log every 500 ms poll; the first
+    /// failure logs at warn level and repeats stay at debug until a
+    /// record succeeds again.
+    record_unhealthy: bool,
     /// Where storm findings are recorded so they are visible through the API
     /// and MCP tools, not just the daemon logs. `None` keeps the monitor
     /// log-only.
@@ -203,6 +210,7 @@ impl ForkStormMonitor {
             warn_cooldown: DEFAULT_WARN_COOLDOWN,
             max_iterations: None,
             last_warned: HashMap::new(),
+            record_unhealthy: false,
             incident_store: None,
         }
     }
@@ -236,11 +244,14 @@ impl ForkStormMonitor {
         self
     }
 
-    /// Reporting gate for [`ForkStormMonitor::run`]: true the first time a
-    /// parent reports a given verdict, and again once the cooldown has
+    /// Log-reporting gate for [`ForkStormMonitor::run`]: true the first time
+    /// a parent reports a given verdict, and again once the cooldown has
     /// elapsed. A verdict *change* for the same parent always reports.
-    /// `tick()` itself is unthrottled so tests and future API consumers see
-    /// every window's measurement.
+    /// This gates the log line only — incident recording is decided
+    /// separately against the store (see `handle_burst`), so a failed
+    /// insert is retried on the next scan instead of being swallowed by
+    /// this cooldown. `tick()` itself is unthrottled so tests and future
+    /// API consumers see every window's measurement.
     fn should_warn(&mut self, burst: &ForkStorm) -> bool {
         if self.warn_cooldown.is_zero() {
             return true;
@@ -278,6 +289,16 @@ impl ForkStormMonitor {
     /// `(rate, forks_in_window, window_secs)` from the samples inside the
     /// sliding window. `None` until at least two samples exist — the first
     /// poll only establishes the baseline.
+    ///
+    /// The rate is normalized against the full [`WINDOW`], not the shorter
+    /// span the samples cover while the window is still filling (right
+    /// after startup or a counter-regression re-baseline). Dividing a
+    /// warm-up delta by its short span would inflate a handful of ordinary
+    /// forks into a storm: eight forks in the first 500 ms are 0.8
+    /// forks/s over the intended 10-second window, not 16. Normalizing
+    /// underestimates during warm-up and converges to the true rate as the
+    /// window fills — a real storm still trips the warn threshold within
+    /// seconds, while warm-up noise never does.
     fn window_rate(&self) -> Option<(f64, u64, f64)> {
         let &(first_t, first_n) = self.samples.front()?;
         let &(last_t, last_n) = self.samples.back()?;
@@ -286,8 +307,8 @@ impl ForkStormMonitor {
         if self.samples.len() < 2 || last_t <= first_t {
             return None;
         }
-        let window_secs = last_t.duration_since(first_t).as_secs_f64();
         let window_forks = last_n.saturating_sub(first_n);
+        let window_secs = WINDOW.as_secs_f64();
         Some((window_forks as f64 / window_secs, window_forks, window_secs))
     }
 
@@ -396,24 +417,27 @@ impl ForkStormMonitor {
     }
 
     /// Reports one actionable finding: log the warning and, when an incident
-    /// store is configured, record it. Logging is gated on `should_warn`'s
-    /// cooldown; recording is additionally checked against the store itself,
-    /// which is the source of truth for what was persisted. A storm the store
-    /// already has — because the bounded cooldown map evicted it, or a
-    /// daemon restart cleared the map — is still logged above (the storm is
-    /// real and ongoing) but is not recorded twice.
+    /// store is configured, record it.
+    ///
+    /// Logging rides `should_warn`'s cooldown — a storm is one log line,
+    /// not one per poll. Recording is gated only on the store itself,
+    /// which is the source of truth for what was persisted: the log
+    /// cooldown never suppresses a record attempt, so a transient insert
+    /// failure is retried on the next scan instead of vanishing for the
+    /// whole cooldown. A storm the store already has — because the bounded
+    /// cooldown map evicted it, or a daemon restart cleared the map — is
+    /// still logged above (the storm is real and ongoing) but is not
+    /// recorded twice.
     async fn handle_burst(&mut self, burst: &ForkStorm) {
-        let mut recorded = self.recently_recorded_keys().await;
-        if !self.should_warn(burst) {
-            return;
+        if self.should_warn(burst) {
+            report(burst);
         }
-        report(burst);
+        let recorded = self.recently_recorded_keys().await;
         let key = (burst.parent_label(), format!("{:?}", burst.verdict));
         if recorded.contains(&key) {
             return;
         }
         self.record_incident(burst).await;
-        recorded.insert(key);
     }
 
     /// `(parent, verdict)` pairs already incidented within the cooldown
@@ -438,20 +462,36 @@ impl ForkStormMonitor {
     }
 
     /// Best-effort: a failing store must not break the monitoring loop.
-    async fn record_incident(&self, burst: &ForkStorm) {
+    /// The first failure logs at warn level; repeats stay at debug until a
+    /// record succeeds, since `handle_burst` retries the insert on every
+    /// scan while the storm continues.
+    async fn record_incident(&mut self, burst: &ForkStorm) {
         let Some(store) = &self.incident_store else {
             return;
         };
         let incident = incident_from_burst(burst);
         match store.insert(&incident).await {
-            Ok(id) => debug!(
-                "[fork-storm] recorded incident #{id} for {}",
-                burst.parent_label()
-            ),
-            Err(e) => warn!(
-                "[fork-storm] failed to record incident for {}: {e}",
-                burst.parent_label()
-            ),
+            Ok(id) => {
+                debug!(
+                    "[fork-storm] recorded incident #{id} for {}",
+                    burst.parent_label()
+                );
+                self.record_unhealthy = false;
+            }
+            Err(e) => {
+                if self.record_unhealthy {
+                    debug!(
+                        "[fork-storm] still failing to record incident for {}: {e}",
+                        burst.parent_label()
+                    );
+                } else {
+                    warn!(
+                        "[fork-storm] failed to record incident for {}: {e}",
+                        burst.parent_label()
+                    );
+                    self.record_unhealthy = true;
+                }
+            }
         }
     }
 }
@@ -904,8 +944,9 @@ mod tests {
             serde_json::from_str(incident.system_snapshot.as_deref().unwrap()).unwrap();
         assert_eq!(snapshot["verdict"], "StormCritical");
 
-        // The cooldown gates recording like it gates logging: handling the
-        // same finding again must not write a second row.
+        // The store already has this finding: handling it again must not
+        // write a second row. Recording is decided against the store, not
+        // the log cooldown.
         mon.handle_burst(&burst).await;
         let incidents = store
             .recent_filtered(10, Some("fork_storm"), None)
@@ -936,6 +977,74 @@ mod tests {
             1,
             "a restarted monitor must not duplicate incidents the store already has"
         );
+    }
+
+    #[test]
+    fn warmup_deltas_are_normalized_against_full_window() {
+        // Eight ordinary forks in the first 500 ms are 0.8 forks/s over the
+        // intended 10-second window — not 16/s, not a storm.
+        let fake = FakeProc::new();
+        let mut mon = fake.monitor();
+        let t0 = Instant::now();
+        assert!(mon.tick_at(t0).is_none());
+        fake.set_counter(8);
+        assert!(
+            mon.tick_at(t0 + Duration::from_millis(500)).is_none(),
+            "warm-up forks must be normalized against the full window"
+        );
+        // Thirty forks in the first second: 3/s normalized, not critical.
+        fake.set_counter(30);
+        assert!(
+            mon.tick_at(t0 + Duration::from_secs(1)).is_none(),
+            "a short burst must not read as critical during warm-up"
+        );
+        // A genuinely sustained storm still fires: 600 forks over the
+        // full 10 s window is 60/s.
+        fake.set_counter(600);
+        let burst = mon
+            .tick_at(t0 + Duration::from_secs(10))
+            .expect("sustained 60 forks/s must be critical");
+        assert_eq!(burst.verdict, ForkVerdict::StormCritical);
+        assert!((burst.forks_per_sec - 60.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn failed_insert_is_retried_on_the_next_scan() {
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("incidents.db");
+        let burst = warning_burst("runaway.sh");
+
+        // The store is down: the finding is logged, but the failed insert
+        // must not poison future record attempts — recording has no
+        // in-memory cooldown, only the store's own contents.
+        let down_store = Arc::new(IncidentStore::new(&db_path).await.unwrap());
+        down_store.close_pool_for_test().await;
+        let mut mon = ForkStormMonitor::new(Duration::from_millis(500))
+            .with_incident_store(Some(Arc::clone(&down_store)));
+        mon.handle_burst(&burst).await;
+
+        // The store recovers (fresh pool on the same file). The next scan
+        // must retry the insert instead of sitting out a cooldown.
+        let up_store = Arc::new(IncidentStore::new(&db_path).await.unwrap());
+        mon.incident_store = Some(Arc::clone(&up_store));
+        mon.handle_burst(&burst).await;
+        let incidents = up_store
+            .recent_filtered(10, Some("fork_storm"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            incidents.len(),
+            1,
+            "a failed insert must be retried once the store recovers"
+        );
+
+        // And the now-recorded finding dedups against the store: no second row.
+        mon.handle_burst(&burst).await;
+        let incidents = up_store
+            .recent_filtered(10, Some("fork_storm"), None)
+            .await
+            .unwrap();
+        assert_eq!(incidents.len(), 1, "a recorded finding must not duplicate");
     }
 
     #[tokio::test]
