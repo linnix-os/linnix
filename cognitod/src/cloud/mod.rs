@@ -14,12 +14,18 @@
 //!   leave the node unless explicitly opted in.
 //! - [`seal`] — batch assembly with the schema's seal triggers.
 //! - [`spool`] — crash-safe on-disk spool with caps and drop priorities.
+//! - [`sender`] — HTTPS POST with the schema's retry/quarantine semantics.
+//! - [`exporter`] — the background loop wiring it all together.
 
+pub mod exporter;
 pub mod identity;
 pub mod model;
 pub mod scrub;
 pub mod seal;
+pub mod sender;
 pub mod spool;
+
+pub use exporter::{ExporterConfig, QualitySnapshot, spawn_exporter};
 
 use std::io;
 use std::path::Path;

@@ -973,6 +973,63 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .unwrap_or_else(|| "unknown".to_string()),
     ));
 
+    // Linnix Cloud exporter: strictly opt-in. Spawns only when [cloud] is
+    // explicitly enabled with an endpoint, tenant, and token; anything that
+    // fails here logs and continues — export can never break monitoring or
+    // the local API. Absent or disabled config means no task and no network.
+    {
+        let cloud = &config.cloud;
+        let env_token = std::env::var("LINNIX_CLOUD_TOKEN").ok();
+        if cloud.usable(env_token.as_deref()) {
+            if !cloud.endpoint_allows_plaintext() {
+                warn!(
+                    "[cognitod] [cloud] endpoint {:?} rejected: plain http:// is only allowed for loopback test targets; cloud export disabled",
+                    cloud.endpoint.as_deref().unwrap_or("")
+                );
+            } else if let Some(store) = incident_store.clone() {
+                let token = cognitod::config::effective_cloud_token(
+                    env_token.as_deref(),
+                    cloud.bearer_token.as_deref(),
+                )
+                .expect("usable() checked the token");
+                // Identity and spool live next to the incident database.
+                let state_dir = incident_db_path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                let exporter_config = cognitod::cloud::ExporterConfig {
+                    endpoint: cloud
+                        .endpoint
+                        .clone()
+                        .expect("usable() checked the endpoint"),
+                    token,
+                    tenant_id: cloud
+                        .tenant_id
+                        .clone()
+                        .expect("usable() checked the tenant"),
+                    cluster_id_override: cloud.cluster_id.clone(),
+                    node_id_override: cloud.node_id.clone(),
+                    export_process_identity: cloud.export_process_identity,
+                    state_dir,
+                    quality: cognitod::cloud::QualitySnapshot {
+                        transport: transport.to_string(),
+                        btf_available: probe_state.btf_available,
+                        rss_probe: match probe_state.rss_probe {
+                            RssProbeMode::Disabled => "unavailable".to_string(),
+                            _ => "measured".to_string(),
+                        },
+                    },
+                };
+                cognitod::cloud::spawn_exporter(exporter_config, store, blame_metrics.clone());
+                info!("[cognitod] cloud exporter enabled");
+            } else {
+                warn!(
+                    "[cognitod] [cloud] enabled but the incident store failed to initialize; cloud export disabled"
+                );
+            }
+        }
+    }
+
     // Start PSI monitor (after incident store is ready)
     if let Some(ctx) = &k8s_context {
         let sink = Arc::new(
