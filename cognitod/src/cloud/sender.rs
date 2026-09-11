@@ -92,6 +92,19 @@ pub fn parse_retry_after(value: Option<&str>) -> Option<Duration> {
     value?.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
 
+/// Extract `Retry-After` for retryable statuses: 429 and 5xx (schema §10:
+/// "honor Retry-After" — a `503 Retry-After: 120` must not fall back to the
+/// shorter local backoff). Pure, unit-tested.
+fn retry_after_for(status: u16, headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    if status != 429 && !(500..=599).contains(&status) {
+        return None;
+    }
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| parse_retry_after(Some(v)))
+}
+
 pub fn gzip_body(bytes: &[u8]) -> Vec<u8> {
     let mut enc = GzEncoder::new(Vec::new(), Compression::default());
     enc.write_all(bytes).expect("gzip into memory cannot fail");
@@ -132,15 +145,7 @@ impl Sender {
         match response {
             Ok(resp) => {
                 let status = resp.status().as_u16();
-                // Honor Retry-After on 429 before falling back to backoff.
-                let retry_after = (status == 429)
-                    .then(|| {
-                        resp.headers()
-                            .get(reqwest::header::RETRY_AFTER)
-                            .and_then(|v| v.to_str().ok())
-                    })
-                    .flatten()
-                    .and_then(|v| parse_retry_after(Some(v)));
+                let retry_after = retry_after_for(status, resp.headers());
                 match classify_status(status) {
                     SendDecision::Retry { .. } => SendDecision::Retry {
                         retry_after: retry_after.unwrap_or(BACKOFF_BASE),
@@ -219,6 +224,40 @@ mod tests {
         );
         assert_eq!(parse_retry_after(None), None);
         assert_eq!(parse_retry_after(Some("not-a-number")), None);
+    }
+
+    fn headers_with_retry_after(value: &str) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_str(value).unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn retry_after_honored_on_429_and_5xx_only() {
+        let headers = headers_with_retry_after("120");
+        let empty = reqwest::header::HeaderMap::new();
+        // 429 and retryable 5xx honor the header...
+        assert_eq!(
+            retry_after_for(429, &headers),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            retry_after_for(503, &headers),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            retry_after_for(500, &headers),
+            Some(Duration::from_secs(120))
+        );
+        // ...a missing header falls back to the caller's backoff...
+        assert_eq!(retry_after_for(503, &empty), None);
+        // ...and non-retryable statuses never honor it.
+        assert_eq!(retry_after_for(200, &headers), None);
+        assert_eq!(retry_after_for(409, &headers), None);
+        assert_eq!(retry_after_for(400, &headers), None);
     }
 
     #[test]

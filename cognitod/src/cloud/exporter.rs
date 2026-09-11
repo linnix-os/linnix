@@ -29,7 +29,7 @@ use super::model::{
     TimeRange, Transport, detection_type_for, rfc3339,
 };
 use super::scrub::{ScrubPolicy, scrub_snapshot};
-use super::seal::{BatchSealer, SealContext, SealedBatch};
+use super::seal::{BatchSealer, PushOutcome, SealContext, SealIdentity, SealedBatch};
 use super::sender::{SendDecision, Sender, backoff_delay};
 use super::spool::{Spool, SpoolPriority};
 use super::{EXPORT_PULL_LIMIT, HEARTBEAT_INTERVAL_SECS, SEAL_INTERVAL_SECS};
@@ -85,6 +85,26 @@ pub fn spawn_exporter(
     })
 }
 
+/// Build a batch sealer bound to the exporter's identity. The sealer needs
+/// the identity fields at construction time for its exact prospective
+/// envelope-size accounting — it must see the same strings that
+/// [`SealContext`] will carry at seal time.
+fn new_sealer(
+    quality: AttributionQuality,
+    tenant_id: &str,
+    identity: &IdentityStore,
+) -> BatchSealer {
+    BatchSealer::new(
+        quality,
+        SealIdentity {
+            tenant_id: tenant_id.to_string(),
+            cluster_id: identity.cluster_id().to_string(),
+            node_id: identity.node_id().to_string(),
+            agent_instance_id: identity.agent_instance_id().to_string(),
+        },
+    )
+}
+
 pub struct Exporter {
     config: ExporterConfig,
     identity: IdentityStore,
@@ -103,10 +123,14 @@ pub struct Exporter {
     blame: Arc<BlameMetrics>,
     start: Instant,
     state_since: String,
-    heartbeat_count: u64,
     last_heartbeat: Instant,
     consecutive_failures: u32,
     last_evictions: u64,
+    /// Events deliberately dropped as individually oversized (the edge
+    /// would quarantine an oversized batch, so one pathological snapshot
+    /// must not wedge the pipeline). Counted in the heartbeat's dropped
+    /// total; the watermark advances past them on purpose.
+    oversize_dropped: u64,
     policy: ScrubPolicy,
     backoff: fn(u32) -> Duration,
 }
@@ -130,29 +154,32 @@ impl Exporter {
         let policy = ScrubPolicy::from_opt_in(config.export_process_identity);
         let watermark = identity.export_watermark();
         let last_evictions = blame.evictions();
+        let sealer = new_sealer(quality, &config.tenant_id, &identity);
         let mut exporter = Self {
             config,
             identity,
             spool,
             sender,
-            sealer: BatchSealer::new(quality),
+            sealer,
             pushed_watermark: watermark,
             pending_priority: SpoolPriority::Heartbeat,
             store,
             blame,
             start: Instant::now(),
             state_since: rfc3339(Utc::now().timestamp()),
-            heartbeat_count: 0,
             last_heartbeat: Instant::now() - Duration::from_secs(HEARTBEAT_INTERVAL_SECS),
             consecutive_failures: 0,
             last_evictions,
+            oversize_dropped: 0,
             policy,
             backoff: backoff_delay,
         };
         // The first batch always opens with the current degradation state so
         // the edge learns the quality before the first heartbeat arrives.
         let degradation = exporter.degradation_event();
-        exporter.push_event(degradation, SpoolPriority::DegradationState);
+        exporter
+            .push_event(degradation, SpoolPriority::DegradationState)
+            .await;
         info!(
             "[cloud] exporter initialized (node {}, cluster {}, quality {:?})",
             exporter.identity.node_id(),
@@ -169,9 +196,10 @@ impl Exporter {
         let quality = self.config.quality.quality();
         if quality != self.sealer.quality() {
             self.seal_and_spool().await;
-            self.sealer = BatchSealer::new(quality);
+            self.sealer = new_sealer(quality, &self.config.tenant_id, &self.identity);
             let degradation = self.degradation_event();
-            self.push_event(degradation, SpoolPriority::DegradationState);
+            self.push_event(degradation, SpoolPriority::DegradationState)
+                .await;
             info!("[cloud] attribution quality changed to {quality:?}; emitted degradation_state");
         }
 
@@ -182,25 +210,39 @@ impl Exporter {
         {
             Ok(incidents) => {
                 for incident in &incidents {
+                    let buffered = match self.detection_event(incident) {
+                        Some(event) => self.push_event(event, SpoolPriority::Detection).await,
+                        None => {
+                            debug!(
+                                "[cloud] skipping incident {:?} (unmapped type {:?})",
+                                incident.id, incident.event_type
+                            );
+                            // Deliberate skip: don't re-pull it forever.
+                            true
+                        }
+                    };
+                    if !buffered {
+                        // The batch is full and the spool is failing: stop
+                        // the pull with the watermark behind this incident so
+                        // it's retried next tick instead of being skipped.
+                        warn!(
+                            "[cloud] could not buffer incident {:?}; pausing pull until the spool recovers",
+                            incident.id
+                        );
+                        break;
+                    }
                     if let Some(id) = incident.id {
                         self.pushed_watermark = self.pushed_watermark.max(id);
-                    }
-                    match self.detection_event(incident) {
-                        Some(event) => self.push_event(event, SpoolPriority::Detection),
-                        None => debug!(
-                            "[cloud] skipping incident {:?} (unmapped type {:?})",
-                            incident.id, incident.event_type
-                        ),
                     }
                 }
             }
             Err(e) => warn!("[cloud] incident pull failed: {e}; will retry next tick"),
         }
 
-        if self.last_heartbeat.elapsed() >= Duration::from_secs(HEARTBEAT_INTERVAL_SECS) {
-            self.heartbeat_count += 1;
-            let heartbeat = self.heartbeat_event();
-            self.push_event(heartbeat, SpoolPriority::Heartbeat);
+        if self.last_heartbeat.elapsed() >= Duration::from_secs(HEARTBEAT_INTERVAL_SECS)
+            && let Some(heartbeat) = self.heartbeat_event()
+        {
+            self.push_event(heartbeat, SpoolPriority::Heartbeat).await;
             self.last_heartbeat = Instant::now();
         }
 
@@ -220,13 +262,55 @@ impl Exporter {
         }
     }
 
-    fn push_event(&mut self, event: Event, priority: SpoolPriority) {
-        self.pending_priority = self.pending_priority.min(priority);
-        self.sealer.push(event);
+    /// Buffer an event, sealing the current batch first when the next
+    /// event wouldn't fit. Returns `true` when the event was buffered or
+    /// deliberately dropped (oversize); `false` when the batch is full and
+    /// the spool is failing, in which case the caller must NOT advance the
+    /// watermark past the event.
+    async fn push_event(&mut self, event: Event, priority: SpoolPriority) -> bool {
+        match self.sealer.try_push(event) {
+            PushOutcome::Accepted => {
+                self.pending_priority = self.pending_priority.min(priority);
+                true
+            }
+            PushOutcome::BatchFull(event) => {
+                // Mid-pull seal: make the full batch durable, then buffer
+                // into a fresh batch and continue.
+                let was_empty = self.sealer.is_empty();
+                self.seal_and_spool().await;
+                if !was_empty && !self.sealer.is_empty() {
+                    // seal_and_spool failed and the buffer is still full.
+                    return false;
+                }
+                match self.sealer.try_push(*event) {
+                    PushOutcome::Accepted => {
+                        self.pending_priority = self.pending_priority.min(priority);
+                        true
+                    }
+                    // try_push filters oversize before the BatchFull check,
+                    // so a drained sealer always accepts — this is a bug.
+                    other => {
+                        error!("[cloud] event rejected by fresh sealer ({other:?}); dropping");
+                        self.oversize_dropped = self.oversize_dropped.saturating_add(1);
+                        true
+                    }
+                }
+            }
+            PushOutcome::DroppedOversize { bytes } => {
+                // Deliberate: the edge would quarantine an oversized batch,
+                // so one pathological snapshot must not wedge the pipeline.
+                // The watermark advances past it on purpose.
+                warn!("[cloud] dropping oversized event ({bytes} bytes > batch cap)");
+                self.oversize_dropped = self.oversize_dropped.saturating_add(1);
+                true
+            }
+        }
     }
 
-    /// Seal the buffered events and spool the batch. The watermark advances
-    /// only after the batch is durable on disk.
+    /// Seal the buffered events and spool the batch. The buffer is cleared
+    /// and the watermark advances only after the batch is durable on disk —
+    /// a failed spool leaves the events buffered for retry, so a later
+    /// successful batch can never advance the watermark past them.
     async fn seal_and_spool(&mut self) {
         if self.sealer.is_empty() {
             return;
@@ -250,12 +334,15 @@ impl Exporter {
         let priority = self.pending_priority;
         match self.spool.store(&batch, priority) {
             Ok(()) => {
+                self.sealer.clear();
                 if let Err(e) = self.identity.set_export_watermark(self.pushed_watermark) {
                     error!("[cloud] spooled batch {sequence} but failed to persist watermark: {e}");
                 }
                 self.pending_priority = SpoolPriority::Heartbeat;
             }
-            Err(e) => error!("[cloud] spool store failed for batch {sequence}: {e}"),
+            Err(e) => error!(
+                "[cloud] spool store failed for batch {sequence}: {e}; events stay buffered for retry"
+            ),
         }
     }
 
@@ -268,17 +355,32 @@ impl Exporter {
                 Ok(b) => b,
                 Err(e) => {
                     warn!("[cloud] spooled batch {sequence} unreadable ({e}); dropping");
-                    let _ = self.spool.remove(sequence);
+                    if let Err(remove_err) = self.spool.remove(sequence) {
+                        error!(
+                            "[cloud] failed to remove unreadable batch {sequence}: {remove_err}; \
+                             will retry next drain"
+                        );
+                    }
                     continue;
                 }
             };
             match self.sender.post_batch(&bytes).await {
                 SendDecision::Acked => {
-                    let _ = self.spool.remove(sequence);
+                    if let Err(e) = self.spool.remove(sequence) {
+                        error!(
+                            "[cloud] edge acked batch {sequence} but spool removal failed: {e}; \
+                             will retry the ack next drain"
+                        );
+                    }
                     self.consecutive_failures = 0;
                 }
                 SendDecision::Quarantine { reason } => {
-                    let _ = self.spool.quarantine(sequence, &reason);
+                    if let Err(e) = self.spool.quarantine(sequence, &reason) {
+                        error!(
+                            "[cloud] failed to quarantine refused batch {sequence}: {e}; \
+                             will retry next drain"
+                        );
+                    }
                     self.consecutive_failures = 0;
                 }
                 SendDecision::Retry { retry_after } => {
@@ -295,16 +397,28 @@ impl Exporter {
         }
     }
 
-    fn heartbeat_event(&mut self) -> Event {
-        let n = self.heartbeat_count;
+    fn heartbeat_event(&mut self) -> Option<Event> {
+        // The idempotency key must never repeat with a different body —
+        // including across daemon restarts, where in-memory counters reset.
+        // The counter is persisted in the identity file for exactly this.
+        let n = match self.identity.next_heartbeat_seq() {
+            Ok(n) => n,
+            Err(e) => {
+                error!(
+                    "[cloud] cannot persist heartbeat sequence: {e}; skipping heartbeat this tick"
+                );
+                return None;
+            }
+        };
         let node_id = self.identity.node_id();
+        let instance = self.identity.agent_instance_id();
         let quality = self.sealer.quality();
         let evicted_total = self.blame.evictions();
         let evicted_delta = evicted_total.saturating_sub(self.last_evictions);
         self.last_evictions = evicted_total;
-        Event {
+        Some(Event {
             event_id: format!("hb-{node_id}-{n}"),
-            event_idempotency_key: format!("e:hb:{node_id}:{n}"),
+            event_idempotency_key: format!("e:hb:{instance}:{n}"),
             event_type: EventType::Heartbeat,
             occurred_at: rfc3339(Utc::now().timestamp()),
             detail_level: DetailLevel::Summary,
@@ -323,7 +437,10 @@ impl Exporter {
                 btf_available: self.config.quality.btf_available,
                 active_node: true,
                 events_buffered: self.spool.pending_events(),
-                events_dropped_total: self.spool.dropped_total(),
+                events_dropped_total: self
+                    .spool
+                    .dropped_total()
+                    .saturating_add(self.oversize_dropped),
                 blame_series_active: self
                     .blame
                     .victim_series()
@@ -332,7 +449,7 @@ impl Exporter {
                 blame_series_evicted_total: evicted_total,
                 blame_series_evicted_delta: evicted_delta,
             }),
-        }
+        })
     }
 
     fn degradation_event(&self) -> Event {
@@ -481,13 +598,11 @@ mod tests {
         dir: tempfile::TempDir,
     }
 
-    async fn harness(endpoint: &str) -> TestHarness {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            IncidentStore::new(dir.path().join("incidents.db"))
-                .await
-                .unwrap(),
-        );
+    async fn build_exporter(
+        state_dir: &std::path::Path,
+        endpoint: &str,
+        store: Arc<IncidentStore>,
+    ) -> Exporter {
         let blame = Arc::new(BlameMetrics::new("test-node"));
         let config = ExporterConfig {
             endpoint: endpoint.to_string(),
@@ -496,16 +611,27 @@ mod tests {
             cluster_id_override: Some("clu_test".to_string()),
             node_id_override: Some("node_test".to_string()),
             export_process_identity: false,
-            state_dir: dir.path().to_path_buf(),
+            state_dir: state_dir.to_path_buf(),
             quality: QualitySnapshot {
                 transport: "userspace".to_string(),
                 btf_available: false,
                 rss_probe: "unavailable".to_string(),
             },
         };
-        let mut exporter = Exporter::new(config, store.clone(), blame).await.unwrap();
+        let mut exporter = Exporter::new(config, store, blame).await.unwrap();
         // Keep retry-path tests fast; production uses exponential backoff.
         exporter.backoff = |_| Duration::from_millis(1);
+        exporter
+    }
+
+    async fn harness(endpoint: &str) -> TestHarness {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            IncidentStore::new(dir.path().join("incidents.db"))
+                .await
+                .unwrap(),
+        );
+        let exporter = build_exporter(dir.path(), endpoint, store.clone()).await;
         TestHarness {
             exporter,
             store,
@@ -532,6 +658,10 @@ mod tests {
             ("cgroup_pressure", "cgroup_pressure"),
             ("oom_kill", "oom_kill"),
             ("circuit_breaker", "circuit_breaker"),
+            // Recorded circuit-breaker variants normalize instead of
+            // skipping (their rows still advance the watermark).
+            ("circuit_breaker_cpu", "circuit_breaker"),
+            ("circuit_breaker_memory", "circuit_breaker"),
         ];
         for (local, cloud) in cases {
             let incident = sample_incident(
@@ -606,6 +736,145 @@ mod tests {
         // The next tick pulls nothing new — no duplicate events buffered.
         exporter.tick().await;
         assert_eq!(exporter.pushed_watermark, 2);
+    }
+
+    #[tokio::test]
+    async fn oversized_pull_seals_mid_tick_without_watermark_loss() {
+        let h = harness("http://127.0.0.1:9/unused").await;
+        for _ in 0..600 {
+            h.store
+                .insert(&sample_incident(None, "fork_storm", None))
+                .await
+                .unwrap();
+        }
+        let mut exporter = h.exporter;
+        // Tick 1 pulls 500 rows (EXPORT_PULL_LIMIT). The sealer already
+        // holds the startup degradation event, so the 500th detection
+        // doesn't fit: the batch seals mid-pull and the pull continues
+        // into a fresh batch.
+        exporter.tick().await;
+        assert_eq!(exporter.spool.batch_count(), 1);
+        // The mid-pull seal persisted the watermark for the 499 incidents
+        // in the sealed batch; the 500th is buffered but not yet sealed.
+        assert_eq!(exporter.identity.export_watermark(), 499);
+        assert_eq!(exporter.pushed_watermark, 500);
+
+        // Tick 2 pulls the remaining 100 rows. (Tick 1's drain backoff
+        // sleeps 5s, so the time-based seal fires here too — the point is
+        // the watermark accounting, not which tick sealed.)
+        exporter.tick().await;
+        assert_eq!(exporter.pushed_watermark, 600);
+        exporter.seal_and_spool().await; // no-op if tick 2 already sealed
+        assert_eq!(exporter.spool.batch_count(), 2);
+        assert_eq!(exporter.identity.export_watermark(), 600);
+
+        // All 600 detections made it into exactly two batches, in order,
+        // with no gaps and no duplicates.
+        let mut detection_ids: Vec<i64> = Vec::new();
+        let mut batch_sizes = Vec::new();
+        for seq in [0, 1] {
+            let bytes = exporter.spool.read(seq as u64).unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let events = v["events"].as_array().unwrap();
+            batch_sizes.push(events.len());
+            for e in events {
+                if e["event_type"] == "detection" {
+                    let id: i64 = e["event_id"]
+                        .as_str()
+                        .unwrap()
+                        .strip_prefix("incident-")
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    detection_ids.push(id);
+                }
+            }
+        }
+        assert_eq!(batch_sizes, [500, 102]); // degradation + 499 detections, then 101 detections + heartbeat
+        detection_ids.sort_unstable();
+        assert_eq!(detection_ids, (1..=600).collect::<Vec<_>>());
+        // The next tick pulls nothing new.
+        exporter.tick().await;
+        assert_eq!(exporter.pushed_watermark, 600);
+    }
+
+    #[tokio::test]
+    async fn failed_spool_store_preserves_events_for_retry() {
+        let h = harness("http://127.0.0.1:9/unused").await;
+        h.store
+            .insert(&sample_incident(None, "fork_storm", None))
+            .await
+            .unwrap();
+        h.store
+            .insert(&sample_incident(None, "oom_kill", None))
+            .await
+            .unwrap();
+        let mut exporter = h.exporter;
+        exporter.tick().await;
+        assert_eq!(exporter.pushed_watermark, 2);
+
+        // Sabotage the next spool store: the batch file for sequence 0
+        // already exists, so create_new fails (disk-full/permission
+        // failures behave the same — store returns Err).
+        let spool_dir = h.dir.path().join(super::super::spool::SPOOL_DIR_NAME);
+        std::fs::write(spool_dir.join("0.json"), b"sabotage").unwrap();
+        exporter.seal_and_spool().await;
+        // The events are still buffered — not lost — and the watermark did
+        // not advance past them.
+        assert!(!exporter.sealer.is_empty());
+        assert_eq!(exporter.spool.batch_count(), 0);
+        assert_eq!(exporter.identity.export_watermark(), 0);
+
+        // Remove the sabotage: the retry spools everything (on the next
+        // sequence — claimed sequences are never reused), the watermark
+        // advances, and no incident is skipped or duplicated.
+        std::fs::remove_file(spool_dir.join("0.json")).unwrap();
+        exporter.seal_and_spool().await;
+        assert!(exporter.sealer.is_empty());
+        assert_eq!(exporter.spool.batch_count(), 1);
+        assert_eq!(exporter.identity.export_watermark(), 2);
+        let bytes = exporter.spool.read(1).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let detections = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["event_type"] == "detection")
+            .count();
+        assert_eq!(detections, 2);
+        exporter.tick().await;
+        assert_eq!(exporter.pushed_watermark, 2);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_idempotency_keys_survive_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            IncidentStore::new(dir.path().join("incidents.db"))
+                .await
+                .unwrap(),
+        );
+        let key_before_restart =
+            build_exporter(dir.path(), "http://127.0.0.1:9/unused", store.clone())
+                .await
+                .heartbeat_event()
+                .unwrap()
+                .event_idempotency_key;
+        // Simulated restart: same state dir, fresh process state (the
+        // in-memory counter is gone, but the persisted one is not).
+        let mut restarted =
+            build_exporter(dir.path(), "http://127.0.0.1:9/unused", store.clone()).await;
+        let key_after_restart = restarted.heartbeat_event().unwrap().event_idempotency_key;
+        let key_next = restarted.heartbeat_event().unwrap().event_idempotency_key;
+        assert_ne!(
+            key_before_restart, key_after_restart,
+            "a restart must not reuse a heartbeat idempotency key with a different body"
+        );
+        assert_ne!(key_after_restart, key_next);
+        assert!(
+            key_after_restart.contains(restarted.identity.agent_instance_id()),
+            "key carries the stable instance id: {key_after_restart}"
+        );
     }
 
     #[tokio::test]

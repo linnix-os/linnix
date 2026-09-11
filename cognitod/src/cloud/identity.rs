@@ -34,6 +34,13 @@ struct IdentityFile {
     agent_instance_id: String,
     next_sequence: u64,
     export_watermark: i64,
+    /// Monotonic heartbeat counter. Heartbeat idempotency keys must never
+    /// repeat with a different body — including across daemon restarts, when
+    /// every in-memory counter resets — so this one is persisted.
+    /// `#[serde(default)]` keeps identities written before this field
+    /// existed readable.
+    #[serde(default)]
+    heartbeat_seq: u64,
 }
 
 /// Resolve the node identity: explicit config override wins, then the
@@ -91,6 +98,7 @@ impl IdentityStore {
                     agent_instance_id: uuid::Uuid::new_v4().to_string(),
                     next_sequence: 0,
                     export_watermark: 0,
+                    heartbeat_seq: 0,
                 };
                 let store = Self {
                     path: path.clone(),
@@ -126,6 +134,19 @@ impl IdentityStore {
     pub fn next_sequence(&mut self) -> io::Result<u64> {
         let seq = self.identity.next_sequence;
         self.identity.next_sequence = seq.saturating_add(1);
+        self.persist()?;
+        Ok(seq)
+    }
+
+    /// Claim the next heartbeat sequence number (persisted immediately).
+    /// Heartbeat idempotency keys are `e:hb:{agent_instance_id}:{n}`: the
+    /// persisted counter keeps them unique across daemon restarts, where an
+    /// in-memory counter would restart at 0 and reuse a key with a
+    /// different body (a declared idempotency violation the edge could
+    /// quarantine a whole batch over).
+    pub fn next_heartbeat_seq(&mut self) -> io::Result<u64> {
+        let seq = self.identity.heartbeat_seq.saturating_add(1);
+        self.identity.heartbeat_seq = seq;
         self.persist()?;
         Ok(seq)
     }
@@ -197,6 +218,30 @@ mod tests {
         drop(store);
         let reopened = fresh_store(dir.path());
         assert_eq!(reopened.export_watermark(), 42);
+    }
+
+    #[test]
+    fn heartbeat_seq_is_persisted_and_monotonic() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = fresh_store(dir.path());
+        assert_eq!(first.next_heartbeat_seq().unwrap(), 1);
+        assert_eq!(first.next_heartbeat_seq().unwrap(), 2);
+        drop(first);
+        // A restart continues the counter — keys never repeat.
+        let mut second = fresh_store(dir.path());
+        assert_eq!(second.next_heartbeat_seq().unwrap(), 3);
+    }
+
+    #[test]
+    fn old_identity_files_without_heartbeat_seq_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(IDENTITY_FILE_NAME),
+            r#"{"cluster_id":"c","node_id":"n","agent_instance_id":"i","next_sequence":0,"export_watermark":0}"#,
+        )
+        .unwrap();
+        let mut store = IdentityStore::load_or_create(dir.path(), None, None).unwrap();
+        assert_eq!(store.next_heartbeat_seq().unwrap(), 1);
     }
 
     #[test]
