@@ -7,13 +7,15 @@
 //!
 //! * **Kill happened (measured):** `/proc/vmstat`'s `oom_kill` counter Δ,
 //!   host-wide. This fires even when cgroup attribution is unavailable.
-//! * **Which cgroup (measured):** per-cgroup `memory.events` `max` Δ. The
-//!   counter is hierarchical, so the witness attributes the kill to the
-//!   *deepest* cgroup(s) whose counter moved — the leaf-most selection
-//!   keeps one kill from being reported once per ancestor. Unlike the
-//!   pressure monitor, kubepods subtrees are *included*: nothing else
-//!   attributes pod OOM kills, and leaf-most selection avoids the
-//!   double-counting that motivated the pressure monitor's skip.
+//! * **Which cgroup (measured):** per-cgroup `memory.events` `oom_kill`
+//!   Δ. The counter is hierarchical, so the witness attributes the kill
+//!   to the *deepest* cgroup(s) whose counter moved — the leaf-most
+//!   selection keeps one kill from being reported once per ancestor.
+//!   (`max` also moves on limit pressure that reclaim survives, so it is
+//!   not a kill signal and is deliberately not read.) Unlike the pressure
+//!   monitor, kubepods subtrees are *included*: nothing else attributes
+//!   pod OOM kills, and leaf-most selection avoids the double-counting
+//!   that motivated the pressure monitor's skip.
 //! * **Victim (best-effort):** the kernel logs
 //!   `Out of memory: Killed process <pid> (<comm>)` to the ring buffer.
 //!   The victim name is `inferred` — the ring may have rotated, and
@@ -22,8 +24,8 @@
 //!
 //! Relationship to the cgroup pressure monitor: that monitor already
 //! classifies a per-cgroup `OomKill` *stall verdict* when `memory.events`
-//! `max` moves. The witness is complementary, not duplicative — it adds
-//! the host-wide counter, the victim identity from `dmesg`, and a
+//! `oom_kill` moves. The witness is complementary, not duplicative — it
+//! adds the host-wide counter, the victim identity from `dmesg`, and a
 //! dedicated `oom_kill` incident type. One burst of kills in a window is
 //! one finding (the kills are counted, not emitted N times); the 15-min
 //! cooldown and store-backed dedup prevent refires.
@@ -99,19 +101,19 @@ pub struct OomVictim {
 /// window is a single finding: `kill_count` counts them.
 #[derive(Debug, Clone)]
 pub struct OomKill {
-    /// Deepest cgroup whose `memory.events:max` moved, as a path relative
-    /// to the cgroup root (`/` for the root). `None` when unattributable
-    /// (v1 host, or the walk found nothing).
+    /// Deepest cgroup whose `memory.events:oom_kill` moved, as a path
+    /// relative to the cgroup root (`/` for the root). `None` when
+    /// unattributable (v1 host, or the walk found nothing).
     pub cgroup: Option<String>,
-    /// That cgroup's `max` Δ; `None` when the cgroup is unattributed.
-    pub cgroup_max_delta: Option<u64>,
+    /// That cgroup's `oom_kill` Δ; `None` when the cgroup is unattributed.
+    pub cgroup_oom_kill_delta: Option<u64>,
     /// Host-wide `/proc/vmstat` `oom_kill` Δ; `None` when unreadable.
     pub host_oom_kill_delta: Option<u64>,
     /// Kills observed this window: the host Δ when readable, else the sum
     /// of attributed leaf-cgroup Δs.
     pub kill_count: u64,
     /// Every leaf cgroup whose counter moved, deepest-first, for snapshot
-    /// context: `(rel_path, max_delta)`.
+    /// context: `(rel_path, oom_kill_delta)`.
     pub attributed_cgroups: Vec<(String, u64)>,
     pub victim: OomVictim,
     pub verdict: OomVerdict,
@@ -185,14 +187,17 @@ fn read_vmstat_oom_kill(proc_root: &Path) -> Option<u64> {
     None
 }
 
-/// One `key value` counter from a cgroup `memory.events` file. Missing
+/// The `oom_kill` counter from a cgroup `memory.events` file — the only
+/// per-cgroup field that means a kill actually happened (`max` also moves
+/// on limit pressure that reclaim survives, so it is not read). Missing
 /// file or key -> `None`, never zero: zero is a real reading, absence is
-/// not. (Mirrors the pressure monitor's reader.)
-fn read_memory_events_max(dir: &Path) -> Option<u64> {
+/// not. (Mirrors the pressure monitor's reader, which reads this same
+/// key.)
+fn read_memory_events_oom_kill(dir: &Path) -> Option<u64> {
     let content = std::fs::read_to_string(dir.join("memory.events")).ok()?;
     for line in content.lines() {
         let mut parts = line.split_whitespace();
-        if parts.next() == Some("max")
+        if parts.next() == Some("oom_kill")
             && let Some(value) = parts.next()
             && let Ok(v) = value.parse::<u64>()
         {
@@ -227,9 +232,15 @@ fn find_cgroup_dirs(root: &Path) -> Vec<(String, PathBuf)> {
 /// Keeps only the deepest cgroups with a positive Δ: `memory.events`
 /// counters are hierarchical, so a kill in a leaf also moves every
 /// ancestor. String-prefix matching with a trailing separator keeps
-/// `svc` from shadowing `svc2`.
+/// `svc` from shadowing `svc2`. The root entry (`/`) is itself an
+/// ancestor of every descendant, but its rel path carries no leading
+/// slash, so no descendant prefix-matches it — without special handling
+/// the hierarchical root counter would survive alongside the real leaf
+/// and one kill would be counted twice. The root is dropped whenever any
+/// non-root delta exists; it is kept only when it is the sole signal
+/// (host-level kill with no cgroup attribution).
 fn leaf_cgroups(deltas: &[(String, u64)]) -> Vec<(String, u64)> {
-    deltas
+    let mut leaves: Vec<(String, u64)> = deltas
         .iter()
         .filter(|(path, _)| {
             let prefix = if path == "/" {
@@ -242,7 +253,11 @@ fn leaf_cgroups(deltas: &[(String, u64)]) -> Vec<(String, u64)> {
                 .any(|(other, _)| other != path && other.starts_with(&prefix))
         })
         .cloned()
-        .collect()
+        .collect();
+    if leaves.iter().any(|(path, _)| path != "/") {
+        leaves.retain(|(path, _)| path != "/");
+    }
+    leaves
 }
 
 /// Stateful OOM-kill witness.
@@ -251,7 +266,7 @@ pub struct OomWitnessMonitor {
     cgroup_root: PathBuf,
     interval: Duration,
     vmstat_baseline: Option<u64>,
-    /// rel_path -> (dir inode, last `max` counter). The inode is the
+    /// rel_path -> (dir inode, last `oom_kill` counter). The inode is the
     /// instance identity: a recreated cgroup (new inode, counters reset)
     /// re-baselines instead of diffing against the dead instance.
     cgroup_baselines: HashMap<String, (u64, u64)>,
@@ -366,7 +381,7 @@ impl OomWitnessMonitor {
         true
     }
 
-    /// One poll: Δ the host counter and every cgroup's `max` counter,
+    /// One poll: Δ the host counter and every cgroup's `oom_kill` counter,
     /// attribute kills to the deepest cgroups, and return a single finding
     /// when at least one kill was observed. First sightings only establish
     /// baselines. `dmesg` is consulted only when a kill was detected.
@@ -396,10 +411,12 @@ impl OomWitnessMonitor {
             }
         };
 
-        // Per-cgroup `max` Δs, with recreation-aware baselines.
+        // Per-cgroup `oom_kill` Δs, with recreation-aware baselines.
         let mut deltas: Vec<(String, u64)> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
         for (rel, dir) in find_cgroup_dirs(&self.cgroup_root) {
-            let Some(cur) = read_memory_events_max(&dir) else {
+            seen.insert(rel.clone());
+            let Some(cur) = read_memory_events_oom_kill(&dir) else {
                 continue;
             };
             let ino = std::fs::metadata(&dir).map(|m| m.ino()).unwrap_or(0);
@@ -408,11 +425,13 @@ impl OomWitnessMonitor {
                     self.cgroup_baselines.insert(rel, (ino, cur));
                 }
                 Some(&(prev_ino, _prev)) if prev_ino != 0 && ino != 0 && prev_ino != ino => {
-                    debug!("[oom] cgroup {rel} recreated; re-baselining max counter");
+                    debug!("[oom] cgroup {rel} recreated; re-baselining oom_kill counter");
                     self.cgroup_baselines.insert(rel, (ino, cur));
                 }
                 Some(&(_, prev)) if cur < prev => {
-                    debug!("[oom] cgroup {rel} max regressed ({prev} -> {cur}); re-baselining");
+                    debug!(
+                        "[oom] cgroup {rel} oom_kill regressed ({prev} -> {cur}); re-baselining"
+                    );
                     self.cgroup_baselines.insert(rel, (ino, cur));
                 }
                 Some(_) => {
@@ -424,15 +443,29 @@ impl OomWitnessMonitor {
                 }
             }
         }
+        // Drop baselines for cgroups the walk no longer returns (pod churn
+        // on K8s nodes would otherwise grow this map for the daemon's
+        // lifetime). Mirrors the pressure collector's pruning.
+        self.cgroup_baselines.retain(|rel, _| seen.contains(rel));
 
         let attributed = leaf_cgroups(&deltas);
-        // The host counter is authoritative, but a cgroup Δ without a host
-        // Δ is still a kill the cgroup counter saw — take the max rather
-        // than trusting one source blindly.
+        // Firing rule: the host counter is the confirmed kill count. A
+        // cgroup `oom_kill` Δ without a host Δ is inconsistent — the two
+        // move through the same code path — so it is logged, not fired.
+        // When the host counter is unreadable, the per-cgroup `oom_kill`
+        // counters are genuine kill signals on their own.
         let cgroup_sum: u64 = attributed.iter().map(|(_, d)| d).sum();
         let kill_count = match host_delta {
-            Some(d) => d.max(cgroup_sum),
-            // vmstat unreadable: the attributed cgroup Δs are the count.
+            Some(d) if d > 0 => d.max(cgroup_sum),
+            Some(_) => {
+                if cgroup_sum > 0 {
+                    debug!(
+                        "[oom] cgroup oom_kill Δ={cgroup_sum} with no host Δ; \
+                         counters inconsistent, not firing"
+                    );
+                }
+                0
+            }
             None => cgroup_sum,
         };
         if kill_count == 0 {
@@ -454,7 +487,7 @@ impl OomWitnessMonitor {
             },
         };
 
-        let (cgroup, cgroup_max_delta) = attributed
+        let (cgroup, cgroup_oom_kill_delta) = attributed
             .iter()
             .max_by_key(|(_, d)| d)
             .map(|(path, d)| (Some(path.clone()), Some(*d)))
@@ -462,7 +495,7 @@ impl OomWitnessMonitor {
 
         Some(OomKill {
             cgroup,
-            cgroup_max_delta,
+            cgroup_oom_kill_delta,
             host_oom_kill_delta: host_delta,
             kill_count,
             attributed_cgroups: attributed,
@@ -579,7 +612,7 @@ fn incident_from_finding(finding: &OomKill) -> Incident {
     let attributed: Vec<serde_json::Value> = finding
         .attributed_cgroups
         .iter()
-        .map(|(path, delta)| serde_json::json!({ "cgroup": path, "max_delta": delta }))
+        .map(|(path, delta)| serde_json::json!({ "cgroup": path, "oom_kill_delta": delta }))
         .collect();
     let victim = serde_json::json!({
         "pid": finding.victim.pid,
@@ -591,7 +624,7 @@ fn incident_from_finding(finding: &OomKill) -> Incident {
     });
     let snapshot = serde_json::json!({
         "cgroup": finding.cgroup,
-        "cgroup_max_delta": finding.cgroup_max_delta,
+        "cgroup_oom_kill_delta": finding.cgroup_oom_kill_delta,
         "host_oom_kill_delta": finding.host_oom_kill_delta,
         "kill_count": finding.kill_count,
         "attributed_cgroups": attributed,
@@ -689,14 +722,24 @@ mod tests {
             .unwrap();
         }
 
-        /// (Re)places `<cgroup-root>/<rel>/memory.events` with a `max`
-        /// counter. `rel` is a `/`-separated path like `system.slice/svc`.
-        fn set_cgroup_max(&self, rel: &str, max: u64) {
+        /// (Re)places `<cgroup-root>/<rel>/memory.events` with independent
+        /// `max` and `oom_kill` counters. `rel` is a `/`-separated path
+        /// like `system.slice/svc`.
+        fn set_cgroup(&self, rel: &str, max: u64, oom_kill: u64) {
             let d = self.dir.path().join("cgroup").join(rel);
             fs::create_dir_all(&d).unwrap();
             fs::write(
                 d.join("memory.events"),
-                format!("low 0\nhigh 0\nmax {max}\noom 0\noom_kill {max}\n"),
+                format!("low 0\nhigh 0\nmax {max}\noom 0\noom_kill {oom_kill}\n"),
+            )
+            .unwrap();
+        }
+
+        /// (Re)places the cgroup *root's* `memory.events` (rel path `/`).
+        fn set_root_cgroup(&self, max: u64, oom_kill: u64) {
+            fs::write(
+                self.dir.path().join("cgroup").join("memory.events"),
+                format!("low 0\nhigh 0\nmax {max}\noom 0\noom_kill {oom_kill}\n"),
             )
             .unwrap();
         }
@@ -712,7 +755,7 @@ mod tests {
     fn observed_finding(cgroup: Option<&str>, victim: Option<(u32, &str)>) -> OomKill {
         OomKill {
             cgroup: cgroup.map(str::to_string),
-            cgroup_max_delta: Some(2),
+            cgroup_oom_kill_delta: Some(2),
             host_oom_kill_delta: Some(2),
             kill_count: 2,
             attributed_cgroups: vec![("system.slice/svc".to_string(), 2)],
@@ -790,15 +833,15 @@ mod tests {
         let mut mon = fake.monitor(Some((4242, "hungry".to_string())));
         let t0 = Instant::now();
         fake.set_vmstat(0);
-        fake.set_cgroup_max("system.slice/svc", 0);
+        fake.set_cgroup("system.slice/svc", 0, 0);
         assert!(mon.tick_at(t0).is_none());
         fake.set_vmstat(2);
-        fake.set_cgroup_max("system.slice/svc", 2);
+        fake.set_cgroup("system.slice/svc", 2, 2);
         let finding = mon
             .tick_at(t0 + Duration::from_secs(10))
-            .expect("cgroup max Δ=2 must fire");
+            .expect("cgroup oom_kill Δ=2 must fire");
         assert_eq!(finding.cgroup.as_deref(), Some("system.slice/svc"));
-        assert_eq!(finding.cgroup_max_delta, Some(2));
+        assert_eq!(finding.cgroup_oom_kill_delta, Some(2));
         assert_eq!(finding.kill_count, 2);
         assert_eq!(finding.victim.pid, Some(4242));
         assert_eq!(finding.victim.comm.as_deref(), Some("hungry"));
@@ -811,23 +854,23 @@ mod tests {
         let mut mon = fake.monitor(None);
         let t0 = Instant::now();
         fake.set_vmstat(0);
-        fake.set_cgroup_max("app", 0);
-        fake.set_cgroup_max("app/worker", 0);
+        fake.set_cgroup("app", 0, 0);
+        fake.set_cgroup("app/worker", 0, 0);
         assert!(mon.tick_at(t0).is_none());
         // Hierarchical counters: the kill moves the leaf and its ancestor.
         fake.set_vmstat(1);
-        fake.set_cgroup_max("app", 1);
-        fake.set_cgroup_max("app/worker", 1);
+        fake.set_cgroup("app", 1, 1);
+        fake.set_cgroup("app/worker", 1, 1);
         let finding = mon
             .tick_at(t0 + Duration::from_secs(10))
             .expect("must fire");
         assert_eq!(finding.cgroup.as_deref(), Some("app/worker"));
         assert_eq!(finding.attributed_cgroups.len(), 1, "one kill, one leaf");
         // A sibling prefix must not shadow: app2 is not under app/.
-        fake.set_cgroup_max("app2", 0);
+        fake.set_cgroup("app2", 0, 0);
         assert!(mon.tick_at(t0 + Duration::from_secs(20)).is_none());
         fake.set_vmstat(2);
-        fake.set_cgroup_max("app2", 1);
+        fake.set_cgroup("app2", 1, 1);
         let finding = mon
             .tick_at(t0 + Duration::from_secs(30))
             .expect("must fire");
@@ -863,7 +906,7 @@ mod tests {
             .expect("host Δ must fire without cgroups");
         assert_eq!(finding.kill_count, 1);
         assert!(finding.cgroup.is_none());
-        assert!(finding.cgroup_max_delta.is_none());
+        assert!(finding.cgroup_oom_kill_delta.is_none());
     }
 
     #[test]
@@ -872,21 +915,136 @@ mod tests {
         let mut mon = fake.monitor(None);
         let t0 = Instant::now();
         fake.set_vmstat(0);
-        fake.set_cgroup_max("svc", 5);
+        fake.set_cgroup("svc", 5, 5);
         assert!(mon.tick_at(t0).is_none());
         // Cgroup recreated: counter reset to 2. That's a re-baseline, not
         // a negative (or wrapped) delta — and the host saw no kill.
-        fake.set_cgroup_max("svc", 2);
+        fake.set_cgroup("svc", 2, 2);
         assert!(
             mon.tick_at(t0 + Duration::from_secs(10)).is_none(),
             "recreated cgroup must not fabricate a kill"
         );
-        // …but the new instance's kills are still observed.
-        fake.set_cgroup_max("svc", 3);
+        // …but the new instance's kills are still observed (host and
+        // cgroup agree a kill happened).
+        fake.set_vmstat(1);
+        fake.set_cgroup("svc", 3, 3);
         let finding = mon
             .tick_at(t0 + Duration::from_secs(20))
             .expect("new instance kills must fire");
-        assert_eq!(finding.cgroup_max_delta, Some(1));
+        assert_eq!(finding.cgroup_oom_kill_delta, Some(1));
+        assert_eq!(finding.kill_count, 1);
+    }
+
+    #[test]
+    fn max_only_delta_does_not_fire() {
+        // `max` moves on limit pressure that reclaim survives — it is not
+        // a kill signal, so a `max`-only delta must not fire even when the
+        // host reports no kill.
+        let fake = FakeProc::new();
+        let mut mon = fake.monitor(None);
+        let t0 = Instant::now();
+        fake.set_vmstat(0);
+        fake.set_cgroup("system.slice/svc", 0, 0);
+        assert!(mon.tick_at(t0).is_none());
+        fake.set_cgroup("system.slice/svc", 7, 0);
+        assert!(
+            mon.tick_at(t0 + Duration::from_secs(10)).is_none(),
+            "max-only pressure must not fabricate an oom_kill incident"
+        );
+        // The `oom_kill` field moving with the host counter is a kill.
+        fake.set_vmstat(2);
+        fake.set_cgroup("system.slice/svc", 7, 2);
+        let finding = mon
+            .tick_at(t0 + Duration::from_secs(20))
+            .expect("oom_kill Δ + host Δ must fire");
+        assert_eq!(finding.cgroup.as_deref(), Some("system.slice/svc"));
+        assert_eq!(finding.cgroup_oom_kill_delta, Some(2));
+        assert_eq!(finding.kill_count, 2);
+    }
+
+    #[test]
+    fn cgroup_delta_without_host_delta_does_not_fire() {
+        // Both counters move through the same kernel path: a cgroup
+        // `oom_kill` Δ with no host Δ is inconsistent data, not a kill.
+        let fake = FakeProc::new();
+        let mut mon = fake.monitor(None);
+        let t0 = Instant::now();
+        fake.set_vmstat(0);
+        fake.set_cgroup("svc", 0, 0);
+        assert!(mon.tick_at(t0).is_none());
+        fake.set_cgroup("svc", 0, 1);
+        assert!(
+            mon.tick_at(t0 + Duration::from_secs(10)).is_none(),
+            "cgroup-only delta with host Δ=0 must not fire"
+        );
+    }
+
+    #[test]
+    fn root_cgroup_is_dropped_when_a_child_reports() {
+        // The root's hierarchical counter moves with every child kill, but
+        // its rel path ("/") never prefix-matches descendants — without
+        // special handling one kill would be counted twice in cgroup_sum.
+        let fake = FakeProc::new();
+        let mut mon = fake.monitor(None);
+        let t0 = Instant::now();
+        fake.set_vmstat(0);
+        fake.set_root_cgroup(0, 0);
+        fake.set_cgroup("app", 0, 0);
+        assert!(mon.tick_at(t0).is_none());
+        fake.set_vmstat(1);
+        fake.set_root_cgroup(1, 1);
+        fake.set_cgroup("app", 1, 1);
+        let finding = mon
+            .tick_at(t0 + Duration::from_secs(10))
+            .expect("must fire");
+        assert_eq!(finding.cgroup.as_deref(), Some("app"));
+        assert!(
+            !finding.attributed_cgroups.iter().any(|(p, _)| p == "/"),
+            "root must not survive leaf-most filtering alongside a child"
+        );
+        assert_eq!(finding.kill_count, 1, "one kill, counted once");
+    }
+
+    #[test]
+    fn root_only_kill_is_still_reported() {
+        // Root retained only when it is the sole signal (host-level kill
+        // with no cgroup attribution).
+        let fake = FakeProc::new();
+        let mut mon = fake.monitor(None);
+        let t0 = Instant::now();
+        fake.set_vmstat(0);
+        fake.set_root_cgroup(0, 0);
+        assert!(mon.tick_at(t0).is_none());
+        fake.set_vmstat(1);
+        fake.set_root_cgroup(1, 1);
+        let finding = mon
+            .tick_at(t0 + Duration::from_secs(10))
+            .expect("must fire");
+        assert_eq!(finding.cgroup.as_deref(), Some("/"));
+        assert_eq!(finding.kill_count, 1);
+    }
+
+    #[test]
+    fn vanished_cgroup_baseline_is_pruned() {
+        // Pod churn must not grow cgroup_baselines for the daemon's
+        // lifetime: entries for dirs the walk no longer returns are
+        // dropped after the scan.
+        let fake = FakeProc::new();
+        let mut mon = fake.monitor(None);
+        let t0 = Instant::now();
+        fake.set_vmstat(0);
+        fake.set_cgroup("kubepods/pod-a", 0, 0);
+        assert!(mon.tick_at(t0).is_none());
+        assert!(
+            mon.cgroup_baselines.contains_key("kubepods/pod-a"),
+            "baseline established on first sighting"
+        );
+        std::fs::remove_dir_all(fake.dir.path().join("cgroup").join("kubepods")).unwrap();
+        assert!(mon.tick_at(t0 + Duration::from_secs(10)).is_none());
+        assert!(
+            !mon.cgroup_baselines.contains_key("kubepods/pod-a"),
+            "vanished cgroup must be pruned"
+        );
     }
 
     #[test]
