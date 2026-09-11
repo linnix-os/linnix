@@ -218,6 +218,11 @@ pub struct Config {
     pub incidents: IncidentsConfig,
     #[serde(default)]
     pub telemetry: TelemetrySettings,
+    /// Opt-in shipment of evidence batches to the Linnix Cloud edge.
+    /// Disabled by default: with `enabled = false` (or the section absent)
+    /// no cloud code runs and no network traffic occurs.
+    #[serde(default)]
+    pub cloud: CloudConfig,
     /// Top-level sections/keys no field matches. Captured so `--check-config`
     /// can name them; a typo'd `[reasner]` is otherwise indistinguishable from
     /// having configured nothing.
@@ -360,6 +365,11 @@ impl Config {
                 "unrecognised key `{key}` in [incidents] (not read by the daemon)"
             ));
         }
+        for key in config.cloud.unknown.keys() {
+            problems.push(format!(
+                "unrecognised key `{key}` in [cloud] (not read by the daemon)"
+            ));
+        }
         problems.extend(config.telemetry.range_problems());
         problems
     }
@@ -406,6 +416,15 @@ impl Config {
                 "[config] ignoring unrecognised key(s) in [incidents]: {}. \
                  These are not read by the daemon and have no effect — a \
                  typo'd `retention_day` leaves pruning disabled. \
+                 Run `cognitod --check-config` to validate.",
+                keys.join(", ")
+            );
+        }
+        if !self.cloud.unknown.is_empty() {
+            let keys: Vec<&str> = self.cloud.unknown.keys().map(String::as_str).collect();
+            log::warn!(
+                "[config] ignoring unrecognised key(s) in [cloud]: {}. \
+                 These are not read by the daemon and have no effect. \
                  Run `cognitod --check-config` to validate.",
                 keys.join(", ")
             );
@@ -708,6 +727,146 @@ fn default_episode_capture_output_dir() -> String {
     "/var/lib/linnix/episodes".to_string()
 }
 
+/// `[cloud]` — opt-in shipment of evidence batches to the Linnix Cloud edge.
+///
+/// Everything here is inert unless `enabled = true`: with the default
+/// `enabled = false` no cloud code runs and no network traffic occurs.
+/// Enabling requires an `endpoint` and a bearer token; the token should come
+/// from the `LINNIX_CLOUD_TOKEN` environment variable (e.g. populated from a
+/// Kubernetes Secret) rather than the config file, mirroring how
+/// `LINNIX_API_TOKEN` overrides `api.auth_token`. A token placed in the
+/// config file is readable by anyone who can read the file, so keep the
+/// file's permissions tight if you do.
+#[derive(Deserialize, Clone, Default)]
+pub struct CloudConfig {
+    /// Master switch. Default false — cloud export is strictly opt-in.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Edge ingest URL, e.g. `https://ingest.linnix.example/v1/event-batches`.
+    /// No default: it must be explicitly configured. Plain `http://` is
+    /// rejected unless the host is loopback (tests), so a bearer token can
+    /// never be sent in cleartext to a remote host by misconfiguration.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Opaque cloud organization ID. Required when enabled; the edge also
+    /// derives the tenant from the token and rejects a mismatched body.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    /// Stable installation ID for the cluster. Optional: when absent the
+    /// daemon generates one once and persists it — but every node then gets
+    /// its own, so set this explicitly (e.g. via Helm) for real clusters.
+    #[serde(default)]
+    pub cluster_id: Option<String>,
+    /// Stable node identity. Optional override; otherwise `NODE_NAME`, then
+    /// `HOSTNAME`, then the OS hostname — the same order `k8s.rs` uses.
+    /// The first resolved value is persisted, so later renames don't fork
+    /// the node's identity.
+    #[serde(default)]
+    pub node_id: Option<String>,
+    /// Bearer token for the edge. `LINNIX_CLOUD_TOKEN` (env) takes precedence
+    /// when both are set; empty values are ignored.
+    #[serde(default)]
+    pub bearer_token: Option<String>,
+    /// Opt-in to exporting process identity (comm, PIDs, cmdline, cgroup
+    /// paths). Default false: the exporter scrubs those fields and the edge
+    /// never sees them.
+    #[serde(default)]
+    pub export_process_identity: bool,
+    /// Keys present in `[cloud]` that no field matches. Captured rather
+    /// than discarded so `warn_unknown_keys` and `Config::check` can name
+    /// them — the same idiom as `[incidents]`.
+    #[serde(flatten)]
+    pub unknown: std::collections::BTreeMap<String, toml::Value>,
+}
+
+impl CloudConfig {
+    /// True when the exporter may start: explicitly enabled with an endpoint,
+    /// a tenant, and a usable token from either source.
+    pub fn usable(&self, env_token: Option<&str>) -> bool {
+        self.enabled
+            && self
+                .endpoint
+                .as_deref()
+                .is_some_and(|e| !e.trim().is_empty())
+            && self
+                .tenant_id
+                .as_deref()
+                .is_some_and(|t| !t.trim().is_empty())
+            && effective_cloud_token(env_token, self.bearer_token.as_deref()).is_some()
+    }
+
+    /// Whether the configured endpoint may be contacted over plaintext HTTP.
+    ///
+    /// This parses with the `url` crate — the same WHATWG URL library
+    /// reqwest uses — so the host we check is exactly the host the request
+    /// goes to. A hand-rolled string parser can be fooled: e.g.
+    /// `http://evil.example\@localhost` looks like `localhost` to naive
+    /// string splitting (the last `@` wins), but WHATWG normalizes the
+    /// backslash to a `/`, making the real host `evil.example` — which
+    /// would send the bearer token over cleartext to a remote host.
+    ///
+    /// Rules: `https` is always allowed; `http` only to `localhost` or a
+    /// loopback IP (`127.0.0.0/8`, `::1`) *without* embedded credentials;
+    /// anything else (parse failure, other schemes, non-loopback hosts) is
+    /// denied.
+    pub fn endpoint_allows_plaintext(&self) -> bool {
+        let Some(raw) = self.endpoint.as_deref() else {
+            return false;
+        };
+        let Ok(parsed) = url::Url::parse(raw) else {
+            return false;
+        };
+        match parsed.scheme() {
+            "https" => true,
+            "http" => {
+                // Credentials in the URL are never acceptable: they'd be
+                // sent in cleartext regardless of the host.
+                if !parsed.username().is_empty() || parsed.password().is_some() {
+                    return false;
+                }
+                match parsed.host() {
+                    Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+                    Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                    Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                    None => false,
+                }
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Resolve the cloud bearer token: `LINNIX_CLOUD_TOKEN` wins over the config
+/// file, mirroring `configured_auth_token` for the API token. Empty values
+/// are treated as absent.
+pub fn effective_cloud_token(
+    env_token: Option<&str>,
+    config_token: Option<&str>,
+) -> Option<String> {
+    env_token
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| config_token.filter(|t| !t.trim().is_empty()))
+        .map(str::to_string)
+}
+
+impl std::fmt::Debug for CloudConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloudConfig")
+            .field("enabled", &self.enabled)
+            .field("endpoint", &self.endpoint)
+            .field("tenant_id", &self.tenant_id)
+            .field("cluster_id", &self.cluster_id)
+            .field("node_id", &self.node_id)
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_deref().map(|_| "<redacted>"),
+            )
+            .field("export_process_identity", &self.export_process_identity)
+            .field("unknown", &self.unknown)
+            .finish()
+    }
+}
+
 /// `[incidents]` — incident store retention.
 ///
 /// The incident store would otherwise grow for the lifetime of the daemon.
@@ -885,6 +1044,121 @@ retention_days = 0
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.incidents.retention_days, Some(0));
+    }
+
+    #[test]
+    fn cloud_is_disabled_by_default() {
+        // Absent means no cloud code runs and no network traffic occurs.
+        let toml = r#"[runtime]
+offline = true
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(!cfg.cloud.enabled);
+        assert!(cfg.cloud.endpoint.is_none());
+        assert!(cfg.cloud.tenant_id.is_none());
+        assert!(cfg.cloud.bearer_token.is_none());
+        assert!(!cfg.cloud.export_process_identity);
+        assert!(!cfg.cloud.usable(None));
+    }
+
+    #[test]
+    fn cloud_config_parses() {
+        let toml = r#"[cloud]
+enabled = true
+endpoint = "https://ingest.example/v1/event-batches"
+tenant_id = "tn_123"
+bearer_token = "tok"
+export_process_identity = true
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.cloud.enabled);
+        assert_eq!(
+            cfg.cloud.endpoint.as_deref(),
+            Some("https://ingest.example/v1/event-batches")
+        );
+        assert_eq!(cfg.cloud.tenant_id.as_deref(), Some("tn_123"));
+        assert!(cfg.cloud.usable(None));
+        assert!(cfg.cloud.export_process_identity);
+    }
+
+    #[test]
+    fn cloud_needs_endpoint_tenant_and_token() {
+        let toml = r#"[cloud]
+enabled = true
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(!cfg.cloud.usable(None));
+        assert!(!cfg.cloud.usable(Some("tok")));
+    }
+
+    #[test]
+    fn cloud_token_env_beats_config() {
+        assert_eq!(
+            effective_cloud_token(Some("env-tok"), Some("cfg-tok")).as_deref(),
+            Some("env-tok")
+        );
+        assert_eq!(
+            effective_cloud_token(None, Some("cfg-tok")).as_deref(),
+            Some("cfg-tok")
+        );
+        assert_eq!(
+            effective_cloud_token(Some("  "), Some("cfg-tok")).as_deref(),
+            Some("cfg-tok")
+        );
+        assert!(effective_cloud_token(None, None).is_none());
+    }
+
+    #[test]
+    fn cloud_rejects_cleartext_to_remote_hosts() {
+        let allows = |endpoint: Option<&str>| {
+            let cfg = CloudConfig {
+                endpoint: endpoint.map(str::to_string),
+                ..Default::default()
+            };
+            cfg.endpoint_allows_plaintext()
+        };
+        assert!(allows(Some("https://ingest.example/v1")));
+        assert!(allows(Some("http://localhost:8080/v1")));
+        assert!(allows(Some("http://127.0.0.1:8080/v1")));
+        assert!(allows(Some("http://127.0.0.2:8080/v1")));
+        assert!(allows(Some("http://[::1]:8080/v1")));
+        assert!(!allows(Some("http://ingest.example/v1")));
+        assert!(!allows(Some("ftp://ingest.example/v1")));
+        assert!(!allows(Some("http://localhost.evil.example/")));
+        // The reviewer's bypass: WHATWG normalizes the backslash to `/`,
+        // so the real host is evil.example — naive string splitting sees
+        // "localhost" after the last '@'.
+        assert!(!allows(Some("http://evil.example\\@localhost:8080/v1")));
+        assert!(!allows(Some("http://evil.example@127.0.0.1:8080/v1")));
+        // Credentials in the URL are never acceptable, even on loopback.
+        assert!(!allows(Some("http://user@localhost/")));
+        assert!(!allows(Some("http://user:pass@127.0.0.1/")));
+        // Malformed URLs fail closed.
+        assert!(!allows(Some("http://:8080")));
+        assert!(!allows(Some("not a url")));
+        assert!(!allows(Some("")));
+        assert!(!allows(None));
+    }
+
+    #[test]
+    fn cloud_bearer_token_is_redacted_in_debug() {
+        let cfg = CloudConfig {
+            bearer_token: Some("super-secret".to_string()),
+            ..Default::default()
+        };
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains("super-secret"));
+        assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn cloud_unknown_keys_are_flagged() {
+        let toml = r#"[cloud]
+enabled = true
+endpooint = "https://ingest.example/v1"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.cloud.unknown.contains_key("endpooint"));
     }
 
     #[test]

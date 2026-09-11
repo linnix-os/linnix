@@ -56,6 +56,34 @@ Linnix mounts:
 - `/sys/kernel/debug`: For debugfs (tracepoints).
 - `hostPID: true`: To correlate events with host processes.
 
+### State & Identity
+
+The DaemonSet mounts a `hostPath` volume at `/var/lib/linnix` and injects
+`NODE_NAME` from the downward API (`spec.nodeName`). Both are required for
+the agent's identity to survive pod restarts:
+
+- **Durable state**: `/var/lib/linnix` holds `incidents.db`, the cloud
+  exporter's `cloud_identity.json` (agent instance ID, batch sequence,
+  export watermark), and the `cloud_spool/` batch queue. Without the
+  hostPath mount, every pod restart would mint a new agent instance ID,
+  reset the batch sequence to 0, drop queued-but-unsent batches, and
+  re-export already-sent incidents — breaking the edge's gap detector and
+  batch idempotency keys.
+- **Stable node name**: the agent resolves its node ID as
+  `NODE_NAME` → `HOSTNAME` → OS hostname and persists the first value it
+  sees. `HOSTNAME` inside a pod is the pod name, which changes on every
+  restart; `spec.nodeName` is the actual Kubernetes node name and is
+  stable, so the persisted identity stays bound to the node.
+
+`hostPath` is the simplest correct choice for a DaemonSet: exactly one pod
+runs per node, so node-local storage is the right scope — no PVCs or
+storage classes needed. `DirectoryOrCreate` provisions the directory on
+fresh nodes automatically. Note the agent runs privileged and stores its
+operational state here; treat host access to `/var/lib/linnix` like host
+disk access generally. If you override the incident DB location with
+`LINNIX_INCIDENT_DB`, point the mount at that path's parent directory
+instead.
+
 ## Cloud Provider Notes
 
 ### AWS EKS

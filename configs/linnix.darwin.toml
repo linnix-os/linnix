@@ -48,3 +48,30 @@ sustained_seconds = 15
 # this are pruned once a day (and once shortly after startup). 0 or unset
 # disables pruning and keeps incidents forever.
 retention_days = 30
+
+[cloud]
+# Opt-in shipment of evidence batches to the Linnix Cloud edge (v1 event
+# schema). Disabled by default: with `enabled = false` (or the section
+# absent) no cloud task starts and no network traffic occurs.
+enabled = false
+# Edge ingest URL. Required when enabled. Plain http:// is rejected for
+# non-loopback hosts so the bearer token never travels unencrypted.
+# endpoint = "https://ingest.example.com/v1/event-batches"
+# Opaque cloud organization/tenant ID. Required when enabled; the edge also
+# derives the tenant from the token and rejects a mismatched body.
+# tenant_id = "tn_123"
+# Stable cluster identity. Optional: when unset the daemon generates one and
+# persists it, but every node then gets its own — set this explicitly (e.g.
+# via Helm) for real clusters.
+# cluster_id = "prod-eu-west"
+# Stable node identity. Optional override; otherwise NODE_NAME, then
+# HOSTNAME, then the OS hostname. The first resolved value is persisted, so
+# later renames don't fork the node's identity.
+# node_id = "node-42"
+# Bearer token for the edge. Prefer the LINNIX_CLOUD_TOKEN environment
+# variable over writing it into this file; the env var wins when both are set.
+# bearer_token = "..."
+# Export process identity (comm, PIDs, cmdline, executable and cgroup paths)
+# inside detection details. Default false: those fields are scrubbed and the
+# edge never sees them. Secrets and environment blocks are always scrubbed.
+# export_process_identity = false

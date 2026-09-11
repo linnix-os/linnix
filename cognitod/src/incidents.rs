@@ -140,6 +140,29 @@ pub fn retention_cutoff_unix(retention_days: Option<u64>, now_unix: i64) -> Opti
     Some(now_unix.saturating_sub(ttl_secs))
 }
 
+/// Map a full-column incident row onto [`Incident`]. Shared by `since` and
+/// the cloud exporter's watermark-ordered `export_batch`.
+fn incident_from_row(r: sqlx::sqlite::SqliteRow) -> Incident {
+    Incident {
+        id: Some(r.get(0)),
+        timestamp: r.get(1),
+        event_type: r.get(2),
+        psi_cpu: r.get(3),
+        psi_memory: r.get(4),
+        cpu_percent: r.get(5),
+        load_avg: r.get(6),
+        action: r.get(7),
+        target_pid: r.get(8),
+        target_name: r.get(9),
+        system_snapshot: r.get(10),
+        llm_analysis: r.get(11),
+        llm_analyzed_at: r.get(12),
+        recovery_time_ms: r.get(13),
+        psi_after: r.get(14),
+        investigation: r.get(15),
+    }
+}
+
 impl IncidentStore {
     /// Create a new incident store
     pub async fn new<P: AsRef<Path>>(db_path: P) -> Result<Self, sqlx::Error> {
@@ -826,27 +849,37 @@ impl IncidentStore {
             .await?
         };
 
-        Ok(rows
-            .into_iter()
-            .map(|r| Incident {
-                id: Some(r.get(0)),
-                timestamp: r.get(1),
-                event_type: r.get(2),
-                psi_cpu: r.get(3),
-                psi_memory: r.get(4),
-                cpu_percent: r.get(5),
-                load_avg: r.get(6),
-                action: r.get(7),
-                target_pid: r.get(8),
-                target_name: r.get(9),
-                system_snapshot: r.get(10),
-                llm_analysis: r.get(11),
-                llm_analyzed_at: r.get(12),
-                recovery_time_ms: r.get(13),
-                psi_after: r.get(14),
-                investigation: r.get(15),
-            })
-            .collect())
+        Ok(rows.into_iter().map(incident_from_row).collect())
+    }
+
+    /// Watermark-ordered read for the cloud exporter: incidents with
+    /// `id > after_id`, oldest row first, bounded by `limit`. The exporter
+    /// persists the highest seen id, so each incident is exported exactly
+    /// once (modulo crashes between spool and watermark commit, which the
+    /// idempotency key makes harmless).
+    pub async fn export_batch(
+        &self,
+        after_id: i64,
+        limit: i64,
+    ) -> Result<Vec<Incident>, sqlx::Error> {
+        let rows = sqlx::query(
+            r#"
+                SELECT id, timestamp, event_type, psi_cpu, psi_memory, cpu_percent, load_avg,
+                       action, target_pid, target_name, system_snapshot,
+                       llm_analysis, llm_analyzed_at, recovery_time_ms, psi_after,
+                   investigation
+                FROM incidents
+                WHERE id > ?
+                ORDER BY id ASC
+                LIMIT ?
+            "#,
+        )
+        .bind(after_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(incident_from_row).collect())
     }
 
     /// Get statistics about incidents
