@@ -67,15 +67,20 @@ pub const DETECTION_OOM_KILL: &str = "oom_kill";
 /// Map a local incident `event_type` to a cloud `detection_type`.
 /// Returns `None` for incident kinds the v1 contract cannot describe —
 /// callers skip those rather than shipping an event the edge can't validate.
+///
+/// The daemon records `circuit_breaker_cpu` (and the API recognizes
+/// `circuit_breaker_memory`); both normalize to the schema's
+/// `circuit_breaker` rather than being skipped.
 pub fn detection_type_for(incident_event_type: &str) -> Option<&'static str> {
     match incident_event_type {
         "fork_storm" => Some(DETECTION_FORK_STORM),
         "memory_leak" => Some(DETECTION_MEMORY_LEAK),
-        "circuit_breaker" => Some(DETECTION_CIRCUIT_BREAKER),
         "cpu_starvation" => Some(DETECTION_CPU_STARVATION),
         "blkio_stall" => Some(DETECTION_BLKIO_STALL),
         "cgroup_pressure" => Some(DETECTION_CGROUP_PRESSURE),
         "oom_kill" => Some(DETECTION_OOM_KILL),
+        "circuit_breaker" => Some(DETECTION_CIRCUIT_BREAKER),
+        t if t.starts_with("circuit_breaker_") => Some(DETECTION_CIRCUIT_BREAKER),
         _ => None,
     }
 }
@@ -277,6 +282,15 @@ mod tests {
         }
         assert_eq!(
             detection_type_for("circuit_breaker"),
+            Some("circuit_breaker")
+        );
+        // Recorded circuit-breaker variants normalize instead of skipping.
+        assert_eq!(
+            detection_type_for("circuit_breaker_cpu"),
+            Some("circuit_breaker")
+        );
+        assert_eq!(
+            detection_type_for("circuit_breaker_memory"),
             Some("circuit_breaker")
         );
         assert_eq!(detection_type_for("bogus"), None);

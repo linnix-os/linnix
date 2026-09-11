@@ -12,6 +12,7 @@
 
 use std::time::Instant;
 
+use log::warn;
 use sha2::{Digest, Sha256};
 
 use super::model::{AttributionQuality, BatchEnvelope, Event, SCHEMA_VERSION};
@@ -48,6 +49,24 @@ pub struct BatchSealer {
     first_push: Option<Instant>,
 }
 
+/// Outcome of attempting to buffer an event. The byte cap is enforced
+/// *before* appending, so a sealed batch can never exceed the edge's body
+/// limit: the caller seals the current batch first when the next event
+/// doesn't fit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushOutcome {
+    /// The event was buffered.
+    Accepted,
+    /// The event doesn't fit in this batch: the caller should seal the
+    /// current batch, then push the event into a fresh sealer.
+    BatchFull,
+    /// The event alone exceeds the byte cap, so it was dropped (with a
+    /// warning). The edge would quarantine an oversized batch anyway;
+    /// dropping keeps one pathological snapshot from blocking the pipeline.
+    /// Callers should count these in their dropped-events total.
+    DroppedOversize { bytes: usize },
+}
+
 impl BatchSealer {
     pub fn new(quality: AttributionQuality) -> Self {
         Self {
@@ -70,17 +89,36 @@ impl BatchSealer {
         self.events.is_empty()
     }
 
-    /// Buffer an event. The caller must only push events whose batch-level
+    /// Buffer an event, enforcing the count and byte caps *before* the
+    /// append. The caller must only push events whose batch-level
     /// attribution quality matches this sealer's — a batch never mixes
     /// quality states (schema §2).
-    pub fn push(&mut self, event: Event) {
+    pub fn try_push(&mut self, event: Event) -> PushOutcome {
         // Size is best-effort: serialization of our own types can't fail.
         let size = serde_json::to_vec(&event).map(|b| b.len()).unwrap_or(0);
+        if size + ENVELOPE_OVERHEAD > MAX_BATCH_BYTES {
+            warn!(
+                "[cloud] dropping oversized event ({} bytes > {} byte batch cap); \
+                 the edge would quarantine an oversized batch",
+                size, MAX_BATCH_BYTES
+            );
+            return PushOutcome::DroppedOversize { bytes: size };
+        }
+        if !self.events.is_empty() && self.would_breach(size) {
+            return PushOutcome::BatchFull;
+        }
         if self.first_push.is_none() {
             self.first_push = Some(Instant::now());
         }
         self.event_bytes += size;
         self.events.push(event);
+        PushOutcome::Accepted
+    }
+
+    /// True if buffering an event of `size` bytes would breach a cap.
+    fn would_breach(&self, size: usize) -> bool {
+        self.events.len() + 1 > MAX_EVENTS_PER_BATCH
+            || self.event_bytes + size + ENVELOPE_OVERHEAD > MAX_BATCH_BYTES
     }
 
     /// True when any seal trigger has fired.
@@ -184,11 +222,104 @@ mod tests {
         }
     }
 
+    fn big_event(id: &str, blob_len: usize) -> Event {
+        Event {
+            event_id: id.to_string(),
+            event_idempotency_key: format!("k:{id}"),
+            event_type: EventType::Detection,
+            occurred_at: rfc3339(1_700_000_000),
+            detail_level: DetailLevel::Evidence,
+            payload: EventPayload::Detection(DetectionPayload {
+                detection_type: "fork_storm".to_string(),
+                severity: Severity::Warning,
+                subject: None,
+                window: TimeRange {
+                    start: rfc3339(1_700_000_000 - 10),
+                    end: rfc3339(1_700_000_000),
+                },
+                rule_name: "fork_storm".to_string(),
+                action: DetectionAction::Observe,
+                details: serde_json::json!({"blob": "x".repeat(blob_len)}),
+            }),
+        }
+    }
+
+    #[test]
+    fn try_push_reports_batch_full_before_breaching_caps() {
+        let mut sealer = BatchSealer::new(AttributionQuality::Full);
+        for i in 0..MAX_EVENTS_PER_BATCH {
+            assert_eq!(
+                sealer.try_push(heartbeat_event(&format!("e{i}"))),
+                PushOutcome::Accepted
+            );
+        }
+        // The next event would breach the 500-event cap: seal first.
+        assert_eq!(
+            sealer.try_push(heartbeat_event("overflow")),
+            PushOutcome::BatchFull
+        );
+        // Nothing was appended by the refused push.
+        assert_eq!(sealer.len(), MAX_EVENTS_PER_BATCH);
+
+        // A fresh sealer accepts it.
+        let mut fresh = BatchSealer::new(AttributionQuality::Full);
+        assert_eq!(
+            fresh.try_push(heartbeat_event("overflow")),
+            PushOutcome::Accepted
+        );
+    }
+
+    #[test]
+    fn try_push_never_lets_a_batch_exceed_the_byte_cap() {
+        let mut sealer = BatchSealer::new(AttributionQuality::Full);
+        assert_eq!(
+            sealer.try_push(big_event("fill", 512 * 1024)),
+            PushOutcome::Accepted
+        );
+        // Keep pushing until the cap trips; the refused event must not be
+        // appended, and the sealed batch must respect the cap.
+        let mut pushed = 1usize;
+        let refused_at = loop {
+            match sealer.try_push(heartbeat_event(&format!("e{pushed}"))) {
+                PushOutcome::Accepted => pushed += 1,
+                PushOutcome::BatchFull => break pushed,
+                PushOutcome::DroppedOversize { .. } => panic!("a heartbeat is tiny"),
+            }
+        };
+        assert!(refused_at > 1, "the cap should trip before seal_due alone");
+        assert_eq!(sealer.len(), refused_at);
+        let batch = sealer.seal(&ctx()).unwrap();
+        assert!(
+            batch.bytes.len() < MAX_BATCH_BYTES,
+            "sealed batch ({} bytes) must respect the cap",
+            batch.bytes.len()
+        );
+        // The refused event goes into a fresh batch cleanly.
+        let mut fresh = BatchSealer::new(AttributionQuality::Full);
+        assert_eq!(
+            fresh.try_push(heartbeat_event("next")),
+            PushOutcome::Accepted
+        );
+    }
+
+    #[test]
+    fn oversized_single_event_is_dropped_with_outcome() {
+        let mut sealer = BatchSealer::new(AttributionQuality::Full);
+        let outcome = sealer.try_push(big_event("huge", MAX_BATCH_BYTES));
+        assert!(matches!(
+            outcome,
+            PushOutcome::DroppedOversize { bytes } if bytes > MAX_BATCH_BYTES
+        ));
+        // The sealer is untouched: the drop can't poison the batch.
+        assert!(sealer.is_empty());
+        assert!(!sealer.seal_due(Instant::now()));
+    }
+
     #[test]
     fn seals_on_event_count() {
         let mut sealer = BatchSealer::new(AttributionQuality::Full);
         for i in 0..MAX_EVENTS_PER_BATCH {
-            sealer.push(heartbeat_event(&format!("e{i}")));
+            sealer.try_push(heartbeat_event(&format!("e{i}")));
             assert_eq!(
                 sealer.seal_due(Instant::now()),
                 i + 1 >= MAX_EVENTS_PER_BATCH
@@ -203,7 +334,7 @@ mod tests {
     #[test]
     fn seals_on_time() {
         let mut sealer = BatchSealer::new(AttributionQuality::PsiOnly);
-        sealer.push(heartbeat_event("e1"));
+        sealer.try_push(heartbeat_event("e1"));
         assert!(!sealer.seal_due(Instant::now()));
         let later = Instant::now() + std::time::Duration::from_secs(SEAL_INTERVAL_SECS);
         assert!(sealer.seal_due(later));
@@ -220,7 +351,7 @@ mod tests {
         // of the same logical batch is recognized as the same batch.
         let build = || {
             let mut sealer = BatchSealer::new(AttributionQuality::Full);
-            sealer.push(heartbeat_event("e1"));
+            sealer.try_push(heartbeat_event("e1"));
             sealer.seal(&ctx()).unwrap()
         };
         let a = build();
@@ -238,7 +369,7 @@ mod tests {
     #[test]
     fn envelope_shape_matches_schema() {
         let mut sealer = BatchSealer::new(AttributionQuality::Full);
-        sealer.push(heartbeat_event("e1"));
+        sealer.try_push(heartbeat_event("e1"));
         let batch = sealer.seal(&ctx()).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&batch.bytes).unwrap();
         assert_eq!(v["schema_version"], "1.0.0");

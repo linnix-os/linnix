@@ -12,6 +12,18 @@
 //! heartbeat, then detection. `degradation_state` is never dropped —
 //! losing the quality signal would let the cloud mistake silence for health.
 //! Every drop increments `dropped_total`, which the heartbeat reports.
+//!
+//! Quarantine is bounded by the same envelope: quarantined bytes count
+//! toward the 256 MiB cap, and quarantined batches older than 24h are
+//! evicted oldest-first (with a diagnostic log; their `.note` is the
+//! operator's record and is never deleted while the batch exists). Spool
+//! batches are always evicted before quarantined ones — refused evidence is
+//! more valuable for debugging than unsent heartbeats.
+//!
+//! A corrupt `spool.json` doesn't silently orphan evidence: the manifest is
+//! rebuilt from the batch files on disk (each payload verified before
+//! re-admission; files that fail verification are moved to quarantine with
+//! a note explaining why).
 
 use std::collections::VecDeque;
 use std::io;
@@ -19,6 +31,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::seal::SealedBatch;
 use super::{SPOOL_MAX_AGE_SECS, SPOOL_MAX_BYTES};
@@ -54,6 +67,17 @@ struct Manifest {
     dropped_total: u64,
 }
 
+/// A quarantined batch, indexed from the files on disk at open (the
+/// quarantine directory itself is the source of truth, so a crash between
+/// the file move and the manifest write can't lose the index).
+#[derive(Debug, Clone)]
+struct QuarantineEntry {
+    sequence: u64,
+    bytes: u64,
+    events: usize,
+    quarantined_at_unix: u64,
+}
+
 pub struct Spool {
     dir: PathBuf,
     manifest_path: PathBuf,
@@ -61,12 +85,17 @@ pub struct Spool {
     entries: VecDeque<SpoolEntry>,
     total_bytes: u64,
     dropped_total: u64,
+    quarantine_entries: VecDeque<QuarantineEntry>,
+    quarantine_bytes: u64,
 }
 
 impl Spool {
     /// Open (or create) the spool in `state_dir/cloud_spool`, rebuilding the
     /// index from the manifest and dropping entries whose batch file is
-    /// missing (e.g. torn write before the manifest fsync).
+    /// missing (e.g. torn write before the manifest fsync). A corrupt
+    /// manifest is rebuilt from the batch files on disk instead of silently
+    /// opening empty (which would orphan evidence the watermark may already
+    /// have advanced past).
     pub fn open(state_dir: &Path) -> io::Result<Self> {
         let dir = state_dir.join(SPOOL_DIR_NAME);
         std::fs::create_dir_all(&dir)?;
@@ -74,8 +103,18 @@ impl Spool {
         std::fs::create_dir_all(&quarantine_dir)?;
         let manifest_path = dir.join(MANIFEST_NAME);
 
+        let mut rebuilt = false;
         let mut manifest: Manifest = match std::fs::read_to_string(&manifest_path) {
-            Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
+            Ok(contents) => match serde_json::from_str(&contents) {
+                Ok(m) => m,
+                Err(e) => {
+                    log::error!(
+                        "[cloud] spool manifest is corrupt ({e}); rebuilding from batch files on disk"
+                    );
+                    rebuilt = true;
+                    Self::rebuild_from_disk(&dir, &quarantine_dir)?
+                }
+            },
             Err(e) if e.kind() == io::ErrorKind::NotFound => Manifest::default(),
             Err(e) => return Err(e),
         };
@@ -84,16 +123,132 @@ impl Spool {
             .entries
             .retain(|e| dir.join(batch_file_name(e.sequence)).exists());
 
+        let quarantine_entries = Self::scan_quarantine(&quarantine_dir)?;
+        let quarantine_bytes = quarantine_entries.iter().map(|e| e.bytes).sum();
+
         let total_bytes = manifest.entries.iter().map(|e| e.bytes).sum();
         let entries = manifest.entries.into_iter().collect();
-        Ok(Self {
+        let spool = Self {
             dir,
             manifest_path,
             quarantine_dir,
             entries,
             total_bytes,
             dropped_total: manifest.dropped_total,
-        })
+            quarantine_entries,
+            quarantine_bytes,
+        };
+        if rebuilt {
+            // Persist the rebuilt manifest so the next open takes the fast
+            // path; the quarantine index is always re-scanned from disk.
+            spool.persist()?;
+        }
+        Ok(spool)
+    }
+
+    /// Rebuild the manifest from `{sequence}.json` files on disk. Every
+    /// payload is verified before re-admission; files that fail verification
+    /// are moved to quarantine with a note (skip-and-note) rather than being
+    /// silently dropped or blindly trusted.
+    fn rebuild_from_disk(dir: &Path, quarantine_dir: &Path) -> io::Result<Manifest> {
+        let mut sequences: Vec<(u64, PathBuf)> = std::fs::read_dir(dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let seq: u64 = name.strip_suffix(".json")?.parse().ok()?;
+                Some((seq, e.path()))
+            })
+            .collect();
+        sequences.sort_by_key(|(seq, _)| *seq);
+
+        let mut manifest = Manifest::default();
+        for (seq, path) in sequences {
+            let bytes = std::fs::read(&path)?;
+            match verify_batch_bytes(&bytes) {
+                Ok(info) => {
+                    manifest.entries.push(SpoolEntry {
+                        sequence: seq,
+                        priority: info.priority,
+                        digest: info.digest,
+                        bytes: bytes.len() as u64,
+                        events: info.events,
+                        sealed_at_unix: file_mtime_unix(&path),
+                    });
+                }
+                Err(reason) => {
+                    let dest = quarantine_dir.join(batch_file_name(seq));
+                    let _ = std::fs::rename(&path, &dest);
+                    let _ = std::fs::write(
+                        quarantine_dir.join(format!("{seq}.note")),
+                        format!(
+                            "sequence: {seq}\nquarantined_at_unix: {}\n\
+                             reason: skipped during spool rebuild: {reason}\n",
+                            now_unix()
+                        ),
+                    );
+                    log::warn!(
+                        "[cloud] spool rebuild: quarantined unreadable batch file {seq} ({reason})"
+                    );
+                }
+            }
+        }
+        log::warn!(
+            "[cloud] spool rebuild complete: re-admitted {} batch(es); dropped_total reset",
+            manifest.entries.len()
+        );
+        Ok(manifest)
+    }
+
+    /// Index the quarantine directory from disk. Every batch gets a note if
+    /// it lacks one — a quarantined batch is never deleted un-noted.
+    fn scan_quarantine(quarantine_dir: &Path) -> io::Result<VecDeque<QuarantineEntry>> {
+        let mut out: Vec<QuarantineEntry> = Vec::new();
+        for entry in std::fs::read_dir(quarantine_dir)? {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(seq) = name
+                .strip_suffix(".json")
+                .and_then(|s| s.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            let note_path = quarantine_dir.join(format!("{seq}.note"));
+            let quarantined_at = std::fs::read_to_string(&note_path)
+                .ok()
+                .and_then(|note| parse_note_field(&note, "quarantined_at_unix"))
+                .unwrap_or_else(|| file_mtime_unix(&entry.path()));
+            if !note_path.exists() {
+                let _ = std::fs::write(
+                    &note_path,
+                    format!(
+                        "sequence: {seq}\nquarantined_at_unix: {quarantined_at}\n\
+                         reason: recovered at startup; original refusal reason unknown\n"
+                    ),
+                );
+            }
+            let events = std::fs::read(entry.path())
+                .ok()
+                .and_then(|b| verify_batch_bytes(&b).ok())
+                .map(|info| info.events)
+                .unwrap_or(0);
+            out.push(QuarantineEntry {
+                sequence: seq,
+                bytes,
+                events,
+                quarantined_at_unix: quarantined_at,
+            });
+        }
+        out.sort_by(|a, b| {
+            a.quarantined_at_unix
+                .cmp(&b.quarantined_at_unix)
+                .then(a.sequence.cmp(&b.sequence))
+        });
+        Ok(out.into())
     }
 
     fn persist(&self) -> io::Result<()> {
@@ -139,9 +294,12 @@ impl Spool {
     }
 
     /// Drop oldest-lowest-priority batches until both caps hold.
-    /// Degradation-state batches are never dropped.
+    /// Degradation-state batches are never dropped. Quarantined batches
+    /// count toward the byte cap and are evicted oldest-first when they age
+    /// out or when the spool alone can't get back under the cap.
     fn enforce_caps(&mut self) -> io::Result<()> {
-        while let Some(i) = select_victim(&self.entries, self.total_bytes, now_unix()) {
+        let now = now_unix();
+        while let Some(i) = select_victim(&self.entries, self.total_bytes_used(), now) {
             let entry = self.entries.remove(i).expect("index from live iter");
             let _ = std::fs::remove_file(self.batch_path(entry.sequence));
             self.total_bytes = self.total_bytes.saturating_sub(entry.bytes);
@@ -151,6 +309,49 @@ impl Spool {
                 entry.events,
                 entry.sequence,
                 entry.priority
+            );
+        }
+        self.enforce_quarantine_caps_at(now)
+    }
+
+    /// Spool + quarantine bytes: the cap both share.
+    fn total_bytes_used(&self) -> u64 {
+        self.total_bytes.saturating_add(self.quarantine_bytes)
+    }
+
+    /// Evict quarantined batches oldest-first when one is older than 24h or
+    /// the shared byte cap is still exceeded. Every evicted batch is noted
+    /// (its `.note` was written at quarantine/scan time) and the eviction
+    /// is logged as the diagnostic trail.
+    fn enforce_quarantine_caps_at(&mut self, now: u64) -> io::Result<()> {
+        while let Some(i) =
+            select_quarantine_victim(&self.quarantine_entries, self.total_bytes_used(), now)
+        {
+            let q = self
+                .quarantine_entries
+                .remove(i)
+                .expect("index from live iter");
+            let note_path = self.quarantine_dir.join(format!("{}.note", q.sequence));
+            if !note_path.exists() {
+                let _ = std::fs::write(
+                    &note_path,
+                    format!(
+                        "sequence: {}\nquarantined_at_unix: {}\n\
+                         reason: recovered at eviction; original refusal reason unknown\n",
+                        q.sequence, q.quarantined_at_unix
+                    ),
+                );
+            }
+            let _ = std::fs::remove_file(self.quarantine_dir.join(batch_file_name(q.sequence)));
+            let _ = std::fs::remove_file(&note_path);
+            self.quarantine_bytes = self.quarantine_bytes.saturating_sub(q.bytes);
+            self.dropped_total = self.dropped_total.saturating_add(q.events as u64);
+            log::error!(
+                "[cloud] quarantine retention: evicted quarantined batch {} \
+                 ({} event(s), {} bytes) — age/size cap",
+                q.sequence,
+                q.events,
+                q.bytes
             );
         }
         Ok(())
@@ -175,7 +376,9 @@ impl Spool {
         Ok(())
     }
 
-    /// Move a refused batch to quarantine with a note. Never retried.
+    /// Move a refused batch to quarantine with a note. Never retried; the
+    /// quarantine directory is bounded by the same retention envelope as
+    /// the spool (see [`Spool::enforce_quarantine_caps_at`]).
     pub fn quarantine(&mut self, sequence: u64, reason: &str) -> io::Result<()> {
         let Some(i) = self.entries.iter().position(|e| e.sequence == sequence) else {
             return Ok(());
@@ -193,6 +396,14 @@ impl Spool {
             ),
         );
         self.total_bytes = self.total_bytes.saturating_sub(entry.bytes);
+        self.quarantine_bytes = self.quarantine_bytes.saturating_add(entry.bytes);
+        self.quarantine_entries.push_back(QuarantineEntry {
+            sequence: entry.sequence,
+            bytes: entry.bytes,
+            events: entry.events,
+            quarantined_at_unix: now_unix(),
+        });
+        self.enforce_quarantine_caps_at(now_unix())?;
         self.persist()?;
         log::error!(
             "[cloud] batch {} quarantined ({} event(s)): {reason}; kept at {}",
@@ -215,6 +426,22 @@ impl Spool {
 
     pub fn batch_count(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Test hooks: quarantine observability.
+    #[cfg(test)]
+    pub fn quarantine_batch_count(&self) -> usize {
+        self.quarantine_entries.len()
+    }
+
+    #[cfg(test)]
+    pub fn quarantine_bytes_used(&self) -> u64 {
+        self.quarantine_bytes
+    }
+
+    #[cfg(test)]
+    pub fn total_bytes_used_for_test(&self) -> u64 {
+        self.total_bytes_used()
     }
 
     /// Read a spooled batch's bytes, verifying the digest.
@@ -261,6 +488,74 @@ fn batch_file_name(sequence: u64) -> String {
     format!("{sequence}.json")
 }
 
+/// What `verify_batch_bytes` recovers from a payload on disk.
+struct BatchInfo {
+    digest: String,
+    events: usize,
+    priority: SpoolPriority,
+}
+
+/// Verify a batch payload well enough to re-admit it after a corrupt
+/// manifest: valid JSON, the envelope's idempotency key, and an events
+/// array. Priority is inferred from the event types present (a batch that
+/// carried a degradation_state keeps its never-drop protection).
+fn verify_batch_bytes(bytes: &[u8]) -> Result<BatchInfo, String> {
+    let v: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| format!("invalid JSON: {e}"))?;
+    if v.get("batch_idempotency_key")
+        .and_then(|k| k.as_str())
+        .is_none()
+    {
+        return Err("missing batch_idempotency_key".to_string());
+    }
+    let events = v
+        .get("events")
+        .and_then(|e| e.as_array())
+        .ok_or_else(|| "missing events array".to_string())?;
+    let mut has_detection = false;
+    let mut has_degradation = false;
+    for e in events {
+        match e.get("event_type").and_then(|t| t.as_str()) {
+            Some("degradation_state") => has_degradation = true,
+            Some("detection") => has_detection = true,
+            _ => {}
+        }
+    }
+    let priority = if has_degradation {
+        SpoolPriority::DegradationState
+    } else if has_detection {
+        SpoolPriority::Detection
+    } else {
+        SpoolPriority::Heartbeat
+    };
+    Ok(BatchInfo {
+        digest: hex::encode(Sha256::digest(bytes)),
+        events: events.len(),
+        priority,
+    })
+}
+
+/// Parse a `key: value` line out of a quarantine `.note` file.
+fn parse_note_field(note: &str, key: &str) -> Option<u64> {
+    note.lines().find_map(|line| {
+        let (k, v) = line.split_once(':')?;
+        if k.trim() == key {
+            v.trim().parse::<u64>().ok()
+        } else {
+            None
+        }
+    })
+}
+
+fn file_mtime_unix(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or_else(now_unix)
+}
+
 /// Pick the next batch to drop when a cap is hit: lowest priority (highest
 /// discriminant) first, then oldest — with the monotonic sequence as the
 /// final tie-break so same-second seals are still deterministic.
@@ -283,6 +578,29 @@ fn select_victim(
                 .cmp(&b.priority)
                 .then(b.sealed_at_unix.cmp(&a.sealed_at_unix))
                 .then(b.sequence.cmp(&a.sequence))
+        })
+        .map(|(i, _)| i)
+}
+
+/// Pick the next quarantined batch to evict: oldest first (by quarantine
+/// time, then sequence), but only when it's older than 24h or the shared
+/// byte cap is exceeded. Pure for testing.
+fn select_quarantine_victim(
+    entries: &VecDeque<QuarantineEntry>,
+    total_bytes_used: u64,
+    now_unix_secs: u64,
+) -> Option<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            total_bytes_used > SPOOL_MAX_BYTES
+                || now_unix_secs.saturating_sub(e.quarantined_at_unix) > SPOOL_MAX_AGE_SECS
+        })
+        .min_by(|(_, a), (_, b)| {
+            a.quarantined_at_unix
+                .cmp(&b.quarantined_at_unix)
+                .then(a.sequence.cmp(&b.sequence))
         })
         .map(|(i, _)| i)
 }
@@ -422,5 +740,133 @@ mod tests {
     #[test]
     fn batch_envelope_idempotency_key_uses_node_and_sequence() {
         assert_eq!(BatchEnvelope::idempotency_key("node_1", 42), "b:node_1:42");
+    }
+
+    fn qentry(sequence: u64, quarantined_at_unix: u64) -> QuarantineEntry {
+        QuarantineEntry {
+            sequence,
+            bytes: 64,
+            events: 2,
+            quarantined_at_unix,
+        }
+    }
+
+    #[test]
+    fn quarantine_victim_selection_is_oldest_first() {
+        let now = 1_700_000_000;
+        let entries: VecDeque<QuarantineEntry> =
+            [qentry(5, now), qentry(3, now - 10), qentry(7, now - 10)]
+                .into_iter()
+                .collect();
+        // Over the shared size cap: oldest first, sequence breaks ties.
+        assert_eq!(
+            select_quarantine_victim(&entries, SPOOL_MAX_BYTES + 1, now),
+            Some(1)
+        );
+        // Aged-out entry evicted even under the size cap.
+        let aged: VecDeque<QuarantineEntry> =
+            [qentry(5, now), qentry(6, now - SPOOL_MAX_AGE_SECS - 1)]
+                .into_iter()
+                .collect();
+        assert_eq!(select_quarantine_victim(&aged, 100, now), Some(1));
+        // Fresh and under the cap: no victim.
+        let fresh: VecDeque<QuarantineEntry> =
+            [qentry(5, now), qentry(6, now)].into_iter().collect();
+        assert_eq!(select_quarantine_victim(&fresh, 100, now), None);
+    }
+
+    #[test]
+    fn quarantine_bytes_count_toward_the_shared_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spool = Spool::open(dir.path()).unwrap();
+        spool
+            .store(&sealed(11, 4), SpoolPriority::Detection)
+            .unwrap();
+        assert_eq!(spool.total_bytes_used_for_test(), 64);
+        spool.quarantine(11, "409 conflict").unwrap();
+        assert_eq!(spool.batch_count(), 0);
+        assert_eq!(spool.quarantine_batch_count(), 1);
+        // The bytes moved with the batch: the cap still sees them.
+        assert_eq!(spool.quarantine_bytes_used(), 64);
+        assert_eq!(spool.total_bytes_used_for_test(), 64);
+        // The batch file and its note survived the move.
+        let qdir = dir.path().join(SPOOL_DIR_NAME).join(QUARANTINE_DIR);
+        assert!(qdir.join("11.json").exists());
+        assert!(qdir.join("11.note").exists());
+    }
+
+    #[test]
+    fn quarantine_index_rebuilt_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let qdir = dir.path().join(SPOOL_DIR_NAME).join(QUARANTINE_DIR);
+        std::fs::create_dir_all(&qdir).unwrap();
+        // A quarantined batch with a note, as quarantine() would leave it.
+        let bytes = br#"{"batch_idempotency_key":"b:n:21","events":[{"event_type":"detection"}]}"#;
+        std::fs::write(qdir.join("21.json"), bytes).unwrap();
+        std::fs::write(
+            qdir.join("21.note"),
+            "sequence: 21\ndigest: d\nquarantined_at_unix: 1700000000\nreason: 409\n",
+        )
+        .unwrap();
+        // And one without a note: open must note it (never delete un-noted).
+        std::fs::write(qdir.join("22.json"), bytes).unwrap();
+
+        let spool = Spool::open(dir.path()).unwrap();
+        assert_eq!(spool.quarantine_batch_count(), 2);
+        assert_eq!(spool.quarantine_bytes_used(), bytes.len() as u64 * 2);
+        assert!(
+            qdir.join("22.note").exists(),
+            "recovered batch must be noted"
+        );
+    }
+
+    #[test]
+    fn corrupt_manifest_rebuilds_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join(SPOOL_DIR_NAME);
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        // A valid sealed batch on disk...
+        let good = serde_json::json!({
+            "schema_version": "1.0.0",
+            "batch_idempotency_key": "b:n:5",
+            "events": [
+                {"event_id": "e1", "event_type": "detection"},
+                {"event_id": "e2", "event_type": "heartbeat"}
+            ]
+        });
+        std::fs::write(spool_dir.join("5.json"), serde_json::to_vec(&good).unwrap()).unwrap();
+        // ...a corrupt one...
+        std::fs::write(spool_dir.join("6.json"), b"not json at all").unwrap();
+        // ...and a corrupt manifest.
+        std::fs::write(spool_dir.join(MANIFEST_NAME), b"{truncated").unwrap();
+
+        let spool = Spool::open(dir.path()).unwrap();
+        // The valid batch was re-admitted with its digest recomputed; the
+        // corrupt file was skip-and-noted into quarantine.
+        assert_eq!(spool.batch_count(), 1);
+        let read = spool.read(5).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&read).unwrap();
+        assert_eq!(v["batch_idempotency_key"], "b:n:5");
+        assert_eq!(spool.quarantine_batch_count(), 1);
+        let qdir = spool_dir.join(QUARANTINE_DIR);
+        assert!(qdir.join("6.json").exists());
+        let note = std::fs::read_to_string(qdir.join("6.note")).unwrap();
+        assert!(note.contains("spool rebuild"), "note explains why: {note}");
+        // The rebuilt manifest is valid: a second open takes the fast path.
+        drop(spool);
+        let reopened = Spool::open(dir.path()).unwrap();
+        assert_eq!(reopened.batch_count(), 1);
+        assert_eq!(reopened.quarantine_batch_count(), 1);
+    }
+
+    #[test]
+    fn corrupt_manifest_with_no_batch_files_opens_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join(SPOOL_DIR_NAME);
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        std::fs::write(spool_dir.join(MANIFEST_NAME), b"\x00\x01 garbage").unwrap();
+        let spool = Spool::open(dir.path()).unwrap();
+        assert_eq!(spool.batch_count(), 0);
+        assert_eq!(spool.quarantine_batch_count(), 0);
     }
 }

@@ -24,6 +24,7 @@ const IDENTITY_KEYS: &[&str] = &[
     "process_name",
     "pid",
     "tid",
+    "tgid",
     "ppid",
     "parent_pid",
     "target_pid",
@@ -199,6 +200,45 @@ mod tests {
         assert_eq!(v["environment_score"], 0.9);
         // ...but substring secret fragments do match `my_tokenizer`.
         assert!(v.get("my_tokenizer").is_none());
+    }
+
+    #[test]
+    fn strict_scrub_removes_tgid_from_cpu_starvation_snapshots() {
+        // Shape mirrors collectors/runqueue_starvation.rs: the subject's
+        // tgid plus one per top_waiters entry. All are process identity.
+        let mut v = json!({
+            "tid": 4321,
+            "tgid": 1234,
+            "comm": "victim",
+            "wait_ms": 6100.0,
+            "window_secs": 10.0,
+            "top_waiters": [
+                {"tid": 111, "tgid": 100, "comm": "hog-a", "wait_ms": 50.0},
+                {"tid": 222, "tgid": 200, "comm": "hog-b", "wait_ms": 40.0}
+            ],
+            "evidence": {"runqueue_wait": "measured", "offender": "unavailable"}
+        });
+        scrub_value(&mut v, STRICT);
+        assert!(v.get("tid").is_none());
+        assert!(v.get("tgid").is_none());
+        assert!(v.get("comm").is_none());
+        for w in v["top_waiters"].as_array().unwrap() {
+            assert!(w.get("tid").is_none());
+            assert!(w.get("tgid").is_none());
+            assert!(w.get("comm").is_none());
+            assert!(w.get("wait_ms").is_some());
+        }
+        // Measurements survive.
+        assert_eq!(v["wait_ms"], 6100.0);
+        assert_eq!(v["evidence"]["runqueue_wait"], "measured");
+    }
+
+    #[test]
+    fn opt_in_preserves_tgid() {
+        let mut v = json!({"tgid": 1234, "top_waiters": [{"tgid": 100}]});
+        scrub_value(&mut v, OPT_IN);
+        assert_eq!(v["tgid"], 1234);
+        assert_eq!(v["top_waiters"][0]["tgid"], 100);
     }
 
     #[test]
