@@ -310,6 +310,77 @@ const CONSUMER_BUSY_CPU_PERCENT: f32 = 5.0;
 /// Bounds episode-capture size on a node with many concurrent consumers.
 const MAX_CANDIDATE_OFFENDERS: usize = 10;
 
+/// Upper bound on the system-wide top-CPU scan in
+/// `get_concurrent_cpu_consumers`. Only the hottest few pids ever get a
+/// `/proc/<pid>/cgroup` read for metadata resolution; the rest cannot be
+/// meaningful offender candidates anyway.
+const SYSTEM_SCAN_TOP_N: usize = 32;
+
+/// Whether the cgroup-PSI peer fallback should supply offender candidates.
+///
+/// True when no process-event signal names a pod *other than* the victim.
+/// Victim-only entries don't count as "having signals":
+/// `calculate_blame_attributions` drops the victim from every candidate
+/// set, so treating them as real signals would suppress the fallback and
+/// still produce zero attributions. Pure so the victim-only trap is pinned
+/// by a test.
+fn needs_peer_fallback(
+    consumers: &[CpuConsumer],
+    fork_counts: &HashMap<String, u64>,
+    short_job_counts: &HashMap<String, u64>,
+    victim_key: &str,
+) -> bool {
+    let consumer_names_other = consumers
+        .iter()
+        .any(|c| format!("{}/{}", c.namespace, c.pod) != victim_key);
+    let forks_name_other = fork_counts.keys().any(|k| k.as_str() != victim_key);
+    let jobs_name_other = short_job_counts.keys().any(|k| k.as_str() != victim_key);
+    !(consumer_names_other || forks_name_other || jobs_name_other)
+}
+
+/// Builds last-resort offender candidates from the cgroup scan's own per-pod
+/// CPU stall deltas, for when the process-event paths produced nothing at
+/// all: no live consumers, no fork counts, no short-job counts.
+///
+/// `peers` is `(namespace, pod, delta_stall_us)` for every pod the scan saw
+/// stalling this window; the victim is excluded by `victim_key`
+/// (`"namespace/pod"`). Each peer's `cpu_percent` is its share of the peers'
+/// total stall as a percent, so it feeds the same `cpu_share` term of the
+/// blame score a measured `CpuConsumer` would -- the blame math only ever
+/// uses relative shares.
+///
+/// This is deliberately the degraded tier: a pod showing CPU pressure is
+/// contending for CPU, but pressure alone cannot say whether it is the
+/// offender or a fellow victim (a pure busy-loop offender may show no
+/// pressure at all, since it never waits). It exists so the pair-attribution
+/// path degrades to "the pods that were also stalled" instead of to
+/// nothing. Pure so it can be tested without driving the scan loop.
+fn cgroup_peer_consumers(peers: &[(String, String, u64)], victim_key: &str) -> Vec<CpuConsumer> {
+    let total: u64 = peers
+        .iter()
+        .filter(|(ns, pod, _)| format!("{ns}/{pod}") != victim_key)
+        .map(|(_, _, delta)| *delta)
+        .sum();
+    if total == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<CpuConsumer> = peers
+        .iter()
+        .filter(|(ns, pod, _)| format!("{ns}/{pod}") != victim_key)
+        .map(|(ns, pod, delta)| CpuConsumer {
+            pod: pod.clone(),
+            namespace: ns.clone(),
+            cpu_percent: (*delta as f64 / total as f64 * 100.0) as f32,
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.cpu_percent
+            .partial_cmp(&a.cpu_percent)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out
+}
+
 /// How many samples of history (at the scan loop's 1-second cadence) to keep
 /// per signal per pod/container.
 ///
@@ -746,6 +817,15 @@ impl PsiMonitor {
                 }
             }
 
+            // Snapshot of the pods this scan saw stalling, for the cgroup-peer
+            // fallback below. Taken before `pod_deltas` is consumed by the
+            // trigger loop.
+            let stalled_peers: Vec<(String, String, u64)> = pod_deltas
+                .iter()
+                .filter(|(_, d)| d.has_previous_sample && d.delta_stall_us > 0)
+                .map(|(_, d)| (d.namespace.clone(), d.pod_name.clone(), d.delta_stall_us))
+                .collect();
+
             for (key, pod_delta) in pod_deltas {
                 if let Some(delta_stall) = pod_delta
                     .has_previous_sample
@@ -777,6 +857,36 @@ impl PsiMonitor {
                             let (fork_counts, short_job_counts) = self
                                 .context
                                 .get_pod_activity_window(self.sustained_pressure_duration);
+
+                            // Last-resort offender discovery. The process-event
+                            // paths count as "having offenders" only if some
+                            // entry names a pod OTHER than the victim:
+                            // calculate_blame_attributions drops the victim
+                            // from every candidate set, so victim-only signals
+                            // would otherwise suppress the fallback and still
+                            // yield zero attributions. Fall back to the pods
+                            // the cgroup scan itself saw stalling this window,
+                            // so pair attribution degrades instead of
+                            // vanishing.
+                            let consumers = if needs_peer_fallback(
+                                &consumers,
+                                &fork_counts,
+                                &short_job_counts,
+                                &key,
+                            ) {
+                                let peers = cgroup_peer_consumers(&stalled_peers, &key);
+                                if !peers.is_empty() {
+                                    info!(
+                                        "[psi] no process-event offenders for {}/{}; attributing from {} cgroup-PSI peer(s)",
+                                        pod_delta.namespace,
+                                        pod_delta.pod_name,
+                                        peers.len()
+                                    );
+                                }
+                                peers
+                            } else {
+                                consumers
+                            };
 
                             let mut victim_pre_window: BTreeMap<String, Vec<f64>> = BTreeMap::new();
                             victim_pre_window.insert(
@@ -1014,17 +1124,41 @@ impl PsiMonitor {
     }
 
     fn get_concurrent_cpu_consumers(&self) -> Vec<CpuConsumer> {
-        let live = self.context.get_live_map();
         let mut consumers: Vec<CpuConsumer> = Vec::new();
+        let mut seen_pids = std::collections::HashSet::new();
 
-        for (proc, meta_opt) in live.values() {
-            if let Some(cpu_pct) = proc.cpu_percent()
-                && cpu_pct > 0.0
-                && let Some(k8s_meta) = meta_opt
-            {
+        {
+            let live = self.context.get_live_map();
+            for (pid, (proc, meta_opt)) in live.iter() {
+                if let (Some(cpu_pct), Some(k8s_meta)) = (proc.cpu_percent(), meta_opt)
+                    && cpu_pct > 0.0
+                {
+                    seen_pids.insert(*pid);
+                    consumers.push(CpuConsumer {
+                        pod: k8s_meta.pod_name.clone(),
+                        namespace: k8s_meta.namespace.clone(),
+                        cpu_percent: cpu_pct,
+                    });
+                }
+            }
+        }
+
+        // The live map is event-sourced: a process that started before the
+        // daemon -- or whose Fork/Exec events were dropped under fork-storm
+        // load -- never appears in it, which is how a sustained StallEvent
+        // used to report "0 concurrent consumers" on a box with an obvious
+        // busy loop. Supplement with a system-wide scan; k8s metadata
+        // resolves per pid straight from /proc, so this covers exactly the
+        // processes the live map misses.
+        for (pid, cpu_pct) in self.context.top_cpu_pids_systemwide(SYSTEM_SCAN_TOP_N) {
+            if seen_pids.contains(&pid) {
+                continue;
+            }
+            if let Some(meta) = self.k8s_ctx.get_metadata_for_pid(pid) {
+                seen_pids.insert(pid);
                 consumers.push(CpuConsumer {
-                    pod: k8s_meta.pod_name.clone(),
-                    namespace: k8s_meta.namespace.clone(),
+                    pod: meta.pod_name.clone(),
+                    namespace: meta.namespace.clone(),
                     cpu_percent: cpu_pct,
                 });
             }
@@ -1612,5 +1746,178 @@ workingset_refault_file 7
         let mut acc: Option<u64> = None;
         accumulate_optional(&mut acc, None);
         assert_eq!(acc, None);
+    }
+
+    #[test]
+    fn test_cgroup_peer_consumers_excludes_victim_and_shares_stall() {
+        let peers = vec![
+            (
+                "default".to_string(),
+                "victim-workload".to_string(),
+                900_000,
+            ),
+            (
+                "default".to_string(),
+                "forkstorm-offender".to_string(),
+                300_000,
+            ),
+            (
+                "default".to_string(),
+                "quiet-neighbour".to_string(),
+                100_000,
+            ),
+        ];
+        let consumers = cgroup_peer_consumers(&peers, "default/victim-workload");
+
+        assert_eq!(consumers.len(), 2);
+        // Sorted by share descending; shares are of the 400_000 peer total.
+        assert_eq!(consumers[0].pod, "forkstorm-offender");
+        assert!((consumers[0].cpu_percent - 75.0).abs() < 0.001);
+        assert_eq!(consumers[1].pod, "quiet-neighbour");
+        assert!((consumers[1].cpu_percent - 25.0).abs() < 0.001);
+        assert!(
+            consumers.iter().all(|c| c.namespace == "default"),
+            "namespace must survive the fallback"
+        );
+    }
+
+    #[test]
+    fn test_cgroup_peer_consumers_empty_when_only_victim_stalled() {
+        let peers = vec![(
+            "default".to_string(),
+            "victim-workload".to_string(),
+            500_000,
+        )];
+        assert!(cgroup_peer_consumers(&peers, "default/victim-workload").is_empty());
+        assert!(cgroup_peer_consumers(&[], "default/victim-workload").is_empty());
+    }
+
+    #[test]
+    fn test_cgroup_peer_consumers_feeds_blame_attribution() {
+        // The whole point of the fallback: with no process-event signals at
+        // all, a stalling peer still produces a pair attribution naming it.
+        let peers = vec![
+            (
+                "default".to_string(),
+                "victim-workload".to_string(),
+                1_000_000,
+            ),
+            (
+                "default".to_string(),
+                "forkstorm-offender".to_string(),
+                1_000_000,
+            ),
+        ];
+        let consumers = cgroup_peer_consumers(&peers, "default/victim-workload");
+        let event = StallEvent {
+            event_id: "peer-fallback".to_string(),
+            victim_pod: "victim-workload".to_string(),
+            victim_namespace: "default".to_string(),
+            stall_delta_us: 1_000_000,
+            timestamp: Instant::now(),
+            concurrent_consumers: consumers,
+            fork_counts: HashMap::new(),
+            short_job_counts: HashMap::new(),
+            memory_stall_delta_us: 0,
+            io_stall_delta_us: 0,
+            memory_bytes: 0,
+            io_bytes: 0,
+            memory_anon_bytes: None,
+            memory_file_bytes: None,
+            memory_slab_bytes: None,
+            memory_pgmajfault_delta: None,
+            workingset_refault_delta: None,
+            candidates: vec![],
+        };
+
+        let attributions = calculate_blame_attributions(&event);
+        assert_eq!(attributions.len(), 1);
+        let attr = &attributions[0];
+        assert_eq!(attr.offender_pod, "forkstorm-offender");
+        assert_eq!(attr.victim_pod, "victim-workload");
+        assert!(attr.attributed_stall_us > 0);
+        assert!((attr.cpu_share - 1.0).abs() < 0.001);
+    }
+
+    fn peer_consumer(pod: &str) -> CpuConsumer {
+        CpuConsumer {
+            pod: pod.to_string(),
+            namespace: "default".to_string(),
+            cpu_percent: 42.0,
+        }
+    }
+
+    #[test]
+    fn test_needs_peer_fallback_victim_only_signals() {
+        // The Codex P1 trap: the only process-derived entries belong to the
+        // victim itself. calculate_blame_attributions drops the victim from
+        // every candidate set, so these must NOT suppress the fallback.
+        let consumers = vec![peer_consumer("victim-workload")];
+        let mut forks = HashMap::new();
+        forks.insert("default/victim-workload".to_string(), 7u64);
+        let mut jobs = HashMap::new();
+        jobs.insert("default/victim-workload".to_string(), 3u64);
+        assert!(needs_peer_fallback(
+            &consumers,
+            &forks,
+            &jobs,
+            "default/victim-workload"
+        ));
+        // Each signal class alone is enough to trigger the trap.
+        assert!(needs_peer_fallback(
+            &consumers,
+            &HashMap::new(),
+            &HashMap::new(),
+            "default/victim-workload"
+        ));
+        assert!(needs_peer_fallback(
+            &[],
+            &forks,
+            &HashMap::new(),
+            "default/victim-workload"
+        ));
+        assert!(needs_peer_fallback(
+            &[],
+            &HashMap::new(),
+            &jobs,
+            "default/victim-workload"
+        ));
+        assert!(needs_peer_fallback(
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            "default/victim-workload"
+        ));
+    }
+
+    #[test]
+    fn test_needs_peer_fallback_suppressed_by_real_offender_signal() {
+        let mut forks = HashMap::new();
+        forks.insert("default/forkstorm-offender".to_string(), 7u64);
+        // A non-victim fork entry suppresses the fallback even when the
+        // victim also appears as a consumer.
+        assert!(!needs_peer_fallback(
+            &[peer_consumer("victim-workload")],
+            &forks,
+            &HashMap::new(),
+            "default/victim-workload"
+        ));
+        // Same for a non-victim consumer alongside victim fork noise.
+        let mut victim_forks = HashMap::new();
+        victim_forks.insert("default/victim-workload".to_string(), 7u64);
+        assert!(!needs_peer_fallback(
+            &[peer_consumer("forkstorm-offender")],
+            &victim_forks,
+            &HashMap::new(),
+            "default/victim-workload"
+        ));
+        let mut jobs = HashMap::new();
+        jobs.insert("default/forkstorm-offender".to_string(), 3u64);
+        assert!(!needs_peer_fallback(
+            &[],
+            &HashMap::new(),
+            &jobs,
+            "default/victim-workload"
+        ));
     }
 }

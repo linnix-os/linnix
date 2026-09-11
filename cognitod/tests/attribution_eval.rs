@@ -867,3 +867,118 @@ async fn poll_until<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) 
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
+
+/// Regression test for the production "0 concurrent consumers" gap: with an
+/// empty live-process map and no process events at all (every offender
+/// predates the daemon, so the event-sourced map never learned them), a
+/// stalling victim must still produce a pair attribution -- via the
+/// cgroup-PSI peer fallback -- naming the stalled neighbour as the offender,
+/// and the `linnix_stall_induced_seconds_total` series must appear.
+///
+/// This is the `kind-linnix-demo` shape: `forkstorm-offender` and
+/// `victim-workload` both show CPU pressure, but no Fork/Exec event ever
+/// reached the daemon for either pod's long-lived processes.
+#[tokio::test]
+async fn scan_loop_attributes_stall_to_cgroup_peer_with_no_process_events() {
+    use cognitod::collectors::psi::PsiMonitor;
+    use cognitod::context::ContextStore;
+    use cognitod::k8s::{K8sContext, K8sMetadata, Priority};
+
+    // K8sContext::new reads its endpoint from the environment; the watcher is
+    // never started, so nothing is actually dialled.
+    unsafe {
+        std::env::set_var("K8S_API_URL", "http://127.0.0.1:1");
+        std::env::set_var("K8S_TOKEN", "dummy");
+    }
+    let k8s_ctx = K8sContext::new().expect("K8sContext should build from env");
+
+    for (container_id, pod_name) in [
+        ("e".repeat(64), "victim-workload"),
+        ("f".repeat(64), "forkstorm-offender"),
+    ] {
+        k8s_ctx.insert_metadata(
+            container_id,
+            K8sMetadata {
+                pod_name: pod_name.to_string(),
+                namespace: "default".to_string(),
+                container_name: "app".to_string(),
+                owner_kind: None,
+                owner_name: None,
+                priority: Priority::default(),
+                slo_tier: None,
+            },
+        );
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut pressure_files = Vec::new();
+    for (container_id, pod_slice) in [("e".repeat(64), "pod-e"), ("f".repeat(64), "pod-f")] {
+        let cgroup_dir = tmp.path().join("kubepods.slice").join(format!(
+            "kubepods-burstable-{pod_slice}.slice/cri-containerd-{container_id}.scope"
+        ));
+        std::fs::create_dir_all(&cgroup_dir).unwrap();
+        pressure_files.push(cgroup_dir.join("cpu.pressure"));
+    }
+    let write_pressure = |total: u64| {
+        for pressure_file in &pressure_files {
+            std::fs::write(
+                pressure_file,
+                format!(
+                    "some avg10=10.00 avg60=5.00 avg300=1.00 total={total}\n\
+                     full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+                ),
+            )
+            .unwrap();
+        }
+    };
+    write_pressure(1_000_000);
+
+    let metrics = Arc::new(BlameMetrics::new("node-1"));
+    let sink = Arc::new(AttributionSink::new(metrics.clone(), None, "node-1"));
+    // Deliberately no process events: the live map and the history queue stay
+    // empty, exactly like a daemon that started after its workloads.
+    let context = Arc::new(ContextStore::new(
+        Duration::from_secs(60),
+        1000,
+        Some(k8s_ctx.clone()),
+    ));
+
+    let monitor = PsiMonitor::new(k8s_ctx, context, None, 0, sink)
+        .with_cgroup_root(tmp.path())
+        .with_max_iterations(60);
+    let handle = tokio::spawn(monitor.run());
+
+    // Both pods keep stalling while the monitor scans.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    write_pressure(2_500_000);
+
+    // The pair series must name forkstorm-offender -> victim-workload. (The
+    // reverse pair also appears: with no process signals the fallback cannot
+    // tell offender from fellow victim, which is the documented cost of the
+    // degraded tier.)
+    let line = poll_until(Duration::from_secs(30), || {
+        let mut body = String::new();
+        metrics.render_prometheus(&mut body);
+        body.lines()
+            .find(|l| {
+                l.starts_with("linnix_stall_induced_seconds_total{")
+                    && l.contains(r#"offender_pod="forkstorm-offender""#)
+                    && l.contains(r#"victim_pod="victim-workload""#)
+            })
+            .map(str::to_string)
+    })
+    .await
+    .expect("cgroup-peer fallback never produced the offender->victim pair series");
+    handle.abort();
+
+    assert!(
+        line.contains(r#"offender_namespace="default""#),
+        "line was: {line}"
+    );
+    assert!(
+        line.contains(r#"victim_namespace="default""#),
+        "line was: {line}"
+    );
+    // Note: unlike `linnix_pod_psi_pressure_total`, the pair series carries no
+    // `node` label -- the (offender, victim) key is the whole identity.
+}
