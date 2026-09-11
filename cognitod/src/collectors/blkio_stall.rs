@@ -8,25 +8,34 @@
 //!
 //! Design:
 //!
-//! * **Signal (inferred):** every 2s, each process's `wchan` is classified.
-//!   The finding is the fraction of samples in a 60s sliding window whose
-//!   `wchan` named a block-layer wait point (`io_schedule`,
-//!   `wait_on_page_bit` family, `blkdev_issue_*`, `get_request*`), i.e.
-//!   "process P was observed waiting on block IO in X% of samples".
-//!   Warn at >= 50%, critical at >= 80% — sustained, not a passing read.
-//! * **Cross-check (measured):** `/proc/<pid>/io` `read_bytes`/`write_bytes`
-//!   deltas ride along in the snapshot. Bytes moving while wchan says
-//!   "waiting" is the normal shape of an IO-heavy victim; bytes *not*
-//!   moving across the whole window is worse — possibly hung storage —
-//!   and the report line says so. The cross-check never gates the finding:
-//!   a stuck task is still a stall.
+//! * **Signal (inferred):** every 2s, each thread's `wchan` is classified
+//!   and aggregated to the process — a poll counts as a block-wait sample
+//!   when *any* thread is observed in a block-layer wait (`io_schedule`,
+//!   `wait_on_page_bit` family, `blkdev_issue_*`, `get_request*`), since
+//!   `/proc/<pid>/wchan` alone only reflects the thread-group leader.
+//!   The finding is the fraction of samples in a 60s sliding window in
+//!   which the process was observed waiting on block IO. Warn at >= 50%,
+//!   critical at >= 80% — sustained, not a passing read.
+//! * **Cross-check (measured when readable):** `/proc/<pid>/io`
+//!   `read_bytes`/`write_bytes` deltas ride along in the snapshot,
+//!   computed newest-minus-oldest *inside* the window from timestamped
+//!   samples. Bytes moving while wchan says "waiting" is the normal shape
+//!   of an IO-heavy victim; bytes *not* moving across the whole window is
+//!   worse — possibly hung storage — and the report line says so, but only
+//!   when the counters were actually read: unreadable counters are labeled
+//!   `unavailable`, never fabricated as zero. The cross-check never gates
+//!   the finding: a stuck task is still a stall.
 //! * **Warm-up honesty:** the percentage is normalized against the full
 //!   window's expected sample count (30), not the samples observed so far,
 //!   so a short-lived burst can't inflate into a verdict — same lesson as
 //!   the fork monitor's review fix. New processes accumulate samples from
 //!   zero and converge to their true fraction.
-//! * **Cost:** one `wchan` read per process per 2s poll (tiny files,
-//!   negligible); `io` is read only for processes with at least one
+//! * **Cost:** one `task`-dir listing plus one `wchan` read per thread per
+//!   2s poll (tiny files, microseconds each; the scan stops at the first
+//!   block-wait found, so stalled processes cost a partial scan).
+//!   Per-process thread scans are capped at 1024 lowest tids — the cap
+//!   only engages on pathological thread counts, and the scan repeats
+//!   every poll. `io` is read only for processes with at least one
 //!   block-wait sample in the window (suspects), so idle hosts pay almost
 //!   nothing. Per-pid state is pruned by window age, so exited processes
 //!   are forgotten within 60s.
@@ -63,6 +72,12 @@ const DEFAULT_WARN_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 const MAX_COOLDOWN_ENTRIES: usize = 1024;
 /// How many distinct block-wait kinds ride along in the incident snapshot.
 const TOP_WCHAN_KINDS: usize = 4;
+/// Cap on threads scanned per process per poll for the wchan sample.
+/// One wchan read is microseconds, but a pathological 100k-thread process
+/// must not stall the 2s loop: lowest tids first (deterministic; thread
+/// IDs are allocated densely from the leader, so the cap only engages on
+/// absurd thread counts), and the scan repeats every poll anyway.
+const MAX_WCHAN_THREADS_PER_POLL: usize = 1024;
 
 /// What a process's sampled block-IO wait fraction means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -98,19 +113,28 @@ pub struct BlkioStall {
     /// Samples a full window holds (denominator of `wait_pct`).
     pub expected_samples: u32,
     /// `/proc/<pid>/io` deltas across the suspect window, for the
-    /// cross-check: bytes moving vs. not.
-    pub io_read_bytes_delta: u64,
-    pub io_write_bytes_delta: u64,
+    /// cross-check: bytes moving vs. not. `None` when the counters were
+    /// never successfully read inside the window (unreadable or raced
+    /// with process exit) — absence is not zero, and the snapshot labels
+    /// it `unavailable` instead of fabricating a zero delta.
+    pub io_bytes_delta: Option<(u64, u64)>,
     /// Observed block-wait kinds and their sample counts, most common first.
     pub wchan_kinds: Vec<(String, u32)>,
     pub verdict: BlkioVerdict,
 }
 
 impl BlkioStall {
-    /// Stable identity for cooldown and incident-dedup keys. PIDs recycle;
-    /// the command name is the identity that survives.
+    /// Stable identity for cooldown and incident-dedup keys: the process
+    /// plus its command name. PIDs are unique per process system-wide, so
+    /// this distinguishes two `postgres` backends where a comm-only key
+    /// suppressed every same-named process for the whole cooldown. A
+    /// recycled PID's counters regress, which re-baselines the
+    /// measurement — and the store keys the verdict to this identity, so
+    /// the new process dedups against its own history, not another
+    /// victim's.
     fn victim_label(&self) -> String {
-        self.comm.clone().unwrap_or_else(|| "unknown".to_string())
+        let comm = self.comm.clone().unwrap_or_else(|| "unknown".to_string());
+        format!("{comm} (pid={})", self.pid)
     }
 }
 
@@ -154,8 +178,38 @@ fn blkio_wait_kind(wchan: &str) -> Option<&'static str> {
     }
 }
 
-fn read_wchan(proc_root: &Path, pid: u32) -> Option<String> {
-    std::fs::read_to_string(proc_root.join(pid.to_string()).join("wchan")).ok()
+/// Thread IDs for a process. Falls back to the leader alone when the
+/// `task` directory can't be listed (a thread exiting mid-scan, or a
+/// fixture tree without per-thread files).
+fn list_tids(proc_root: &Path, pid: u32) -> Vec<u32> {
+    let task_dir = proc_root.join(pid.to_string()).join("task");
+    let Ok(entries) = std::fs::read_dir(&task_dir) else {
+        return vec![pid];
+    };
+    let mut tids: Vec<u32> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .collect();
+    if tids.is_empty() {
+        tids.push(pid);
+    }
+    tids.sort_unstable();
+    tids
+}
+
+/// One thread's `wchan`. The leader's file is also visible at the plain
+/// pid path; worker threads live under `task/<tid>/`.
+fn read_thread_wchan(proc_root: &Path, pid: u32, tid: u32) -> Option<String> {
+    let path = if tid == pid {
+        proc_root.join(pid.to_string()).join("wchan")
+    } else {
+        proc_root
+            .join(pid.to_string())
+            .join("task")
+            .join(tid.to_string())
+            .join("wchan")
+    };
+    std::fs::read_to_string(path).ok()
 }
 
 fn read_comm(proc_root: &Path, pid: u32) -> Option<String> {
@@ -199,14 +253,15 @@ fn list_pids(proc_root: &Path) -> Vec<u32> {
     out
 }
 
-/// IO-byte baseline for a suspect process: first and latest counters inside
-/// the window, so the snapshot can cross-check "waiting" against "moving".
-#[derive(Debug, Clone, Copy)]
+/// IO-byte baseline for a suspect process: timestamped
+/// `(sampled_at, read_bytes, write_bytes)` counter samples inside the
+/// sliding window. The reported delta is newest-minus-oldest *in the
+/// window*, so a stall that started hours ago doesn't smear ancient
+/// progress into the current window — and earlier progress can't conceal
+/// that no bytes moved during the last 60s.
+#[derive(Debug, Clone, Default)]
 struct IoBaseline {
-    first_read: u64,
-    first_write: u64,
-    last_read: u64,
-    last_write: u64,
+    samples: VecDeque<(Instant, u64, u64)>,
 }
 
 /// Stateful block-IO stall monitor.
@@ -320,6 +375,28 @@ impl BlkioStallMonitor {
         true
     }
 
+    /// One poll's block-wait sample for a process: `Some(kind)` when any
+    /// scanned thread is observed in a block-layer wait, `None`
+    /// otherwise. `/proc/<pid>/wchan` reflects only the thread-group
+    /// leader, so worker-thread stalls (databases, app servers whose
+    /// leader idles in a futex/event loop) are invisible without the
+    /// per-thread enumeration — the poll counts as a block-wait sample
+    /// for the process when *any* thread is waiting. Threads are scanned
+    /// lowest-tid-first up to `MAX_WCHAN_THREADS_PER_POLL`; a thread that
+    /// exits mid-scan is skipped (unreadable wchan is not a wait).
+    fn sample_process_wchan(&self, pid: u32) -> Option<&'static str> {
+        for tid in list_tids(&self.proc_root, pid)
+            .into_iter()
+            .take(MAX_WCHAN_THREADS_PER_POLL)
+        {
+            let wchan = read_thread_wchan(&self.proc_root, pid, tid).unwrap_or_default();
+            if let Some(kind) = blkio_wait_kind(&wchan) {
+                return Some(kind);
+            }
+        }
+        None
+    }
+
     /// One poll: sample every process's `wchan`, maintain the suspect
     /// windows, and return a finding for the worst block-IO waiter when it
     /// is actionable.
@@ -328,10 +405,10 @@ impl BlkioStallMonitor {
     }
 
     fn tick_at(&mut self, now: Instant) -> Option<BlkioStall> {
-        // 1. Sample wchan for every process; record block-wait sightings.
+        // 1. Sample wchan for every thread of every process; record a
+        // block-wait sighting for the process when any thread waits.
         for pid in list_pids(&self.proc_root) {
-            let wchan = read_wchan(&self.proc_root, pid).unwrap_or_default();
-            if let Some(kind) = blkio_wait_kind(&wchan) {
+            if let Some(kind) = self.sample_process_wchan(pid) {
                 self.wait_samples
                     .entry(pid)
                     .or_default()
@@ -340,40 +417,25 @@ impl BlkioStallMonitor {
         }
 
         // 2. IO cross-check, suspects only: fold this poll's counters into
-        // the baseline. A regressing counter means the PID was recycled:
-        // re-baseline instead of fabricating a negative delta.
+        // the timestamped baseline. A regressing counter means the PID was
+        // recycled: re-baseline instead of fabricating a negative delta.
+        // Unreadable counters simply add no sample — availability is
+        // tracked explicitly (see fix below), never fabricated as zero.
         let suspects: Vec<u32> = self.wait_samples.keys().copied().collect();
         for pid in suspects {
             let Some((r, w)) = read_io_bytes(&self.proc_root, pid) else {
                 continue;
             };
-            match self.io_baselines.get_mut(&pid) {
-                Some(baseline) => {
-                    if r < baseline.last_read || w < baseline.last_write {
-                        debug!("[blkio] io counters regressed for pid={pid}; re-baselining");
-                        *baseline = IoBaseline {
-                            first_read: r,
-                            first_write: w,
-                            last_read: r,
-                            last_write: w,
-                        };
-                    } else {
-                        baseline.last_read = r;
-                        baseline.last_write = w;
-                    }
-                }
-                None => {
-                    self.io_baselines.insert(
-                        pid,
-                        IoBaseline {
-                            first_read: r,
-                            first_write: w,
-                            last_read: r,
-                            last_write: w,
-                        },
-                    );
-                }
+            let baseline = self.io_baselines.entry(pid).or_default();
+            if baseline
+                .samples
+                .back()
+                .is_some_and(|&(_, last_r, last_w)| r < last_r || w < last_w)
+            {
+                debug!("[blkio] io counters regressed for pid={pid}; re-baselining");
+                baseline.samples.clear();
             }
+            baseline.samples.push_back((now, r, w));
         }
 
         // 3. Age out samples older than the window; forget processes with
@@ -390,6 +452,26 @@ impl BlkioStallMonitor {
         }
         for pid in empty_pids {
             self.wait_samples.remove(&pid);
+            self.io_baselines.remove(&pid);
+        }
+        // Age the IO samples with the same window: the delta below must
+        // cover the window, not the process's lifetime. Drop baselines
+        // whose samples all aged out — their counters are unobservable
+        // now, which the finding reports as unavailable.
+        let mut stale_io = Vec::new();
+        for (pid, baseline) in self.io_baselines.iter_mut() {
+            while baseline
+                .samples
+                .front()
+                .is_some_and(|&(t, _, _)| t < cutoff)
+            {
+                baseline.samples.pop_front();
+            }
+            if baseline.samples.is_empty() {
+                stale_io.push(*pid);
+            }
+        }
+        for pid in stale_io {
             self.io_baselines.remove(&pid);
         }
 
@@ -420,16 +502,16 @@ impl BlkioStallMonitor {
             .collect();
         wchan_kinds.sort_by_key(|a| std::cmp::Reverse(a.1));
         wchan_kinds.truncate(TOP_WCHAN_KINDS);
-        let (io_read_bytes_delta, io_write_bytes_delta) = self
-            .io_baselines
-            .get(&pid)
-            .map(|b| {
-                (
-                    b.last_read.saturating_sub(b.first_read),
-                    b.last_write.saturating_sub(b.first_write),
-                )
-            })
-            .unwrap_or((0, 0));
+        // Newest-minus-oldest *inside the window*; `None` when no counter
+        // sample survived the window — never a fabricated zero.
+        let io_bytes_delta: Option<(u64, u64)> = self.io_baselines.get(&pid).and_then(|b| {
+            let &(_, first_r, first_w) = b.samples.front()?;
+            let &(_, last_r, last_w) = b.samples.back()?;
+            Some((
+                last_r.saturating_sub(first_r),
+                last_w.saturating_sub(first_w),
+            ))
+        });
         Some(BlkioStall {
             pid,
             comm: read_comm(&self.proc_root, pid),
@@ -437,8 +519,7 @@ impl BlkioStallMonitor {
             window_secs: WINDOW.as_secs_f64(),
             wait_samples,
             expected_samples: self.expected_samples,
-            io_read_bytes_delta,
-            io_write_bytes_delta,
+            io_bytes_delta,
             wchan_kinds,
             verdict,
         })
@@ -545,9 +626,12 @@ impl BlkioStallMonitor {
 ///   fields this monitor doesn't sample, so they're zero/empty; the
 ///   triggering reading is the sampled block-wait fraction, carried in
 ///   `system_snapshot`.
-/// * `target_pid` / `target_name` name the victim process.
+/// * `target_pid` / `target_name` name the victim process; the name
+///   carries the PID so same-comm victims are distinct identities.
 /// * The wait fraction is `inferred` (sampled wchan peeks, not delay
-///   accounting); the IO byte deltas are `measured` kernel counters.
+///   accounting); the IO byte deltas are `measured` kernel counters when
+///   they were readable inside the window, `unavailable` otherwise —
+///   never a fabricated zero.
 fn incident_from_finding(finding: &BlkioStall) -> Incident {
     let wchan_kinds: Vec<serde_json::Value> = finding
         .wchan_kinds
@@ -561,17 +645,18 @@ fn incident_from_finding(finding: &BlkioStall) -> Incident {
         "window_secs": finding.window_secs,
         "wait_samples": finding.wait_samples,
         "expected_samples": finding.expected_samples,
-        "io_read_bytes_delta": finding.io_read_bytes_delta,
-        "io_write_bytes_delta": finding.io_write_bytes_delta,
+        "io_read_bytes_delta": finding.io_bytes_delta.map(|(r, _)| r),
+        "io_write_bytes_delta": finding.io_bytes_delta.map(|(_, w)| w),
         "wchan_kinds": wchan_kinds,
         "source_tier": "polling",
         "verdict": format!("{:?}", finding.verdict),
         // wchan sampling is an inferred fraction; the io counters are
-        // measured. No bytes moving across the whole window while wchan
-        // says "waiting" is the hung-storage shape.
+        // measured when readable, unavailable when not. No bytes moving
+        // across the whole window while wchan says "waiting" is the
+        // hung-storage shape.
         "evidence": {
             "blkio_wait": "inferred",
-            "io_counters": "measured",
+            "io_counters": if finding.io_bytes_delta.is_some() { "measured" } else { "unavailable" },
         },
     });
     Incident {
@@ -595,25 +680,29 @@ fn incident_from_finding(finding: &BlkioStall) -> Incident {
 }
 
 /// One human- and agent-readable line per actionable finding. The wait
-/// fraction is `inferred`; the IO deltas are `measured` — the tags say
-/// which is which.
+/// fraction is `inferred`; the IO deltas are `measured` when readable and
+/// `unavailable` when not — the tags say which is which, and the
+/// hung-storage note only appears for counters that were actually read.
 fn report(finding: &BlkioStall) {
     let victim = match finding.comm.as_deref() {
         Some(comm) => format!("{comm} (pid={})", finding.pid),
         None => format!("pid={}", finding.pid),
     };
-    let io_note = if finding.io_read_bytes_delta == 0 && finding.io_write_bytes_delta == 0 {
-        "; no IO progress across the window — possible hung storage"
-    } else {
-        ""
+    let (io_note, io_tag) = match finding.io_bytes_delta {
+        Some((0, 0)) => (
+            "; no IO progress across the window — possible hung storage",
+            "io counters measured",
+        ),
+        Some(_) => ("", "io counters measured"),
+        None => ("", "io counters unavailable"),
     };
     match finding.verdict {
         BlkioVerdict::BlkioWarning => warn!(
-            "[blkio] WARNING: process {victim} spent {:.0}% of the last {:.0}s in block-IO wait ({}/{} samples) [wait inferred, io counters measured]{io_note}",
+            "[blkio] WARNING: process {victim} spent {:.0}% of the last {:.0}s in block-IO wait ({}/{} samples) [wait inferred, {io_tag}]{io_note}",
             finding.wait_pct, finding.window_secs, finding.wait_samples, finding.expected_samples,
         ),
         BlkioVerdict::BlkioCritical => warn!(
-            "[blkio] CRITICAL: process {victim} spent {:.0}% of the last {:.0}s in block-IO wait ({}/{} samples) — effectively stalled on storage [wait inferred, io counters measured]{io_note}",
+            "[blkio] CRITICAL: process {victim} spent {:.0}% of the last {:.0}s in block-IO wait ({}/{} samples) — effectively stalled on storage [wait inferred, {io_tag}]{io_note}",
             finding.wait_pct, finding.window_secs, finding.wait_samples, finding.expected_samples,
         ),
         BlkioVerdict::Healthy => {}
@@ -659,6 +748,26 @@ mod tests {
             fs::write(d.join("comm"), format!("{comm}\n")).unwrap();
         }
 
+        /// (Re)places one thread's wchan. The leader's wchan is also
+        /// mirrored at `<pid>/wchan`, like the kernel's alias.
+        fn set_thread_wchan(&self, pid: u32, tid: u32, wchan: &str) {
+            let task = self
+                .dir
+                .path()
+                .join(pid.to_string())
+                .join("task")
+                .join(tid.to_string());
+            fs::create_dir_all(&task).unwrap();
+            fs::write(task.join("wchan"), format!("{wchan}\n")).unwrap();
+            if tid == pid {
+                fs::write(
+                    self.dir.path().join(pid.to_string()).join("wchan"),
+                    format!("{wchan}\n"),
+                )
+                .unwrap();
+            }
+        }
+
         fn remove_pid(&self, pid: u32) {
             fs::remove_dir_all(self.dir.path().join(pid.to_string())).unwrap();
         }
@@ -676,8 +785,7 @@ mod tests {
             window_secs: 60.0,
             wait_samples: 18,
             expected_samples: 30,
-            io_read_bytes_delta: 1_000_000,
-            io_write_bytes_delta: 0,
+            io_bytes_delta: Some((1_000_000, 0)),
             wchan_kinds: vec![("io_schedule".to_string(), 18)],
             verdict: BlkioVerdict::BlkioWarning,
         }
@@ -731,6 +839,58 @@ mod tests {
     }
 
     #[test]
+    fn worker_thread_block_wait_fires() {
+        // The leader idles in a futex (event loop) while a worker is stuck
+        // in io_schedule: /proc/<pid>/wchan alone would miss this
+        // entirely, so the monitor enumerates task/<tid>/wchan and a poll
+        // counts when *any* thread waits.
+        let fake = FakeProc::new();
+        // 6s poll => 10 expected samples per 60s window.
+        let mut mon = fake.monitor_with_interval(Duration::from_secs(6));
+        let t0 = Instant::now();
+        let mut finding = None;
+        for i in 0..10 {
+            fake.set_proc(100, "db", "futex_wait_queue_me", 1000 * i, 0);
+            fake.set_thread_wchan(100, 101, "io_schedule");
+            finding = mon.tick_at(t0 + Duration::from_secs(6 * i));
+        }
+        let finding = finding.expect("worker-thread block-IO wait must fire");
+        assert_eq!(finding.pid, 100);
+        assert_eq!(finding.verdict, BlkioVerdict::BlkioCritical);
+        assert_eq!(
+            finding.wchan_kinds,
+            vec![("io_schedule".to_string(), 10)],
+            "the worker thread's wait kind must be reported"
+        );
+        // The IO cross-check still rode along for the process.
+        assert_eq!(finding.io_bytes_delta, Some((9000, 0)));
+    }
+
+    #[test]
+    fn thread_scan_cap_bounds_cost() {
+        // 1030 threads, lowest tids first, cap at 1024: the stalled
+        // thread beyond the cap is not sampled on this poll. This pins
+        // the documented tradeoff — pathological thread counts can't
+        // stall the 2s loop, at the cost of missing waits past the cap.
+        let fake = FakeProc::new();
+        let mon = fake.monitor_with_interval(Duration::from_secs(2));
+        fake.set_proc(100, "db", "futex_wait_queue_me", 0, 0);
+        for tid in 101..=1129u32 {
+            let wchan = if tid == 1129 {
+                "io_schedule"
+            } else {
+                "futex_wait_queue_me"
+            };
+            fake.set_thread_wchan(100, tid, wchan);
+        }
+        assert_eq!(
+            mon.sample_process_wchan(100),
+            None,
+            "threads past the per-process scan cap are not sampled"
+        );
+    }
+
+    #[test]
     fn warmup_under_reports_and_converges() {
         // 6s poll => 10 expected samples per 60s window. Four wait samples
         // are 40% — a short burst must not inflate into a verdict just
@@ -775,7 +935,10 @@ mod tests {
         assert_eq!(finding.pid, 100);
         assert_eq!(finding.comm.as_deref(), Some("backfill"));
         // The IO cross-check rode along: bytes moved while waiting.
-        assert!(finding.io_read_bytes_delta > 0);
+        assert!(
+            matches!(finding.io_bytes_delta, Some((r, _)) if r > 0),
+            "read-byte delta must be measured and positive"
+        );
         assert_eq!(
             finding.wchan_kinds,
             vec![("wait_on_page".to_string(), 30)],
@@ -797,8 +960,11 @@ mod tests {
             finding = mon.tick_at(t0 + Duration::from_secs(2 * i));
         }
         let finding = finding.expect("must fire");
-        assert_eq!(finding.io_read_bytes_delta, 0);
-        assert_eq!(finding.io_write_bytes_delta, 0);
+        assert_eq!(
+            finding.io_bytes_delta,
+            Some((0, 0)),
+            "counters were read and did not move: a measured zero"
+        );
     }
 
     #[test]
@@ -828,8 +994,64 @@ mod tests {
             .tick_at(t0 + Duration::from_secs(60))
             .expect("must fire");
         assert_eq!(
-            finding.io_read_bytes_delta, 3900,
+            finding.io_bytes_delta,
+            Some((3900, 0)),
             "delta must be measured from the re-baselined counters"
+        );
+    }
+
+    #[test]
+    fn io_delta_covers_only_the_window() {
+        // 2s poll, 60s window, 36 ticks (t=0..70s). Bytes move early, then
+        // stop at t=40s. The reported delta must be newest-minus-oldest
+        // *inside the window* — [t=10s, t=70s]: 20000-5000 — not since
+        // first sighting, so ancient progress can't smear into (or
+        // conceal a stall within) the current window.
+        let fake = FakeProc::new();
+        let mut mon = fake.monitor_with_interval(Duration::from_secs(2));
+        let t0 = Instant::now();
+        let mut finding = None;
+        for i in 0..=35u64 {
+            fake.set_proc(100, "backfill", "io_schedule", 1000 * i.min(20), 0);
+            finding = mon.tick_at(t0 + Duration::from_secs(2 * i));
+        }
+        let finding = finding.expect("must fire");
+        assert_eq!(
+            finding.io_bytes_delta,
+            Some((15_000, 0)),
+            "delta must cover only the 60s window"
+        );
+    }
+
+    #[test]
+    fn unavailable_io_counters_are_not_fabricated() {
+        // wchan says "waiting" but /proc/<pid>/io is unreadable (raced
+        // with process exit): the finding still fires — the cross-check
+        // never gates — but the counters are labeled unavailable, not
+        // zero, and no hung-storage claim is made.
+        let fake = FakeProc::new();
+        let mut mon = fake.monitor_with_interval(Duration::from_secs(2));
+        let t0 = Instant::now();
+        let mut finding = None;
+        for i in 0..30 {
+            // wchan + comm present, io file absent.
+            let d = fake.pid_dir(100);
+            fs::write(d.join("wchan"), "io_schedule\n").unwrap();
+            fs::write(d.join("comm"), "backfill\n").unwrap();
+            finding = mon.tick_at(t0 + Duration::from_secs(2 * i));
+        }
+        let finding = finding.expect("must fire");
+        assert_eq!(
+            finding.io_bytes_delta, None,
+            "unreadable counters must be unavailable, not zero"
+        );
+        let incident = incident_from_finding(&finding);
+        let snapshot: serde_json::Value =
+            serde_json::from_str(incident.system_snapshot.as_deref().unwrap()).unwrap();
+        assert_eq!(snapshot["evidence"]["io_counters"], "unavailable");
+        assert!(
+            snapshot["io_read_bytes_delta"].is_null() && snapshot["io_write_bytes_delta"].is_null(),
+            "the snapshot must not carry fabricated zero deltas"
         );
     }
 
@@ -888,7 +1110,7 @@ mod tests {
             if i == 9 {
                 let finding = finding.expect("10/10 must fire");
                 assert_eq!(finding.comm, None);
-                assert_eq!(finding.victim_label(), "unknown");
+                assert_eq!(finding.victim_label(), "unknown (pid=200)");
             }
         }
     }
@@ -910,6 +1132,26 @@ mod tests {
         assert!(mon.should_warn(&escalated));
         // A different victim is unaffected.
         assert!(mon.should_warn(&warning_finding("other")));
+    }
+
+    #[test]
+    fn same_comm_processes_do_not_suppress_each_other() {
+        // Two processes sharing a comm (think `postgres` backends): the
+        // dedup identity includes the PID, so each victim warns on its own.
+        let mut mon = BlkioStallMonitor::new(Duration::from_secs(2));
+        let a = BlkioStall {
+            pid: 100,
+            ..warning_finding("postgres")
+        };
+        let b = BlkioStall {
+            pid: 200,
+            ..warning_finding("postgres")
+        };
+        assert!(mon.should_warn(&a), "first victim must warn");
+        assert!(
+            mon.should_warn(&b),
+            "a different PID with the same comm must warn too"
+        );
     }
 
     #[test]
@@ -956,8 +1198,7 @@ mod tests {
             window_secs: 60.0,
             wait_samples: 26,
             expected_samples: 30,
-            io_read_bytes_delta: 5_000_000,
-            io_write_bytes_delta: 1000,
+            io_bytes_delta: Some((5_000_000, 1000)),
             wchan_kinds: vec![("io_schedule".to_string(), 26)],
             verdict: BlkioVerdict::BlkioCritical,
         };
@@ -965,7 +1206,11 @@ mod tests {
         assert_eq!(incident.event_type, "blkio_stall");
         assert_eq!(incident.action, "alert");
         assert_eq!(incident.target_pid, Some(4242));
-        assert_eq!(incident.target_name.as_deref(), Some("backfill"));
+        assert_eq!(
+            incident.target_name.as_deref(),
+            Some("backfill (pid=4242)"),
+            "the incident identity names the victim process, not just the comm"
+        );
         // Host-level fields this monitor doesn't sample stay zero/empty;
         // the triggering reading lives in the snapshot.
         assert_eq!(incident.psi_cpu, 0.0);
@@ -1010,7 +1255,10 @@ mod tests {
             .unwrap();
         assert_eq!(incidents.len(), 1, "one finding, one incident");
         assert_eq!(incidents[0].event_type, "blkio_stall");
-        assert_eq!(incidents[0].target_name.as_deref(), Some("backfill"));
+        assert_eq!(
+            incidents[0].target_name.as_deref(),
+            Some("backfill (pid=100)")
+        );
 
         // The store already has this finding: handling it again must not
         // write a second row. Recording is decided against the store, not
@@ -1046,6 +1294,41 @@ mod tests {
             incidents.len(),
             1,
             "a restarted monitor must not duplicate incidents the store already has"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_comm_victims_record_independently() {
+        // The store dedup key is (target_name, verdict) and the target
+        // name carries the PID: two same-comm victims are two identities,
+        // so both record — one `postgres` backend no longer suppresses
+        // the others for the whole cooldown.
+        let db_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            IncidentStore::new(db_dir.path().join("incidents.db"))
+                .await
+                .unwrap(),
+        );
+        let mut mon = BlkioStallMonitor::new(Duration::from_secs(2))
+            .with_incident_store(Some(Arc::clone(&store)));
+        let a = BlkioStall {
+            pid: 100,
+            ..warning_finding("postgres")
+        };
+        let b = BlkioStall {
+            pid: 200,
+            ..warning_finding("postgres")
+        };
+        mon.handle_finding(&a).await;
+        mon.handle_finding(&b).await;
+        let incidents = store
+            .recent_filtered(10, Some("blkio_stall"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            incidents.len(),
+            2,
+            "same-comm processes are distinct incident identities"
         );
     }
 
