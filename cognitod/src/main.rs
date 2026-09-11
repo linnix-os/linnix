@@ -991,6 +991,38 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
     }
 
+    // Runqueue starvation monitor: per-thread schedstat runqueue-wait Δ
+    // over a 10s window, polled every 5s. The victim's wait is measured;
+    // offender identity is eBPF-only and stays unlabeled. Degrades
+    // gracefully on kernels without CONFIG_SCHEDSTATS.
+    {
+        let monitor = cognitod::collectors::runqueue_starvation::RunqueueStarvationMonitor::new(
+            std::time::Duration::from_secs(5),
+        )
+        // Starvation findings become queryable incidents for the API and
+        // MCP tools, not just log lines.
+        .with_incident_store(incident_store.clone());
+        tokio::spawn(async move {
+            monitor.run().await;
+        });
+    }
+
+    // Block-IO stall monitor: per-process wchan sampling (tier B) every 2s
+    // over a 60s window, cross-checked against /proc/<pid>/io deltas. The
+    // wait fraction is inferred (sampled peeks, not delay accounting);
+    // tier A (taskstats netlink) is the documented upgrade path.
+    {
+        let monitor = cognitod::collectors::blkio_stall::BlkioStallMonitor::new(
+            std::time::Duration::from_secs(2),
+        )
+        // Stall findings become queryable incidents for the API and MCP
+        // tools, not just log lines.
+        .with_incident_store(incident_store.clone());
+        tokio::spawn(async move {
+            monitor.run().await;
+        });
+    }
+
     // Initialize Slack Notifier
     let _slack_notifier = if let Some(ref notif_cfg) = config.notifications {
         if let Some(ref slack_cfg) = notif_cfg.slack {
