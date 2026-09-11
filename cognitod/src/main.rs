@@ -953,6 +953,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
     }
 
+    // Generic cgroup pressure monitor: per-cgroup stall attribution for
+    // everything PsiMonitor doesn't cover (systemd slices, non-K8s containers,
+    // hand-rolled cgroups). Runs on every host, K8s or not -- kubepods paths
+    // are skipped here because PsiMonitor owns them when a K8s context exists.
+    {
+        let monitor = cognitod::collectors::cgroup_pressure::CgroupPressureMonitor::new(
+            std::time::Duration::from_secs(10),
+        )
+        // On Kubernetes hosts PsiMonitor owns kubepods pressure; the monitor
+        // then also drops aggregate ancestors (e.g. the root cgroup) whose
+        // hierarchical counters include kubepods stalls, so the same stall
+        // isn't reported twice.
+        .with_kubernetes(k8s_context.is_some());
+        tokio::spawn(async move {
+            monitor.run().await;
+        });
+    }
+
     // Initialize Slack Notifier
     let _slack_notifier = if let Some(ref notif_cfg) = config.notifications {
         if let Some(ref slack_cfg) = notif_cfg.slack {
