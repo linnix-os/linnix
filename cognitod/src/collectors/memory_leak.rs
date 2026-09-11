@@ -246,10 +246,10 @@ fn linear_fit(xs: &[f64], ys: &[f64]) -> Option<(f64, f64)> {
     Some((slope, r2.clamp(0.0, 1.0)))
 }
 
-/// Allocator hints from `/proc/<pid>/smaps_rollup`: the `Rss:`, `Anon:`,
-/// and `Private_Dirty:` summary lines (KiB). `None` when the file is
-/// missing or unparseable — absence is not zero. Read once per firing,
-/// never per poll.
+/// Allocator hints from `/proc/<pid>/smaps_rollup`: the `Rss:`,
+/// `Anonymous:`, and `Private_Dirty:` summary lines (KiB). `None` when the
+/// file is missing or unparseable — absence is not zero. Read once per
+/// firing, never per poll.
 fn read_smaps_hints(proc_root: &Path, pid: u32) -> Option<SmapsHints> {
     let content =
         std::fs::read_to_string(proc_root.join(pid.to_string()).join("smaps_rollup")).ok()?;
@@ -264,7 +264,7 @@ fn read_smaps_hints(proc_root: &Path, pid: u32) -> Option<SmapsHints> {
     }
     Some(SmapsHints {
         rss_kb: kb(&content, "Rss:")?,
-        anon_kb: kb(&content, "Anon:")?,
+        anon_kb: kb(&content, "Anonymous:")?,
         private_dirty_kb: kb(&content, "Private_Dirty:")?,
     })
 }
@@ -479,10 +479,15 @@ impl MemoryLeakMonitor {
             }
         });
 
-        // Fit every process with enough in-window history; the worst
-        // sustained grower becomes the finding.
+        // Fit every *live* process with enough in-window history. Dead
+        // incarnations keep their samples for transient read failures, but
+        // a frozen trend from an exited process must not select it as the
+        // finding — or crowd out a smaller live trend.
         let mut worst: Option<MemoryLeak> = None;
         for (&(pid, starttime), baseline) in &self.baselines {
+            if live.get(&pid) != Some(&starttime) {
+                continue;
+            }
             if baseline.samples.len() < MIN_SAMPLES {
                 continue;
             }
@@ -761,7 +766,7 @@ mod tests {
                     d.join("smaps_rollup"),
                     format!(
                         "Rss:                  {rss_kb} kB\n\
-                         Anon:                 {anon_kb} kB\n\
+                         Anonymous:            {anon_kb} kB\n\
                          Private_Dirty:        {pd_kb} kB\n"
                     ),
                 )
@@ -977,6 +982,69 @@ mod tests {
             .expect("must fire");
         let hints = finding.smaps.expect("smaps_rollup readable in fixture");
         assert_eq!(hints.anon_kb, 155 * 1024);
+    }
+
+    #[test]
+    fn smaps_rollup_kernel_format_parses() {
+        // Verbatim 6.x kernel layout: a `[rollup]` header line, then the
+        // real field names. The kernel's field is `Anonymous:`, not
+        // `Anon:` — a fixture using the wrong name masks a production
+        // failure where every firing reports hints as unavailable.
+        let fake = FakeProc::new();
+        let d = fake.dir.path().join("42");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(
+            d.join("smaps_rollup"),
+            "58d32c280000-7ffe54261000 ---p 00000000 00:00 0                          [rollup]\n\
+             Rss:                1668 kB\n\
+             Pss:                 558 kB\n\
+             Shared_Clean:       1520 kB\n\
+             Private_Clean:        40 kB\n\
+             Private_Dirty:       108 kB\n\
+             Referenced:         1668 kB\n\
+             Anonymous:           108 kB\n\
+             KSM:                   0 kB\n",
+        )
+        .unwrap();
+        let hints = read_smaps_hints(fake.dir.path(), 42).expect("kernel-format rollup must parse");
+        assert_eq!(hints.rss_kb, 1668);
+        assert_eq!(hints.anon_kb, 108);
+        assert_eq!(hints.private_dirty_kb, 108);
+    }
+
+    #[test]
+    fn dead_process_does_not_crowd_out_live_trend() {
+        // Two growing processes; the bigger trend exits mid-window. Its
+        // baseline is retained for transient read failures, but the frozen
+        // trend must not be selected as the finding — the smaller *live*
+        // trend must win instead.
+        let fake = FakeProc::new();
+        let mut mon = fake.monitor();
+        let t0 = Instant::now();
+        for i in 0..20u64 {
+            // pid 21: fast grower (~190 MiB over the window).
+            fake.set_proc(21, "big", 7000, mib_pages(100 + i * 10), None);
+            // pid 23: slower but actionable (~76 MiB).
+            fake.set_proc(23, "small", 8000, mib_pages(100 + i * 4), None);
+            mon.tick_at(t0 + Duration::from_secs(30 * i));
+        }
+        // pid 21 exits: its whole proc dir vanishes.
+        fs::remove_dir_all(fake.dir.path().join("21")).unwrap();
+        fake.set_proc(23, "small", 8000, mib_pages(100 + 20 * 4), None);
+        let finding = mon
+            .tick_at(t0 + Duration::from_secs(30 * 20))
+            .expect("live trend must still fire");
+        assert_eq!(
+            finding.pid, 23,
+            "dead process's frozen trend must not be selected"
+        );
+        // And it keeps not firing for the dead incarnation on later polls.
+        fake.set_proc(23, "small", 8000, mib_pages(100 + 21 * 4), None);
+        let finding = mon.tick_at(t0 + Duration::from_secs(30 * 21));
+        assert!(
+            finding.is_none() || finding.unwrap().pid == 23,
+            "no refire for the dead process"
+        );
     }
 
     #[test]
