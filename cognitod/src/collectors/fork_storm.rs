@@ -9,7 +9,7 @@
 //! This monitor runs at the spec's tier B (polling):
 //!
 //! * **Rate (measured):** `/proc/stat` `processes` is sampled every 0.5s and
-//!   the rate is computed over a 10s sliding window. Warn at >= 15 forks/s,
+//!   the rate is computed over a 10s sliding window. Warn at >= 30 forks/s,
 //!   critical at >= 60 forks/s — the prototype-validated defaults from the
 //!   userspace detector spec (D3). While the window is still filling
 //!   (startup, re-baseline) the delta is normalized against the full
@@ -51,7 +51,7 @@ use crate::incidents::{Incident, IncidentStore};
 /// Sliding window over which the fork rate is computed.
 const WINDOW: Duration = Duration::from_secs(10);
 /// Sustained fork rate at or above which a warning fires (prototype default).
-const WARN_FORKS_PER_SEC: f64 = 15.0;
+const WARN_FORKS_PER_SEC: f64 = 30.0;
 /// Sustained fork rate at or above which a critical fires (prototype default).
 const CRIT_FORKS_PER_SEC: f64 = 60.0;
 /// The PID-set diff only runs while the measured rate is at least this high:
@@ -643,8 +643,8 @@ mod tests {
     #[test]
     fn classify_matrix() {
         assert_eq!(classify(0.0), ForkVerdict::Healthy);
-        assert_eq!(classify(14.99), ForkVerdict::Healthy);
-        assert_eq!(classify(15.0), ForkVerdict::StormWarning);
+        assert_eq!(classify(29.99), ForkVerdict::Healthy);
+        assert_eq!(classify(30.0), ForkVerdict::StormWarning);
         assert_eq!(classify(59.99), ForkVerdict::StormWarning);
         assert_eq!(classify(60.0), ForkVerdict::StormCritical);
         assert_eq!(classify(10_000.0), ForkVerdict::StormCritical);
@@ -653,17 +653,17 @@ mod tests {
     #[test]
     fn detects_warning_and_critical_rates() {
         let t0 = Instant::now();
-        // 150 forks over 10s = 15/s -> warning.
+        // 300 forks over 10s = 30/s -> warning.
         let fake = FakeProc::new();
         let mut mon = fake.monitor();
         assert!(mon.tick_at(t0).is_none());
-        fake.set_counter(150);
+        fake.set_counter(300);
         let burst = mon
             .tick_at(t0 + Duration::from_secs(10))
-            .expect("15 forks/s must warn");
+            .expect("30 forks/s must warn");
         assert_eq!(burst.verdict, ForkVerdict::StormWarning);
-        assert!((burst.forks_per_sec - 15.0).abs() < 1e-9);
-        assert_eq!(burst.window_forks, 150);
+        assert!((burst.forks_per_sec - 30.0).abs() < 1e-9);
+        assert_eq!(burst.window_forks, 300);
 
         // 600 forks over 10s = 60/s -> critical.
         let fake = FakeProc::new();
