@@ -112,10 +112,17 @@ pub struct CpuStarvation {
 }
 
 impl CpuStarvation {
-    /// Stable identity for cooldown and incident-dedup keys. TIDs recycle;
-    /// the command name is the identity that survives.
+    /// Stable identity for cooldown and incident-dedup keys: the victim
+    /// thread plus its command name. TIDs are unique per thread
+    /// system-wide, so this distinguishes two `java` workers where a
+    /// comm-only key suppressed every same-named victim for the whole
+    /// cooldown. A recycled TID's counters regress, which re-baselines
+    /// the measurement — and the store keys the verdict to this identity,
+    /// so the new thread dedups against its own history, not another
+    /// victim's. The tgid rides along in the incident snapshot.
     fn victim_label(&self) -> String {
-        self.comm.clone().unwrap_or_else(|| "unknown".to_string())
+        let comm = self.comm.clone().unwrap_or_else(|| "unknown".to_string());
+        format!("{comm} (tid={}, tgid={})", self.tid, self.tgid)
     }
 }
 
@@ -365,6 +372,13 @@ impl RunqueueStarvationMonitor {
     /// window, or `None` until two samples exist. The wait is the raw Δ —
     /// never divided by a short warm-up span, so a partial window can only
     /// under-report, never inflate.
+    ///
+    /// The newest sample at or before the window cutoff is retained as
+    /// the baseline anchor: polls land slightly more than 5s apart (the
+    /// loop sleeps after each scan), so without the anchor the sample
+    /// from two polls ago ages just past the window and gets pruned —
+    /// leaving a ~5s delta reported as `window_secs = 10`, which can
+    /// misclassify a critical as a warning.
     fn update_baseline(&mut self, tid: u32, now: Instant, wait_ns: u64) -> Option<f64> {
         let baseline = self
             .wait_baselines
@@ -387,7 +401,12 @@ impl RunqueueStarvationMonitor {
         }
         baseline.samples.push_back((now, wait_ns));
         let cutoff = now.checked_sub(WINDOW).unwrap_or(now);
-        while baseline.samples.front().is_some_and(|&(t, _)| t < cutoff) {
+        // Prune aged samples but keep the anchor: pop the front only while
+        // the *second* sample is still at or before the cutoff, so the
+        // front remains the newest sample on or before the cutoff. When
+        // every sample has aged out, one anchor survives and the
+        // two-sample check below yields `None` until fresh data arrives.
+        while baseline.samples.len() > 1 && baseline.samples[1].0 <= cutoff {
             baseline.samples.pop_front();
         }
         let &(first_t, first_w) = baseline.samples.front()?;
@@ -840,6 +859,59 @@ mod tests {
     }
 
     #[test]
+    fn window_anchor_spans_full_window_at_uneven_poll_spacing() {
+        // Polls land 5.2s apart: the loop sleeps 5s *after* each scan and
+        // any incident handling. Without a baseline anchor, the t0 sample
+        // ages just past the 10s window on the third poll and gets pruned,
+        // leaving a ~5.2s delta reported as window_secs = 10 — a 5000ms
+        // critical misclassified as a warning. The anchor retains the
+        // newest sample at or before the cutoff, so the delta spans the
+        // full window.
+        let fake = FakeProc::new();
+        let mut mon = fake.monitor();
+        let t0 = Instant::now();
+        fake.set_thread(1, 7, "hungry", 0);
+        assert!(mon.tick_at(t0).is_none());
+        fake.set_thread(1, 7, "hungry", 2_500_000_000);
+        let mid = mon
+            .tick_at(t0 + Duration::from_millis(5200))
+            .expect("2500ms over 5.2s must warn");
+        assert_eq!(mid.verdict, StarvationVerdict::StarvationWarning);
+        fake.set_thread(1, 7, "hungry", 5_000_000_000);
+        let finding = mon
+            .tick_at(t0 + Duration::from_millis(10_400))
+            .expect("5000ms over the full window must fire");
+        assert_eq!(
+            finding.verdict,
+            StarvationVerdict::StarvationCritical,
+            "the window delta must span the full 10s, not just the last 5.2s"
+        );
+        assert!((finding.wait_ms - 5000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn same_comm_victims_do_not_suppress_each_other() {
+        // Two threads sharing a comm (think `java` workers): the dedup
+        // identity includes the TID, so each victim warns on its own.
+        let mut mon = RunqueueStarvationMonitor::new(Duration::from_secs(5));
+        let a = CpuStarvation {
+            tid: 7,
+            tgid: 1,
+            ..warning_finding("worker")
+        };
+        let b = CpuStarvation {
+            tid: 8,
+            tgid: 1,
+            ..warning_finding("worker")
+        };
+        assert!(mon.should_warn(&a), "first victim must warn");
+        assert!(
+            mon.should_warn(&b),
+            "a different TID with the same comm must warn too"
+        );
+    }
+
+    #[test]
     fn ranks_worst_waiter_first() {
         let fake = FakeProc::new();
         fake.set_thread(1, 7, "hungry", 0);
@@ -1065,7 +1137,11 @@ mod tests {
         assert_eq!(incident.event_type, "cpu_starvation");
         assert_eq!(incident.action, "alert");
         assert_eq!(incident.target_pid, Some(4242));
-        assert_eq!(incident.target_name.as_deref(), Some("hungry"));
+        assert_eq!(
+            incident.target_name.as_deref(),
+            Some("hungry (tid=4242, tgid=4200)"),
+            "the incident identity names the victim thread, not just the comm"
+        );
         // Host-level fields this monitor doesn't sample stay zero/empty;
         // the triggering reading lives in the snapshot.
         assert_eq!(incident.psi_cpu, 0.0);
@@ -1107,7 +1183,10 @@ mod tests {
             .unwrap();
         assert_eq!(incidents.len(), 1, "one finding, one incident");
         assert_eq!(incidents[0].event_type, "cpu_starvation");
-        assert_eq!(incidents[0].target_name.as_deref(), Some("hungry"));
+        assert_eq!(
+            incidents[0].target_name.as_deref(),
+            Some("hungry (tid=7, tgid=1)")
+        );
 
         // The store already has this finding: handling it again must not
         // write a second row. Recording is decided against the store, not
@@ -1140,6 +1219,43 @@ mod tests {
             incidents.len(),
             1,
             "a restarted monitor must not duplicate incidents the store already has"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_comm_victims_record_independently() {
+        // The store dedup key is (target_name, verdict) and the target
+        // name carries the TID: two same-comm victims are two identities,
+        // so both record — one `java` victim no longer suppresses the
+        // others for the whole cooldown.
+        let db_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            IncidentStore::new(db_dir.path().join("incidents.db"))
+                .await
+                .unwrap(),
+        );
+        let mut mon = RunqueueStarvationMonitor::new(Duration::from_secs(5))
+            .with_incident_store(Some(Arc::clone(&store)));
+        let a = CpuStarvation {
+            tid: 7,
+            tgid: 1,
+            ..warning_finding("worker")
+        };
+        let b = CpuStarvation {
+            tid: 8,
+            tgid: 1,
+            ..warning_finding("worker")
+        };
+        mon.handle_finding(&a).await;
+        mon.handle_finding(&b).await;
+        let incidents = store
+            .recent_filtered(10, Some("cpu_starvation"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            incidents.len(),
+            2,
+            "same-comm victims are distinct incident identities"
         );
     }
 
