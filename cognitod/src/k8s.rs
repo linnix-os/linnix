@@ -2,6 +2,7 @@ use log::{debug, info, trace, warn};
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::time::sleep;
@@ -46,6 +47,38 @@ pub struct K8sContext {
     api_url: String,
     token: String,
     pub node_name: String,
+    /// Root under which `<pid>/cgroup` is read. Always `/proc` in
+    /// production; tests point it at a fixture tree so metadata-resolution
+    /// races can be exercised without a live `/proc`.
+    proc_root: PathBuf,
+}
+
+/// Extracts a 64-char container id from `/proc/<pid>/cgroup` content, or
+/// `None` when no line carries one.
+///
+/// Pure so the heuristic is unit-testable without a live `/proc`: cgroup v2
+/// writes a single `0::/...` line, cgroup v1 writes one line per controller,
+/// and both bury the id in the last path segment as
+/// `cri-containerd-<id>.scope`, `docker-<id>.scope`, or a bare `<id>`.
+fn container_id_from_cgroup_content(content: &str) -> Option<String> {
+    for line in content.lines() {
+        // Simple heuristic: look for last part that looks like a container ID
+        if let Some(last_part) = line.split('/').next_back() {
+            // Remove .scope suffix if present
+            let clean = last_part.trim_end_matches(".scope");
+            // Remove prefix like "cri-containerd-" or "docker-"
+            let id = if let Some(idx) = clean.rfind('-') {
+                &clean[idx + 1..]
+            } else {
+                clean
+            };
+
+            if id.len() == 64 {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
 }
 
 enum K8sTlsConfig {
@@ -118,17 +151,63 @@ impl K8sContext {
             api_url,
             token,
             node_name,
+            proc_root: PathBuf::from("/proc"),
         }))
+    }
+
+    #[cfg(test)]
+    /// Test seam: builds a context reading `<pid>/cgroup` from a fixture
+    /// tree instead of the real `/proc`, so metadata-resolution races can
+    /// be driven deterministically. Same-crate only; production always
+    /// goes through `new()` and reads the real `/proc`.
+    pub(crate) fn new_for_test(proc_root: PathBuf) -> Arc<Self> {
+        Arc::new(Self {
+            container_map: RwLock::new(HashMap::new()),
+            client: Client::new(),
+            api_url: "http://127.0.0.1:1".to_string(),
+            token: "test".to_string(),
+            node_name: "test-node".to_string(),
+            proc_root,
+        })
     }
 
     pub fn start_watcher(self: Arc<Self>) {
         tokio::spawn(async move {
             info!("[k8s] starting pod watcher for node {}", self.node_name);
+            let mut consecutive_failures: u32 = 0;
             loop {
-                if let Err(e) = self.refresh_pods().await {
-                    warn!("[k8s] failed to refresh pods: {}", e);
+                // Stringify the error immediately: `refresh_pods` fails with
+                // `Box<dyn Error>` (not `Send`), which must not live across
+                // the awaits below in this spawned future.
+                match self.refresh_pods().await.map_err(|e| e.to_string()) {
+                    Ok(()) => {
+                        if consecutive_failures > 0 {
+                            info!(
+                                "[k8s] pod watcher recovered after {consecutive_failures} failed refresh(es)"
+                            );
+                        }
+                        consecutive_failures = 0;
+                        sleep(Duration::from_secs(30)).await;
+                    }
+                    Err(detail) => {
+                        consecutive_failures += 1;
+                        // Retry fast at first: a startup race (API not up yet
+                        // when the daemon starts) used to leave container_map
+                        // empty for a full 30s per failed attempt, which is
+                        // exactly the window where early Fork/Exec events lose
+                        // the metadata race. Back off to the normal 30s
+                        // cadence only after repeated failures.
+                        let backoff_secs = match consecutive_failures {
+                            1 => 5,
+                            2 => 10,
+                            _ => 30,
+                        };
+                        warn!(
+                            "[k8s] failed to refresh pods (failure #{consecutive_failures}): {detail}; retrying in {backoff_secs}s"
+                        );
+                        sleep(Duration::from_secs(backoff_secs)).await;
+                    }
                 }
-                sleep(Duration::from_secs(30)).await;
             }
         });
     }
@@ -225,48 +304,31 @@ impl K8sContext {
     }
 
     pub fn get_metadata_for_pid(&self, pid: u32) -> Option<K8sMetadata> {
-        // Read /proc/<pid>/cgroup
-        let Ok(content) = std::fs::read_to_string(format!("/proc/{}/cgroup", pid)) else {
+        // Read <proc_root>/<pid>/cgroup (`proc_root` is /proc in production,
+        // a fixture tree in tests).
+        let path = self.proc_root.join(pid.to_string()).join("cgroup");
+        let Ok(content) = std::fs::read_to_string(&path) else {
             // Expected for pids that have already exited (e.g. a fork-bomb
             // child that lived microseconds) -- not itself evidence of a
             // container-map race.
-            trace!("[k8s] pid {pid} has no /proc/<pid>/cgroup (already exited?)");
+            trace!("[k8s] pid {pid} has no {path:?} (already exited?)");
             return None;
         };
 
-        // Parse cgroup to find container ID
-        // Format: 0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod<uid>.slice/cri-containerd-<id>.scope
-        // Or similar. We look for a 64-char hex string.
+        let id = container_id_from_cgroup_content(&content)?;
 
-        for line in content.lines() {
-            // Simple heuristic: look for last part that looks like a container ID
-            if let Some(last_part) = line.split('/').next_back() {
-                // Remove .scope suffix if present
-                let clean = last_part.trim_end_matches(".scope");
-                // Remove prefix like "cri-containerd-" or "docker-"
-                let id = if let Some(idx) = clean.rfind('-') {
-                    &clean[idx + 1..]
-                } else {
-                    clean
-                };
-
-                if id.len() == 64 {
-                    let meta = self.get_metadata(id);
-                    if meta.is_none() {
-                        // The pid resolved to a real container ID, but that
-                        // ID isn't (yet) in the watcher's container map --
-                        // the container-map race: the pod's process started
-                        // before the last 30s poll picked up its containerID.
-                        debug!(
-                            "[k8s] pid {pid} -> container {id} has no entry in container_map ({} entries tracked)",
-                            self.container_map.read().unwrap().len()
-                        );
-                    }
-                    return meta;
-                }
-            }
+        let meta = self.get_metadata(&id);
+        if meta.is_none() {
+            // The pid resolved to a real container ID, but that ID isn't
+            // (yet) in the watcher's container map -- the container-map race:
+            // the pod's process started before the last poll picked up its
+            // containerID.
+            debug!(
+                "[k8s] pid {pid} -> container {id} has no entry in container_map ({} entries tracked)",
+                self.container_map.read().unwrap().len()
+            );
         }
-        None
+        meta
     }
 
     pub fn get_metadata(&self, container_id: &str) -> Option<K8sMetadata> {
@@ -358,5 +420,77 @@ mod tests {
         assert!(!flag_value_is_true("1"));
         assert!(!flag_value_is_true("yes"));
         assert!(!flag_value_is_true(""));
+    }
+
+    #[test]
+    fn container_id_parses_cgroup_v2_unified_line() {
+        let id = "e".repeat(64);
+        let content = format!(
+            "0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123abc.slice/cri-containerd-{id}.scope\n"
+        );
+        assert_eq!(container_id_from_cgroup_content(&content), Some(id));
+    }
+
+    #[test]
+    fn container_id_parses_cgroup_v1_per_controller_lines() {
+        let id = "f".repeat(64);
+        let content = format!(
+            "2:cpu,cpuacct:/kubepods.slice/kubepods-burstable.slice/docker-{id}.scope\n\
+             1:name=systemd:/kubepods.slice/kubepods-burstable.slice/docker-{id}.scope\n"
+        );
+        assert_eq!(container_id_from_cgroup_content(&content), Some(id));
+    }
+
+    #[test]
+    fn container_id_parses_bare_id_without_runtime_prefix() {
+        let id = "a".repeat(64);
+        let content = format!("0::/kubepods/{id}\n");
+        assert_eq!(container_id_from_cgroup_content(&content), Some(id));
+    }
+
+    #[test]
+    fn container_id_is_none_without_a_64_char_segment() {
+        assert_eq!(container_id_from_cgroup_content("0::/\n"), None);
+        assert_eq!(
+            container_id_from_cgroup_content("0::/kubepods.slice/short-id.scope\n"),
+            None
+        );
+        assert_eq!(container_id_from_cgroup_content(""), None);
+    }
+
+    #[test]
+    fn new_for_test_reads_cgroup_from_the_fixture_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "b".repeat(64);
+        let pid_dir = tmp.path().join("4242");
+        std::fs::create_dir(&pid_dir).unwrap();
+        std::fs::write(
+            pid_dir.join("cgroup"),
+            format!("0::/kubepods.slice/cri-containerd-{id}.scope\n"),
+        )
+        .unwrap();
+
+        let ctx = K8sContext::new_for_test(tmp.path().to_path_buf());
+        // Map empty: the pid resolves to a container id, but nothing is known
+        // about it yet -- the container-map race, deterministically.
+        assert!(ctx.get_metadata_for_pid(4242).is_none());
+
+        ctx.insert_metadata(
+            id.clone(),
+            K8sMetadata {
+                pod_name: "victim-workload".to_string(),
+                namespace: "default".to_string(),
+                container_name: "app".to_string(),
+                owner_kind: None,
+                owner_name: None,
+                priority: Priority::default(),
+                slo_tier: None,
+            },
+        );
+        let meta = ctx
+            .get_metadata_for_pid(4242)
+            .expect("map warmed after the race; resolution should heal");
+        assert_eq!(meta.pod_name, "victim-workload");
+        assert_eq!(meta.namespace, "default");
     }
 }

@@ -140,15 +140,19 @@ impl ContextStore {
                             "[context] no k8s metadata yet for pid {} (event_type={})",
                             event.pid, event.event_type
                         );
-                        if event.event_type == 1 {
-                            // Fork fallback: inherit parent's metadata if we can't find
-                            // child's yet (race condition: process created but cgroup
-                            // not yet populated). Re-resolve rather than trusting a
-                            // stale cached `None` -- the watcher may have caught up
-                            // with the parent's pod since the parent's own Exec/Fork.
-                            let mut live = self.live.lock().unwrap();
-                            metadata = resolve_live_metadata(ctx, &mut live, event.ppid);
-                        }
+                        // The child itself may already be gone (a fork-bomb
+                        // child can live microseconds), but its parent is
+                        // usually long-lived: inherit the parent's metadata.
+                        // Consult the live map first (it also covers
+                        // exited-but-retained parents), then read the parent's
+                        // cgroup straight from /proc -- a parent that started
+                        // before the daemon, or whose own Fork/Exec event was
+                        // dropped under load, is absent from the live map too,
+                        // and the old live-map-only fallback left exactly
+                        // those children permanently unattributed.
+                        let mut live = self.live.lock().unwrap();
+                        metadata = resolve_live_metadata(ctx, &mut live, event.ppid)
+                            .or_else(|| ctx.get_metadata_for_pid(event.ppid).map(Arc::new));
                     }
                 }
                 2 => {
@@ -472,6 +476,36 @@ impl ContextStore {
         }
     }
 
+    /// `(pid, cpu_percent)` for the hottest processes on the box, straight from
+    /// sysinfo rather than the event-sourced live map.
+    ///
+    /// The live map only ever learns about processes it saw Fork/Exec for: a
+    /// process that started before the daemon -- or whose events were dropped
+    /// under fork-storm load -- is invisible to it forever, which is how a
+    /// sustained StallEvent used to report "0 concurrent consumers" on a box
+    /// with an obvious busy loop. The PSI monitor supplements the live map
+    /// with this. Callers resolve k8s metadata per pid themselves (via
+    /// `K8sContext::get_metadata_for_pid`, which reads `/proc` directly and
+    /// works for exactly the processes the live map misses) and dedupe
+    /// against live-map pids.
+    pub fn top_cpu_pids_systemwide(&self, limit: usize) -> Vec<(u32, f32)> {
+        use std::cmp::Ordering;
+
+        let sys = self.sys.lock().unwrap();
+        let mut entries: Vec<(u32, f32)> = sys
+            .processes()
+            .values()
+            .filter_map(|proc| {
+                let cpu = proc.cpu_usage();
+                (cpu > 0.0).then(|| (proc.pid().as_u32(), cpu))
+            })
+            .collect();
+
+        entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+        entries.truncate(limit);
+        entries
+    }
+
     /// Get top CPU processes from the entire system (not just eBPF-tracked ones).
     /// This is a fallback for circuit breaker when no eBPF-tracked processes exist.
     pub fn top_cpu_processes_systemwide(&self, limit: usize) -> Vec<ProcessMemorySummary> {
@@ -601,6 +635,7 @@ impl ContextStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::k8s::Priority;
     use crate::{PERCENT_MILLI_UNKNOWN, ProcessEvent, ProcessEventWire};
     use linnix_ai_ebpf_common::EventType;
 
@@ -725,5 +760,102 @@ mod tests {
             "exit event should remain after exec eviction"
         );
         assert_eq!(recent[0].event_type, EventType::Exit as u32);
+    }
+
+    /// Fixture helpers for the metadata-race regression tests below: a fake
+    /// `/proc`-style tree where `<pid>/cgroup` carries a synthetic container
+    /// id, plus a constructor stamping that id's pod metadata.
+    fn fixture_proc_tree(pids: &[(u32, &str)]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        for (pid, container_id) in pids {
+            let pid_dir = tmp.path().join(pid.to_string());
+            std::fs::create_dir(&pid_dir).unwrap();
+            std::fs::write(
+                pid_dir.join("cgroup"),
+                format!(
+                    "0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod9d2.slice/cri-containerd-{container_id}.scope\n"
+                ),
+            )
+            .unwrap();
+        }
+        tmp
+    }
+
+    fn offender_metadata(pod_name: &str) -> K8sMetadata {
+        K8sMetadata {
+            pod_name: pod_name.to_string(),
+            namespace: "default".to_string(),
+            container_name: "app".to_string(),
+            owner_kind: None,
+            owner_name: None,
+            priority: Priority::default(),
+            slo_tier: None,
+        }
+    }
+
+    /// The reported production failure, deterministically: a Fork ingested
+    /// while the watcher's container map is still empty stamps `None`
+    /// metadata, and the periodic rescan heals the live entry once the map
+    /// warms -- the entry must not stay attributionless forever.
+    #[test]
+    fn rescan_heals_sticky_null_once_container_map_warms() {
+        let container_id = "c".repeat(64);
+        let tmp = fixture_proc_tree(&[(4343, &container_id)]);
+        let k8s = K8sContext::new_for_test(tmp.path().to_path_buf());
+        let store = ContextStore::new(Duration::from_secs(60), 1000, Some(k8s.clone()));
+
+        // Ingest before the watcher has learned the container: the pid
+        // resolves to a real container id, but the map is empty.
+        store.add(sample_event(4343, 1, EventType::Fork));
+        {
+            let live = store.get_live_map();
+            let (_, meta) = live.get(&4343).expect("fork should register live");
+            assert!(
+                meta.is_none(),
+                "metadata must be None while the container map is cold"
+            );
+        }
+
+        // The watcher catches up.
+        k8s.insert_metadata(container_id, offender_metadata("forkstorm-offender"));
+
+        store.rescan_unresolved_k8s_metadata();
+
+        let live = store.get_live_map();
+        let (_, meta) = live.get(&4343).expect("fork should register live");
+        let meta = meta.as_ref().expect("rescan should have healed the entry");
+        assert_eq!(meta.pod_name, "forkstorm-offender");
+        assert_eq!(meta.namespace, "default");
+    }
+
+    /// A fork-bomb child can exit before its Fork event is even processed, so
+    /// its own `/proc` entry is gone -- but the forking parent is long-lived.
+    /// When that parent started before the daemon (or its own events were
+    /// dropped), it is absent from the live map too; the fallback must read
+    /// the parent's cgroup straight from `/proc`, not just the live map.
+    #[test]
+    fn fork_event_inherits_parent_metadata_from_proc_when_parent_predates_daemon() {
+        let container_id = "d".repeat(64);
+        // Only the parent (5000) has a /proc entry; the child (6000) is
+        // already gone -- the fork-bomb churn case.
+        let tmp = fixture_proc_tree(&[(5000, &container_id)]);
+        let k8s = K8sContext::new_for_test(tmp.path().to_path_buf());
+        k8s.insert_metadata(container_id, offender_metadata("forkstorm-offender"));
+        let store = ContextStore::new(Duration::from_secs(60), 1000, Some(k8s));
+
+        // The parent never emitted any event the daemon saw: it is NOT in the
+        // live map. Only the child's Fork arrives.
+        store.add(sample_event(6000, 5000, EventType::Fork));
+
+        let live = store.get_live_map();
+        assert!(
+            !live.contains_key(&5000),
+            "test setup: parent must be absent from the live map"
+        );
+        let (_, meta) = live.get(&6000).expect("fork should register live");
+        let meta = meta
+            .as_ref()
+            .expect("child should inherit the parent's pod via /proc fallback");
+        assert_eq!(meta.pod_name, "forkstorm-offender");
     }
 }
