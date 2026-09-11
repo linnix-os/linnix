@@ -126,6 +126,20 @@ const REQUIRED_COLUMNS: &[RequiredColumn] = &[
     },
 ];
 
+/// Cutoff (unix seconds) for incident retention: rows with
+/// `timestamp < cutoff` are pruned by
+/// [`IncidentStore::prune_older_than`].
+///
+/// Returns `None` when retention is disabled — an unset key and an explicit
+/// `0` both mean "retain forever", and the daemon must not delete anything
+/// in that case. Saturating arithmetic keeps absurd values (e.g.
+/// `u64::MAX` days) from wrapping the cutoff into the future.
+pub fn retention_cutoff_unix(retention_days: Option<u64>, now_unix: i64) -> Option<i64> {
+    let days = retention_days.filter(|d| *d > 0)?;
+    let ttl_secs = i64::try_from(days.saturating_mul(86_400)).unwrap_or(i64::MAX);
+    Some(now_unix.saturating_sub(ttl_secs))
+}
+
 impl IncidentStore {
     /// Create a new incident store
     pub async fn new<P: AsRef<Path>>(db_path: P) -> Result<Self, sqlx::Error> {
@@ -685,6 +699,22 @@ impl IncidentStore {
             .await
     }
 
+    /// Delete incident rows strictly older than `cutoff` (unix seconds).
+    /// Returns the number of rows deleted.
+    ///
+    /// Type-agnostic: every event type is pruned by the same TTL. The
+    /// comparison is strictly older-than, so a row exactly at the cutoff is
+    /// kept. The monitor dedup windows (minutes) are orders of magnitude
+    /// shorter than any sane TTL (days), so pruning can never remove a row
+    /// the dedup logic still needs.
+    pub async fn prune_older_than(&self, cutoff: i64) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query("DELETE FROM incidents WHERE timestamp < ?")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Test-only: simulates a transient store outage by closing the pool,
     /// so inserts and queries fail with `PoolClosed`. The pool cannot be
     /// reopened — build a new store to recover.
@@ -1036,6 +1066,116 @@ mod tests {
                     "wrong_culprit".to_string()
                 ),
             ]
+        );
+    }
+
+    fn incident_at(event_type: &str, timestamp: i64) -> Incident {
+        let mut inc = incident(event_type);
+        inc.timestamp = timestamp;
+        inc
+    }
+
+    #[test]
+    fn retention_cutoff_none_or_zero_is_disabled() {
+        let now = 1_800_000_000_i64;
+        assert_eq!(retention_cutoff_unix(None, now), None);
+        assert_eq!(retention_cutoff_unix(Some(0), now), None);
+        assert_eq!(
+            retention_cutoff_unix(Some(30), now),
+            Some(now - 30 * 86_400)
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_deletes_only_strictly_older_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = IncidentStore::new(dir.path().join("incidents.db"))
+            .await
+            .unwrap();
+        let now = Utc::now().timestamp();
+        let cutoff = now - 30 * 86_400;
+
+        let old_id = store
+            .insert(&incident_at("fork_storm", cutoff - 1))
+            .await
+            .unwrap();
+        let boundary_id = store
+            .insert(&incident_at("fork_storm", cutoff))
+            .await
+            .unwrap();
+        let recent_id = store.insert(&incident_at("fork_storm", now)).await.unwrap();
+
+        let deleted = store.prune_older_than(cutoff).await.unwrap();
+        assert_eq!(deleted, 1, "only the strictly-older row is deleted");
+
+        assert!(store.get(old_id).await.unwrap().is_none());
+        assert!(store.get(boundary_id).await.unwrap().is_some());
+        assert!(store.get(recent_id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn prune_is_type_agnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = IncidentStore::new(dir.path().join("incidents.db"))
+            .await
+            .unwrap();
+        let now = Utc::now().timestamp();
+        let cutoff = now - 30 * 86_400;
+
+        for event_type in [
+            "cgroup_pressure",
+            "fork_storm",
+            "cpu_starvation",
+            "blkio_stall",
+            "memory_leak",
+            "oom_kill",
+        ] {
+            store
+                .insert(&incident_at(event_type, cutoff - 10))
+                .await
+                .unwrap();
+        }
+
+        let deleted = store.prune_older_than(cutoff).await.unwrap();
+        assert_eq!(deleted, 6, "every event type is pruned by the same TTL");
+        let remaining = store.recent(100).await.unwrap();
+        assert!(remaining.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recently_recorded_incident_survives_prune() {
+        // The dedup windows (minutes) are far shorter than any TTL (days),
+        // but prove it directly: a recent incident must still dedup after a
+        // prune run.
+        let dir = tempfile::tempdir().unwrap();
+        let store = IncidentStore::new(dir.path().join("incidents.db"))
+            .await
+            .unwrap();
+        let now = Utc::now().timestamp();
+        let cutoff = now - 30 * 86_400;
+
+        let mut recent = incident_at("cpu_starvation", now);
+        recent.target_name = Some("hungry (tid=7, tgid=1)".to_string());
+        recent.system_snapshot = Some(r#"{"verdict": "StarvationWarning"}"#.to_string());
+        store.insert(&recent).await.unwrap();
+        store
+            .insert(&incident_at("cpu_starvation", cutoff - 10))
+            .await
+            .unwrap();
+
+        let deleted = store.prune_older_than(cutoff).await.unwrap();
+        assert_eq!(deleted, 1);
+
+        let keys = store
+            .recent_incident_keys("cpu_starvation", 900)
+            .await
+            .unwrap();
+        assert!(
+            keys.contains(&(
+                "hungry (tid=7, tgid=1)".to_string(),
+                "StarvationWarning".to_string()
+            )),
+            "the recent incident still dedups after pruning"
         );
     }
 }

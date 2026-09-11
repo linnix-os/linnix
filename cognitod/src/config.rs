@@ -215,6 +215,8 @@ pub struct Config {
     #[serde(default)]
     pub episode_capture: EpisodeCaptureConfig,
     #[serde(default)]
+    pub incidents: IncidentsConfig,
+    #[serde(default)]
     pub telemetry: TelemetrySettings,
     /// Top-level sections/keys no field matches. Captured so `--check-config`
     /// can name them; a typo'd `[reasner]` is otherwise indistinguishable from
@@ -691,6 +693,22 @@ fn default_episode_capture_output_dir() -> String {
     "/var/lib/linnix/episodes".to_string()
 }
 
+/// `[incidents]` — incident store retention.
+///
+/// The incident store would otherwise grow for the lifetime of the daemon.
+/// A background task prunes rows older than the configured TTL once a day
+/// (and once shortly after startup). Unset or 0 disables pruning entirely:
+/// retention is opt-in at the code level, so an existing config that never
+/// mentions this section can never lose rows to it. The shipped default
+/// config sets 30 days.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct IncidentsConfig {
+    /// Days of incident history to retain. `None` (key absent) or `Some(0)`
+    /// means "retain forever" — the prune task is not even spawned.
+    #[serde(default)]
+    pub retention_days: Option<u64>,
+}
+
 fn default_attribution_threshold_ms() -> u64 {
     100
 }
@@ -817,6 +835,35 @@ offline = true
         assert_eq!(cfg.runtime.event_queue_capacity, 4096);
         assert_eq!(cfg.api.listen_addr, "127.0.0.1:3000");
         assert!(cfg.api.auth_token.is_none());
+    }
+
+    #[test]
+    fn incident_retention_is_unset_by_default() {
+        // Absent means retain forever: an existing config that never mentions
+        // the section must not lose rows to pruning.
+        let toml = r#"[runtime]
+offline = true
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.incidents.retention_days, None);
+    }
+
+    #[test]
+    fn incident_retention_days_parses() {
+        let toml = r#"[incidents]
+retention_days = 30
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.incidents.retention_days, Some(30));
+    }
+
+    #[test]
+    fn incident_retention_zero_parses_as_disabled() {
+        let toml = r#"[incidents]
+retention_days = 0
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.incidents.retention_days, Some(0));
     }
 
     #[test]

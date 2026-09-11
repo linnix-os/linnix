@@ -13,7 +13,7 @@ use aya::util::online_cpus;
 use aya::{Ebpf, EbpfLoader};
 use aya_log::EbpfLogger;
 use caps::{CapSet, Capability};
-use log::{info, warn};
+use log::{debug, info, warn};
 use std::{convert::TryFrom, error::Error, net::IpAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncWriteExt, BufWriter};
@@ -740,6 +740,54 @@ async fn main() -> Result<(), Box<dyn Error>> {
     } else {
         None
     };
+
+    // Incident retention: prune rows older than the configured TTL on a
+    // background loop. Best-effort by design — a failed prune logs a warning
+    // and retries on the next cycle; it never blocks inserts or breaks the
+    // monitoring loop. Unset or 0 disables pruning entirely (retain forever).
+    const INCIDENT_PRUNE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+    // First prune runs shortly after startup so a long-configured TTL takes
+    // effect promptly instead of waiting out a full interval.
+    const INCIDENT_PRUNE_STARTUP_DELAY: Duration = Duration::from_secs(60);
+    let retention_days = config.incidents.retention_days;
+    match retention_days {
+        Some(days) if days > 0 => match incident_store.clone() {
+            Some(store) => {
+                info!(
+                    "[cognitod] Incident retention: pruning incidents older than {} days every 24h",
+                    days
+                );
+                tokio::spawn(async move {
+                    tokio::time::sleep(INCIDENT_PRUNE_STARTUP_DELAY).await;
+                    loop {
+                        if let Some(cutoff) = cognitod::incidents::retention_cutoff_unix(
+                            Some(days),
+                            chrono::Utc::now().timestamp(),
+                        ) {
+                            match store.prune_older_than(cutoff).await {
+                                Ok(deleted) => info!(
+                                    "[cognitod] Incident retention: pruned {} incident(s) older than {} days",
+                                    deleted, days
+                                ),
+                                Err(e) => warn!(
+                                    "[cognitod] Incident retention: prune failed ({}); will retry on the next cycle",
+                                    e
+                                ),
+                            }
+                        }
+                        tokio::time::sleep(INCIDENT_PRUNE_INTERVAL).await;
+                    }
+                });
+            }
+            None => warn!(
+                "[cognitod] Incident retention configured ({} days) but no incident store is available; pruning disabled",
+                days
+            ),
+        },
+        _ => debug!(
+            "[cognitod] Incident retention not configured (retention_days unset or 0); keeping incidents forever"
+        ),
+    }
 
     let incident_analyzer = if config.reasoner.enabled && !config.reasoner.endpoint.is_empty() {
         match cognitod::IncidentAnalyzer::new(
@@ -1493,6 +1541,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         slack_signing_secret,
         enforcement: enforcement_queue.clone(),
         incident_store: incident_store.clone(),
+        incident_retention_days: retention_days.filter(|d| *d > 0),
         k8s: k8s_context.clone(),
         blame_metrics: blame_metrics.clone(),
     });
