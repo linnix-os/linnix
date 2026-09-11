@@ -355,6 +355,11 @@ impl Config {
                 "unrecognised key `{key}` in [telemetry] (not read by the daemon)"
             ));
         }
+        for key in config.incidents.unknown.keys() {
+            problems.push(format!(
+                "unrecognised key `{key}` in [incidents] (not read by the daemon)"
+            ));
+        }
         problems.extend(config.telemetry.range_problems());
         problems
     }
@@ -391,6 +396,16 @@ impl Config {
             log::warn!(
                 "[config] ignoring unrecognised key(s) in [reasoner]: {}. \
                  These are not read by the daemon and have no effect. \
+                 Run `cognitod --check-config` to validate.",
+                keys.join(", ")
+            );
+        }
+        if !self.incidents.unknown.is_empty() {
+            let keys: Vec<&str> = self.incidents.unknown.keys().map(String::as_str).collect();
+            log::warn!(
+                "[config] ignoring unrecognised key(s) in [incidents]: {}. \
+                 These are not read by the daemon and have no effect — a \
+                 typo'd `retention_day` leaves pruning disabled. \
                  Run `cognitod --check-config` to validate.",
                 keys.join(", ")
             );
@@ -707,6 +722,12 @@ pub struct IncidentsConfig {
     /// means "retain forever" — the prune task is not even spawned.
     #[serde(default)]
     pub retention_days: Option<u64>,
+    /// Keys present in `[incidents]` that no field matches. Captured rather
+    /// than discarded so `warn_unknown_keys` and `Config::check` can name
+    /// them — a typo'd `retention_day` is otherwise indistinguishable from
+    /// having configured nothing, and pruning would stay silently disabled.
+    #[serde(flatten)]
+    pub unknown: std::collections::BTreeMap<String, toml::Value>,
 }
 
 fn default_attribution_threshold_ms() -> u64 {
@@ -1229,6 +1250,33 @@ timeout_ms = 30000
         assert_eq!(problems.len(), 2, "got: {problems:?}");
         assert!(problems.iter().any(|p| p.contains("reasner")));
         assert!(problems.iter().any(|p| p.contains("window_seconds")));
+    }
+
+    #[test]
+    fn check_flags_a_misspelled_incidents_key() {
+        // Without the unknown-key capture, a typo'd `retention_day` parses
+        // fine, `retention_days` stays `None`, and pruning stays silently
+        // disabled. The check must name the key.
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "[incidents]\nretention_day = 30").unwrap();
+
+        let problems = Config::check(file.path());
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("retention_day") && p.contains("[incidents]")),
+            "a typo'd [incidents] key must be flagged, got: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn check_passes_a_correct_incidents_section() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "[incidents]\nretention_days = 30").unwrap();
+        assert!(
+            Config::check(file.path()).is_empty(),
+            "a correct [incidents] section must be clean"
+        );
     }
 
     #[test]
