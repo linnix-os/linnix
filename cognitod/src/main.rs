@@ -965,7 +965,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // then also drops aggregate ancestors (e.g. the root cgroup) whose
         // hierarchical counters include kubepods stalls, so the same stall
         // isn't reported twice.
-        .with_kubernetes(k8s_context.is_some());
+        .with_kubernetes(k8s_context.is_some())
+        // Stall findings become queryable incidents for the API and MCP
+        // tools, not just log lines.
+        .with_incident_store(incident_store.clone());
         tokio::spawn(async move {
             monitor.run().await;
         });
