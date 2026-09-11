@@ -960,7 +960,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     {
         let monitor = cognitod::collectors::cgroup_pressure::CgroupPressureMonitor::new(
             std::time::Duration::from_secs(10),
-        );
+        )
+        // On Kubernetes hosts PsiMonitor owns kubepods pressure; the monitor
+        // then also drops aggregate ancestors (e.g. the root cgroup) whose
+        // hierarchical counters include kubepods stalls, so the same stall
+        // isn't reported twice.
+        .with_kubernetes(k8s_context.is_some());
         tokio::spawn(async move {
             monitor.run().await;
         });
