@@ -220,7 +220,12 @@ impl BatchSealer {
 
     /// Seal the buffered events into an immutable batch. Returns `None`
     /// when there's nothing to seal (the schema requires 1–500 events).
-    pub fn seal(&mut self, ctx: &SealContext<'_>) -> Option<SealedBatch> {
+    ///
+    /// This does NOT drain the buffer: call [`clear`] only after the batch
+    /// is durable (spooled). A failed spool store leaves the events
+    /// buffered for retry, so a later successful batch can never advance
+    /// the watermark past them.
+    pub fn seal(&self, ctx: &SealContext<'_>) -> Option<SealedBatch> {
         if self.events.is_empty() {
             return None;
         }
@@ -230,10 +235,7 @@ impl BatchSealer {
         debug_assert_eq!(ctx.cluster_id, self.identity.cluster_id);
         debug_assert_eq!(ctx.node_id, self.identity.node_id);
         debug_assert_eq!(ctx.agent_instance_id, self.identity.agent_instance_id);
-        let events = std::mem::take(&mut self.events);
-        self.event_bytes = 0;
-        self.first_push = None;
-        let event_count = events.len();
+        let event_count = self.events.len();
 
         let envelope = BatchEnvelope {
             schema_version: SCHEMA_VERSION.to_string(),
@@ -246,7 +248,7 @@ impl BatchSealer {
             sequence: ctx.sequence,
             agent_instance_id: ctx.agent_instance_id.to_string(),
             attribution_quality: self.quality,
-            events,
+            events: self.events.clone(),
         };
         // Same inputs → same bytes: idempotency keys are stable across retries.
         let bytes = serde_json::to_vec(&envelope).expect("envelope serialization cannot fail");
@@ -267,6 +269,15 @@ impl BatchSealer {
             bytes,
             digest,
         })
+    }
+
+    /// Drain the buffer after the sealed batch is durable on disk. Only
+    /// call this once the batch bytes are safely spooled — otherwise the
+    /// buffered events are lost.
+    pub fn clear(&mut self) {
+        self.events.clear();
+        self.event_bytes = 0;
+        self.first_push = None;
     }
 }
 
@@ -520,6 +531,10 @@ mod tests {
         let batch = sealer.seal(&ctx()).unwrap();
         assert_eq!(batch.event_count, MAX_EVENTS_PER_BATCH);
         assert_eq!(batch.sequence, 7);
+        // seal() doesn't drain: the buffer clears only once the batch is
+        // durable (the exporter's seal_and_spool does this after spooling).
+        assert!(!sealer.is_empty());
+        sealer.clear();
         assert!(sealer.is_empty());
     }
 
@@ -533,6 +548,7 @@ mod tests {
         let batch = sealer.seal(&ctx()).unwrap();
         assert_eq!(batch.quality, AttributionQuality::PsiOnly);
         // Empty sealer seals to nothing: the schema requires ≥1 event.
+        sealer.clear();
         assert!(sealer.seal(&ctx()).is_none());
     }
 
