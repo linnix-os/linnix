@@ -43,6 +43,15 @@ spec:
                 secretKeyRef:
                   name: linnix-api-token
                   key: token
+            # Downward API: the node's name. The agent prefers NODE_NAME over
+            # HOSTNAME when resolving its identity, so the persisted
+            # cloud_identity.json (and its batch sequence / export watermark)
+            # stays bound to the *node* across pod restarts instead of
+            # following the pod's hostname.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           volumeMounts:
             - name: config
               mountPath: /etc/linnix
@@ -52,6 +61,15 @@ spec:
               readOnly: true
             - name: debugfs
               mountPath: /sys/kernel/debug
+            # Durable per-node state: the incident DB, cloud_identity.json
+            # (agent instance ID, batch sequence, export watermark) and the
+            # cloud_spool/ batch queue all live under /var/lib/linnix (the
+            # daemon's default state dir; see LINNIX_INCIDENT_DB). Without
+            # this, every pod restart mints a new agent_instance_id, resets
+            # the batch sequence, and drops queued batches — breaking the
+            # edge's gap detector and idempotency keys.
+            - name: state
+              mountPath: /var/lib/linnix
             # Mount host /proc to monitor processes
             # Note: In container, this might be mounted at /host/proc if configured,
             # but standard hostPID: true makes /proc the host's /proc?
@@ -101,3 +119,14 @@ spec:
           hostPath:
             path: /sys/kernel/debug
             type: Directory
+        # hostPath is the simplest correct choice for a DaemonSet: one pod
+        # per node, so node-local storage is exactly the right scope — no
+        # PVC provisioning or storage class needed. DirectoryOrCreate so a
+        # fresh node comes up without manual provisioning. Security note:
+        # the agent runs privileged and writes its DB/spool here; restrict
+        # host access to /var/lib/linnix to the same administrators who can
+        # already read the node's disk.
+        - name: state
+          hostPath:
+            path: /var/lib/linnix
+            type: DirectoryOrCreate

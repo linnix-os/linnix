@@ -795,34 +795,43 @@ impl CloudConfig {
             && effective_cloud_token(env_token, self.bearer_token.as_deref()).is_some()
     }
 
-    /// Refuse cleartext `http://` to non-loopback hosts: the bearer token
-    /// must not travel unencrypted because of a typo'd scheme.
+    /// Whether the configured endpoint may be contacted over plaintext HTTP.
+    ///
+    /// This parses with the `url` crate — the same WHATWG URL library
+    /// reqwest uses — so the host we check is exactly the host the request
+    /// goes to. A hand-rolled string parser can be fooled: e.g.
+    /// `http://evil.example\@localhost` looks like `localhost` to naive
+    /// string splitting (the last `@` wins), but WHATWG normalizes the
+    /// backslash to a `/`, making the real host `evil.example` — which
+    /// would send the bearer token over cleartext to a remote host.
+    ///
+    /// Rules: `https` is always allowed; `http` only to `localhost` or a
+    /// loopback IP (`127.0.0.0/8`, `::1`) *without* embedded credentials;
+    /// anything else (parse failure, other schemes, non-loopback hosts) is
+    /// denied.
     pub fn endpoint_allows_plaintext(&self) -> bool {
-        match self.endpoint.as_deref() {
-            Some(url) => {
-                let lower = url.trim_start().to_ascii_lowercase();
-                if lower.starts_with("https://") {
-                    return true;
+        let Some(raw) = self.endpoint.as_deref() else {
+            return false;
+        };
+        let Ok(parsed) = url::Url::parse(raw) else {
+            return false;
+        };
+        match parsed.scheme() {
+            "https" => true,
+            "http" => {
+                // Credentials in the URL are never acceptable: they'd be
+                // sent in cleartext regardless of the host.
+                if !parsed.username().is_empty() || parsed.password().is_some() {
+                    return false;
                 }
-                if lower.starts_with("http://") {
-                    let Some(after_scheme) = lower.strip_prefix("http://") else {
-                        return false;
-                    };
-                    let host = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
-                    let host = host.rsplit('@').next().unwrap_or(host);
-                    // Strip a :port suffix without mangling bracketed IPv6.
-                    if let Some(rest) = host.strip_prefix('[') {
-                        return rest.split(']').next().is_some_and(|ip| ip == "::1");
-                    }
-                    if host.matches(':').count() > 1 {
-                        return host == "::1";
-                    }
-                    let host = host.split(':').next().unwrap_or(host);
-                    return host == "localhost" || host == "127.0.0.1";
+                match parsed.host() {
+                    Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+                    Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                    Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                    None => false,
                 }
-                false
             }
-            None => false,
+            _ => false,
         }
     }
 }
@@ -1109,10 +1118,25 @@ enabled = true
             cfg.endpoint_allows_plaintext()
         };
         assert!(allows(Some("https://ingest.example/v1")));
-        assert!(allows(Some("http://127.0.0.1:8080/v1")));
         assert!(allows(Some("http://localhost:8080/v1")));
+        assert!(allows(Some("http://127.0.0.1:8080/v1")));
+        assert!(allows(Some("http://127.0.0.2:8080/v1")));
+        assert!(allows(Some("http://[::1]:8080/v1")));
         assert!(!allows(Some("http://ingest.example/v1")));
         assert!(!allows(Some("ftp://ingest.example/v1")));
+        assert!(!allows(Some("http://localhost.evil.example/")));
+        // The reviewer's bypass: WHATWG normalizes the backslash to `/`,
+        // so the real host is evil.example — naive string splitting sees
+        // "localhost" after the last '@'.
+        assert!(!allows(Some("http://evil.example\\@localhost:8080/v1")));
+        assert!(!allows(Some("http://evil.example@127.0.0.1:8080/v1")));
+        // Credentials in the URL are never acceptable, even on loopback.
+        assert!(!allows(Some("http://user@localhost/")));
+        assert!(!allows(Some("http://user:pass@127.0.0.1/")));
+        // Malformed URLs fail closed.
+        assert!(!allows(Some("http://:8080")));
+        assert!(!allows(Some("not a url")));
+        assert!(!allows(Some("")));
         assert!(!allows(None));
     }
 

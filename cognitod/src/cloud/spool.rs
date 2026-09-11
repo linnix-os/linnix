@@ -1,5 +1,15 @@
 //! Crash-safe on-disk spool for sealed batches.
 //!
+//! Durability model: every metadata write (manifest, quarantine notes) goes
+//! through [`super::persist_durable`] — temp file, `sync_all`, atomic
+//! rename, parent-directory fsync — so it survives process crashes *and*
+//! host/power loss on filesystems that honor sync. Payload files are
+//! written with `create_new` + `sync_all`, plus a directory fsync so the
+//! directory entry is durable too. A crash between syncing a payload and
+//! persisting the manifest can't strand evidence: every open reconciles
+//! the manifest against the batch files on disk (orphans are re-admitted
+//! after verification).
+//!
 //! Layout inside the state directory (`cloud_spool/`):
 //! - `{sequence}.json` — the immutable sealed batch bytes.
 //! - `spool.json` — manifest: entries (sequence, priority, digest, bytes,
@@ -25,7 +35,7 @@
 //! re-admission; files that fail verification are moved to quarantine with
 //! a note explaining why).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -103,7 +113,6 @@ impl Spool {
         std::fs::create_dir_all(&quarantine_dir)?;
         let manifest_path = dir.join(MANIFEST_NAME);
 
-        let mut rebuilt = false;
         let mut manifest: Manifest = match std::fs::read_to_string(&manifest_path) {
             Ok(contents) => match serde_json::from_str(&contents) {
                 Ok(m) => m,
@@ -111,24 +120,26 @@ impl Spool {
                     log::error!(
                         "[cloud] spool manifest is corrupt ({e}); rebuilding from batch files on disk"
                     );
-                    rebuilt = true;
                     Self::rebuild_from_disk(&dir, &quarantine_dir)?
                 }
             },
             Err(e) if e.kind() == io::ErrorKind::NotFound => Manifest::default(),
             Err(e) => return Err(e),
         };
-        // Drop index entries whose payload didn't survive.
-        manifest
-            .entries
-            .retain(|e| dir.join(batch_file_name(e.sequence)).exists());
+        // Reconcile the manifest against the batch files on disk on *every*
+        // open, not just after a corrupt manifest: a crash between syncing
+        // a payload and persisting the manifest leaves a valid manifest
+        // plus an orphaned batch that would otherwise never be uploaded,
+        // removed, or counted. Listed entries whose file is missing,
+        // resized, or digest-drifted are dropped, repaired, or quarantined.
+        Self::reconcile_with_disk(&mut manifest, &dir, &quarantine_dir)?;
 
         let quarantine_entries = Self::scan_quarantine(&quarantine_dir)?;
         let quarantine_bytes = quarantine_entries.iter().map(|e| e.bytes).sum();
 
         let total_bytes = manifest.entries.iter().map(|e| e.bytes).sum();
         let entries = manifest.entries.into_iter().collect();
-        let spool = Self {
+        let mut spool = Self {
             dir,
             manifest_path,
             quarantine_dir,
@@ -138,12 +149,183 @@ impl Spool {
             quarantine_entries,
             quarantine_bytes,
         };
-        if rebuilt {
-            // Persist the rebuilt manifest so the next open takes the fast
-            // path; the quarantine index is always re-scanned from disk.
-            spool.persist()?;
-        }
+        // Enforce the caps on recovered state before the sender ever drains
+        // it: an over-age or over-size spool from a previous run must be
+        // evicted, not served. Then persist the reconciled, cap-enforced
+        // manifest so the next open takes the fast path.
+        spool.enforce_caps()?;
+        spool.persist()?;
         Ok(spool)
+    }
+
+    /// Move an unverifiable batch file into quarantine with a note. A
+    /// missing source is already-done (idempotent); anything else
+    /// propagates — the caller must not index a file whose disposition is
+    /// unknown.
+    fn quarantine_file(
+        path: &Path,
+        quarantine_dir: &Path,
+        seq: u64,
+        reason: &str,
+    ) -> io::Result<()> {
+        let dest = quarantine_dir.join(batch_file_name(seq));
+        match std::fs::rename(path, &dest) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                log::warn!("[cloud] spool: batch file {seq} vanished before quarantine; skipping");
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
+        // The rename already succeeded, so the batch IS quarantined on
+        // disk; a note-write failure propagates, but the next open's scan
+        // recreates the note — the batch is never left un-noted.
+        let note = format!(
+            "sequence: {seq}\nquarantined_at_unix: {}\nreason: {reason}\n",
+            now_unix()
+        );
+        super::persist_durable(&quarantine_dir.join(format!("{seq}.note")), note.as_bytes())?;
+        log::warn!("[cloud] spool: quarantined batch file {seq} ({reason})");
+        Ok(())
+    }
+
+    /// Reconcile a manifest against the batch files on disk.
+    ///
+    /// - Payload files not listed in the manifest (the crash window: payload
+    ///   synced, manifest never persisted) are verified and re-admitted, or
+    ///   quarantined with a note when they fail verification.
+    /// - Listed entries whose file is missing are dropped.
+    /// - Listed entries whose size or digest no longer matches the file are
+    ///   re-verified: repaired from disk when the file is a valid batch,
+    ///   quarantined with a note when it isn't.
+    fn reconcile_with_disk(
+        manifest: &mut Manifest,
+        dir: &Path,
+        quarantine_dir: &Path,
+    ) -> io::Result<()> {
+        let mut indexed: HashMap<u64, usize> = HashMap::new();
+        for (i, e) in manifest.entries.iter().enumerate() {
+            indexed.entry(e.sequence).or_insert(i);
+        }
+        let mut on_disk: Vec<(u64, PathBuf)> = std::fs::read_dir(dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let seq: u64 = name.strip_suffix(".json")?.parse().ok()?;
+                Some((seq, e.path()))
+            })
+            .collect();
+        on_disk.sort_by_key(|(seq, _)| *seq);
+
+        // Sequences whose manifest entry survives this pass.
+        let mut confirmed: HashSet<u64> = HashSet::new();
+        for (seq, path) in on_disk {
+            let survives = match indexed.get(&seq) {
+                Some(&i) => {
+                    let entry = &manifest.entries[i];
+                    // Read once: size and digest are both checked against
+                    // the manifest. Any drift means the file changed under
+                    // us — re-verify before trusting it.
+                    let disk = std::fs::read(&path);
+                    let matches = match &disk {
+                        Ok(bytes) => {
+                            bytes.len() as u64 == entry.bytes
+                                && hex::encode(Sha256::digest(bytes)) == entry.digest
+                        }
+                        Err(_) => false,
+                    };
+                    if matches {
+                        true
+                    } else {
+                        match disk.map_err(|e| e.to_string()).and_then(|bytes| {
+                            verify_batch_bytes(&bytes).map(|info| {
+                                let digest = hex::encode(Sha256::digest(&bytes));
+                                (bytes.len() as u64, digest, info)
+                            })
+                        }) {
+                            Ok((actual_bytes, actual_digest, info)) => {
+                                log::warn!(
+                                    "[cloud] spool reconcile: repaired manifest entry for batch \
+                                     {seq} (size/digest drifted on disk)"
+                                );
+                                let e = &mut manifest.entries[i];
+                                e.bytes = actual_bytes;
+                                e.digest = actual_digest;
+                                e.events = info.events;
+                                e.priority = info.priority;
+                                true
+                            }
+                            Err(reason) => {
+                                let claimed_events = manifest.entries[i].events;
+                                Self::quarantine_file(
+                                    &path,
+                                    quarantine_dir,
+                                    seq,
+                                    &format!(
+                                        "spool reconcile: listed batch failed re-verification: {reason}"
+                                    ),
+                                )?;
+                                manifest.dropped_total =
+                                    manifest.dropped_total.saturating_add(claimed_events as u64);
+                                false
+                            }
+                        }
+                    }
+                }
+                None => {
+                    // Orphaned batch: the payload was synced but the
+                    // manifest persist never landed.
+                    match std::fs::read(&path)
+                        .map_err(|e| e.to_string())
+                        .and_then(|bytes| {
+                            verify_batch_bytes(&bytes).map(|info| (bytes.len() as u64, info))
+                        }) {
+                        Ok((actual_bytes, info)) => {
+                            log::warn!(
+                                "[cloud] spool reconcile: re-admitting orphaned batch {seq} \
+                                 ({} event(s))",
+                                info.events
+                            );
+                            indexed.insert(seq, manifest.entries.len());
+                            manifest.entries.push(SpoolEntry {
+                                sequence: seq,
+                                priority: info.priority,
+                                digest: info.digest,
+                                bytes: actual_bytes,
+                                events: info.events,
+                                sealed_at_unix: file_mtime_unix(&path),
+                            });
+                            true
+                        }
+                        Err(reason) => {
+                            Self::quarantine_file(
+                                &path,
+                                quarantine_dir,
+                                seq,
+                                &format!(
+                                    "spool reconcile: orphaned batch failed verification: {reason}"
+                                ),
+                            )?;
+                            false
+                        }
+                    }
+                }
+            };
+            if survives {
+                confirmed.insert(seq);
+            }
+        }
+        let before = manifest.entries.len();
+        manifest.entries.retain(|e| confirmed.contains(&e.sequence));
+        let dropped = before - manifest.entries.len();
+        if dropped > 0 {
+            log::warn!(
+                "[cloud] spool reconcile: dropped {dropped} manifest entr(ies) with no surviving file"
+            );
+        }
+        manifest.entries.sort_by_key(|e| e.sequence);
+        Ok(())
     }
 
     /// Rebuild the manifest from `{sequence}.json` files on disk. Every
@@ -177,19 +359,12 @@ impl Spool {
                     });
                 }
                 Err(reason) => {
-                    let dest = quarantine_dir.join(batch_file_name(seq));
-                    let _ = std::fs::rename(&path, &dest);
-                    let _ = std::fs::write(
-                        quarantine_dir.join(format!("{seq}.note")),
-                        format!(
-                            "sequence: {seq}\nquarantined_at_unix: {}\n\
-                             reason: skipped during spool rebuild: {reason}\n",
-                            now_unix()
-                        ),
-                    );
-                    log::warn!(
-                        "[cloud] spool rebuild: quarantined unreadable batch file {seq} ({reason})"
-                    );
+                    Self::quarantine_file(
+                        &path,
+                        quarantine_dir,
+                        seq,
+                        &format!("spool rebuild: skipped unreadable batch: {reason}"),
+                    )?;
                 }
             }
         }
@@ -223,13 +398,16 @@ impl Spool {
                 .and_then(|note| parse_note_field(&note, "quarantined_at_unix"))
                 .unwrap_or_else(|| file_mtime_unix(&entry.path()));
             if !note_path.exists() {
-                let _ = std::fs::write(
+                // A quarantined batch is never left un-noted; the write
+                // propagates — without the note we can't prove the
+                // quarantine later.
+                std::fs::write(
                     &note_path,
                     format!(
                         "sequence: {seq}\nquarantined_at_unix: {quarantined_at}\n\
                          reason: recovered at startup; original refusal reason unknown\n"
                     ),
-                );
+                )?;
             }
             let events = std::fs::read(entry.path())
                 .ok()
@@ -251,15 +429,16 @@ impl Spool {
         Ok(out.into())
     }
 
+    /// Durable manifest persist: temp file + file sync + atomic rename +
+    /// parent-directory fsync (see [`super::persist_durable`]), so a host or
+    /// power loss can't roll the manifest back or leave it torn.
     fn persist(&self) -> io::Result<()> {
         let manifest = Manifest {
             entries: self.entries.iter().cloned().collect(),
             dropped_total: self.dropped_total,
         };
-        let tmp = self.manifest_path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(&manifest).unwrap())?;
-        std::fs::rename(&tmp, &self.manifest_path)?;
-        Ok(())
+        let bytes = serde_json::to_string_pretty(&manifest).unwrap();
+        super::persist_durable(&self.manifest_path, bytes.as_bytes())
     }
 
     fn batch_path(&self, sequence: u64) -> PathBuf {
@@ -277,6 +456,11 @@ impl Spool {
         use std::io::Write as _;
         file.write_all(&batch.bytes)?;
         file.sync_all()?;
+        drop(file);
+        // Sync the directory entry too: without this a power loss can lose
+        // the payload file itself, which the manifest (persisted later)
+        // would then reference.
+        super::sync_dir(&self.dir)?;
 
         // Keep newest-first ordering simple: entries are appended in
         // sequence order; the drain end is the front.
@@ -300,8 +484,14 @@ impl Spool {
     fn enforce_caps(&mut self) -> io::Result<()> {
         let now = now_unix();
         while let Some(i) = select_victim(&self.entries, self.total_bytes_used(), now) {
+            // The file goes first: only after the filesystem confirms the
+            // deletion does the index stop describing the batch. A missing
+            // file is already-done (idempotent); anything else aborts the
+            // eviction so the index never claims a deletion that didn't
+            // happen — the batch stays queued and is retried next pass.
+            let sequence = self.entries[i].sequence;
+            remove_file_if_exists(&self.batch_path(sequence))?;
             let entry = self.entries.remove(i).expect("index from live iter");
-            let _ = std::fs::remove_file(self.batch_path(entry.sequence));
             self.total_bytes = self.total_bytes.saturating_sub(entry.bytes);
             self.dropped_total = self.dropped_total.saturating_add(entry.events as u64);
             log::warn!(
@@ -327,23 +517,30 @@ impl Spool {
         while let Some(i) =
             select_quarantine_victim(&self.quarantine_entries, self.total_bytes_used(), now)
         {
-            let q = self
-                .quarantine_entries
-                .remove(i)
-                .expect("index from live iter");
-            let note_path = self.quarantine_dir.join(format!("{}.note", q.sequence));
+            // Ensure the note exists *before* deleting anything: a
+            // quarantined batch is never deleted un-noted. The write
+            // propagates — without the note we can't prove the eviction
+            // later, so the batch stays.
+            let note_path = self
+                .quarantine_dir
+                .join(format!("{}.note", self.quarantine_entries[i].sequence));
             if !note_path.exists() {
-                let _ = std::fs::write(
+                std::fs::write(
                     &note_path,
                     format!(
                         "sequence: {}\nquarantined_at_unix: {}\n\
                          reason: recovered at eviction; original refusal reason unknown\n",
-                        q.sequence, q.quarantined_at_unix
+                        self.quarantine_entries[i].sequence,
+                        self.quarantine_entries[i].quarantined_at_unix,
                     ),
-                );
+                )?;
             }
-            let _ = std::fs::remove_file(self.quarantine_dir.join(batch_file_name(q.sequence)));
-            let _ = std::fs::remove_file(&note_path);
+            let q = self
+                .quarantine_entries
+                .remove(i)
+                .expect("index from live iter");
+            remove_file_if_exists(&self.quarantine_dir.join(batch_file_name(q.sequence)))?;
+            remove_file_if_exists(&note_path)?;
             self.quarantine_bytes = self.quarantine_bytes.saturating_sub(q.bytes);
             self.dropped_total = self.dropped_total.saturating_add(q.events as u64);
             log::error!(
@@ -365,11 +562,13 @@ impl Spool {
         })
     }
 
-    /// Remove a batch after the edge acknowledged it (200/202).
+    /// Remove a batch after the edge acknowledged it (200/202). The file is
+    /// deleted first; the index and manifest follow only once the filesystem
+    /// confirms it. A delete failure propagates and the batch stays queued.
     pub fn remove(&mut self, sequence: u64) -> io::Result<()> {
         if let Some(i) = self.entries.iter().position(|e| e.sequence == sequence) {
+            remove_file_if_exists(&self.batch_path(sequence))?;
             let entry = self.entries.remove(i).expect("position from live iter");
-            let _ = std::fs::remove_file(self.batch_path(entry.sequence));
             self.total_bytes = self.total_bytes.saturating_sub(entry.bytes);
             self.persist()?;
         }
@@ -379,22 +578,45 @@ impl Spool {
     /// Move a refused batch to quarantine with a note. Never retried; the
     /// quarantine directory is bounded by the same retention envelope as
     /// the spool (see [`Spool::enforce_quarantine_caps_at`]).
+    ///
+    /// The rename happens before any in-memory change: only after the
+    /// filesystem confirms the move does the index follow. A rename failure
+    /// propagates and the batch stays queued for retry; a missing source is
+    /// already-done (the entry is dropped, since the batch can't be read
+    /// anyway).
     pub fn quarantine(&mut self, sequence: u64, reason: &str) -> io::Result<()> {
         let Some(i) = self.entries.iter().position(|e| e.sequence == sequence) else {
             return Ok(());
         };
+        let src = self.batch_path(sequence);
+        let dest = self.quarantine_dir.join(batch_file_name(sequence));
+        match std::fs::rename(&src, &dest) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                log::warn!(
+                    "[cloud] batch {sequence} already gone from spool; dropping its index entry"
+                );
+                let entry = self.entries.remove(i).expect("position from live iter");
+                self.total_bytes = self.total_bytes.saturating_sub(entry.bytes);
+                self.persist()?;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
+        // The rename succeeded: on disk the batch IS quarantined, so the
+        // index follows. A note-write failure propagates, but the next
+        // open's scan recreates the note — the batch is never lost un-noted.
         let entry = self.entries.remove(i).expect("position from live iter");
-        let dest = self.quarantine_dir.join(batch_file_name(entry.sequence));
-        let _ = std::fs::rename(self.batch_path(entry.sequence), &dest);
-        let _ = std::fs::write(
-            self.quarantine_dir.join(format!("{}.note", entry.sequence)),
+        super::persist_durable(
+            &self.quarantine_dir.join(format!("{}.note", entry.sequence)),
             format!(
                 "sequence: {}\ndigest: {}\nquarantined_at_unix: {}\nreason: {reason}\n",
                 entry.sequence,
                 entry.digest,
                 now_unix()
-            ),
-        );
+            )
+            .as_bytes(),
+        )?;
         self.total_bytes = self.total_bytes.saturating_sub(entry.bytes);
         self.quarantine_bytes = self.quarantine_bytes.saturating_add(entry.bytes);
         self.quarantine_entries.push_back(QuarantineEntry {
@@ -486,6 +708,17 @@ impl SpoolEntryView<'_> {
 
 fn batch_file_name(sequence: u64) -> String {
     format!("{sequence}.json")
+}
+
+/// Delete a file that should be gone. A missing file is already-done
+/// (idempotent); any other error propagates so the caller can't update its
+/// index as if the deletion had happened.
+fn remove_file_if_exists(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// What `verify_batch_bytes` recovers from a payload on disk.
@@ -801,11 +1034,16 @@ mod tests {
         let qdir = dir.path().join(SPOOL_DIR_NAME).join(QUARANTINE_DIR);
         std::fs::create_dir_all(&qdir).unwrap();
         // A quarantined batch with a note, as quarantine() would leave it.
+        // (The note's timestamp must be fresh: open() now enforces the 24h
+        // quarantine age cap, so an ancient fixture would be evicted.)
         let bytes = br#"{"batch_idempotency_key":"b:n:21","events":[{"event_type":"detection"}]}"#;
         std::fs::write(qdir.join("21.json"), bytes).unwrap();
         std::fs::write(
             qdir.join("21.note"),
-            "sequence: 21\ndigest: d\nquarantined_at_unix: 1700000000\nreason: 409\n",
+            format!(
+                "sequence: 21\ndigest: d\nquarantined_at_unix: {}\nreason: 409\n",
+                now_unix()
+            ),
         )
         .unwrap();
         // And one without a note: open must note it (never delete un-noted).
@@ -866,6 +1104,182 @@ mod tests {
         std::fs::create_dir_all(&spool_dir).unwrap();
         std::fs::write(spool_dir.join(MANIFEST_NAME), b"\x00\x01 garbage").unwrap();
         let spool = Spool::open(dir.path()).unwrap();
+        assert_eq!(spool.batch_count(), 0);
+        assert_eq!(spool.quarantine_batch_count(), 0);
+    }
+
+    fn valid_batch_bytes(seq: u64, event_count: usize) -> Vec<u8> {
+        let events: Vec<_> = (0..event_count)
+            .map(|i| serde_json::json!({"event_id": format!("e{i}"), "event_type": "detection"}))
+            .collect();
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": "1.0.0",
+            "batch_idempotency_key": format!("b:n:{seq}"),
+            "events": events,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn reconcile_readmits_orphan_batch_with_valid_manifest() {
+        // The crash window: payload synced, manifest persist never landed.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut spool = Spool::open(dir.path()).unwrap();
+            spool
+                .store(&sealed(1, 5), SpoolPriority::Heartbeat)
+                .unwrap();
+        }
+        // An orphaned payload appears on disk with the manifest untouched.
+        let orphan = valid_batch_bytes(2, 3);
+        std::fs::write(dir.path().join(SPOOL_DIR_NAME).join("2.json"), &orphan).unwrap();
+
+        let spool = Spool::open(dir.path()).unwrap();
+        assert_eq!(spool.batch_count(), 2, "orphan must be re-admitted");
+        assert_eq!(spool.read(2).unwrap(), orphan);
+        // The reconciled manifest was persisted: a second open agrees.
+        drop(spool);
+        let reopened = Spool::open(dir.path()).unwrap();
+        assert_eq!(reopened.batch_count(), 2);
+    }
+
+    #[test]
+    fn reconcile_repairs_drifted_but_valid_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut spool = Spool::open(dir.path()).unwrap();
+            spool
+                .store(&sealed(1, 5), SpoolPriority::Heartbeat)
+                .unwrap();
+        }
+        // The file on disk is replaced by different-but-valid batch bytes
+        // (size and digest drift from the manifest).
+        let replacement = valid_batch_bytes(1, 4);
+        std::fs::write(dir.path().join(SPOOL_DIR_NAME).join("1.json"), &replacement).unwrap();
+
+        let spool = Spool::open(dir.path()).unwrap();
+        assert_eq!(spool.batch_count(), 1);
+        // The manifest entry was repaired: the digest check passes on the
+        // new bytes.
+        assert_eq!(spool.read(1).unwrap(), replacement);
+        assert_eq!(spool.pending_events(), 4);
+    }
+
+    #[test]
+    fn reconcile_quarantines_listed_batch_that_fails_reverification() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut spool = Spool::open(dir.path()).unwrap();
+            spool
+                .store(&sealed(1, 5), SpoolPriority::Heartbeat)
+                .unwrap();
+        }
+        // Torn write: the file no longer parses.
+        std::fs::write(dir.path().join(SPOOL_DIR_NAME).join("1.json"), b"{torn").unwrap();
+
+        let spool = Spool::open(dir.path()).unwrap();
+        assert_eq!(
+            spool.batch_count(),
+            0,
+            "unverifiable batch leaves the index"
+        );
+        assert_eq!(spool.quarantine_batch_count(), 1);
+        let note = std::fs::read_to_string(
+            dir.path()
+                .join(SPOOL_DIR_NAME)
+                .join(QUARANTINE_DIR)
+                .join("1.note"),
+        )
+        .unwrap();
+        assert!(note.contains("reconcile"), "note explains why: {note}");
+    }
+
+    #[test]
+    fn reopen_enforces_age_cap_on_recovered_state() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut spool = Spool::open(dir.path()).unwrap();
+            spool
+                .store(&sealed(1, 5), SpoolPriority::Heartbeat)
+                .unwrap();
+        }
+        // Age the manifest entry to the epoch: a recovered spool older than
+        // 24h must be evicted at open, not served to the sender.
+        let manifest_path = dir.path().join(SPOOL_DIR_NAME).join(MANIFEST_NAME);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["entries"][0]["sealed_at_unix"] = serde_json::json!(0);
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let spool = Spool::open(dir.path()).unwrap();
+        assert_eq!(
+            spool.batch_count(),
+            0,
+            "over-age batch must be evicted at open"
+        );
+        assert_eq!(spool.dropped_total(), 5);
+        assert!(
+            !dir.path().join(SPOOL_DIR_NAME).join("1.json").exists(),
+            "evicted batch file must be gone"
+        );
+    }
+
+    #[test]
+    fn remove_propagates_fs_errors_without_desync() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spool = Spool::open(dir.path()).unwrap();
+        spool
+            .store(&sealed(1, 5), SpoolPriority::Heartbeat)
+            .unwrap();
+        // Failure injection that works even as root: a directory where the
+        // batch file should be makes remove_file fail with a non-NotFound
+        // error.
+        let batch_path = dir.path().join(SPOOL_DIR_NAME).join("1.json");
+        std::fs::remove_file(&batch_path).unwrap();
+        std::fs::create_dir(&batch_path).unwrap();
+
+        let err = spool.remove(1).unwrap_err();
+        assert_ne!(err.kind(), io::ErrorKind::NotFound);
+        // The failure must not desync the index: the batch is still queued
+        // with its accounting intact, so a later retry can finish the ack.
+        assert_eq!(spool.batch_count(), 1);
+        assert_eq!(spool.total_bytes_used_for_test(), 64);
+    }
+
+    #[test]
+    fn quarantine_propagates_rename_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spool = Spool::open(dir.path()).unwrap();
+        spool
+            .store(&sealed(1, 5), SpoolPriority::Heartbeat)
+            .unwrap();
+        // Block the rename target with a directory: rename fails, the error
+        // propagates, and the batch stays queued (never half-moved).
+        let qdir = dir.path().join(SPOOL_DIR_NAME).join(QUARANTINE_DIR);
+        std::fs::create_dir(qdir.join("1.json")).unwrap();
+
+        let err = spool.quarantine(1, "409 conflict").unwrap_err();
+        assert_ne!(err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            spool.batch_count(),
+            1,
+            "failed quarantine must not drop the batch"
+        );
+        assert_eq!(spool.quarantine_batch_count(), 0);
+        assert_eq!(spool.total_bytes_used_for_test(), 64);
+    }
+
+    #[test]
+    fn quarantine_with_vanished_source_drops_the_index_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spool = Spool::open(dir.path()).unwrap();
+        spool
+            .store(&sealed(1, 5), SpoolPriority::Heartbeat)
+            .unwrap();
+        // The payload vanished between oldest() and quarantine(): NotFound
+        // is already-done — drop the entry rather than wedging the drain.
+        std::fs::remove_file(dir.path().join(SPOOL_DIR_NAME).join("1.json")).unwrap();
+        spool.quarantine(1, "409 conflict").unwrap();
         assert_eq!(spool.batch_count(), 0);
         assert_eq!(spool.quarantine_batch_count(), 0);
     }

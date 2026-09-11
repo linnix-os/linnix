@@ -13,8 +13,11 @@
 //! - `export_watermark`: the last incident row id sealed into a batch, so a
 //!   restart resumes export without re-sending or skipping.
 //!
-//! Writes go through write-tmp-then-rename so a crash can't leave a torn
-//! identity file.
+//! Writes go through [`super::persist_durable`]: temp file, `sync_all` the
+//! temp file, atomic rename, then a parent-directory fsync. That covers
+//! process crashes *and* host/power loss (on filesystems that honor sync),
+//! so a torn or rolled-back identity file can never fork the node's
+//! sequence, watermark, or agent instance ID.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -102,10 +105,8 @@ impl IdentityStore {
     }
 
     fn persist(&self) -> io::Result<()> {
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(&self.identity).unwrap())?;
-        std::fs::rename(&tmp, &self.path)?;
-        Ok(())
+        let bytes = serde_json::to_string_pretty(&self.identity).unwrap();
+        super::persist_durable(&self.path, bytes.as_bytes())
     }
 
     pub fn cluster_id(&self) -> &str {
