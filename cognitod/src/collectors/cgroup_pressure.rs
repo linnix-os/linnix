@@ -567,10 +567,7 @@ mod tests {
 
     #[test]
     fn classify_matrix() {
-        assert_eq!(
-            classify(50.0, 0.0, 0.0, 0.0, 0),
-            StallVerdict::Contended
-        );
+        assert_eq!(classify(50.0, 0.0, 0.0, 0.0, 0), StallVerdict::Contended);
         assert_eq!(classify(5.0, 2.0, 0.0, 0.0, 0), StallVerdict::Throttled);
         assert_eq!(
             classify(50.0, 2.0, 0.0, 0.0, 0),
