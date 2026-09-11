@@ -576,15 +576,45 @@ impl CgroupPressureMonitor {
     }
 
     /// Reports one scan's actionable findings: log the warning and, when an
-    /// incident store is configured, record it. Both are gated on
-    /// `should_warn`, so the 15-minute cooldown dedups incident rows exactly
-    /// like it dedups log lines — every logged warning has a matching
-    /// incident, and a verdict flip is new information in both places.
+    /// incident store is configured, record it. Logging is gated on
+    /// `should_warn`'s cooldown; recording is additionally checked against
+    /// the store itself, which is the source of truth for what was persisted.
+    /// A stall the store already has — because the bounded cooldown map
+    /// evicted it, or a daemon restart cleared the map — is still logged
+    /// above (the stall is real and ongoing) but is not recorded twice.
     async fn handle_stalls(&mut self, stalls: &[CgroupStall]) {
+        let mut recorded = self.recently_recorded_keys().await;
         for stall in stalls {
-            if self.should_warn(stall) {
-                report(stall);
-                self.record_incident(stall).await;
+            if !self.should_warn(stall) {
+                continue;
+            }
+            report(stall);
+            let key = (stall.cgroup.clone(), format!("{:?}", stall.verdict));
+            if recorded.contains(&key) {
+                continue;
+            }
+            self.record_incident(stall).await;
+            recorded.insert(key);
+        }
+    }
+
+    /// `(cgroup, verdict)` pairs already incidented within the cooldown
+    /// window. Empty when no store is configured; fail-open when the store
+    /// can't be read — a store that won't answer the dedup query probably
+    /// won't take the insert either, and a duplicate row beats a silently
+    /// dropped incident.
+    async fn recently_recorded_keys(&self) -> HashSet<(String, String)> {
+        let Some(store) = &self.incident_store else {
+            return HashSet::new();
+        };
+        match store
+            .recent_cgroup_pressure_keys(self.warn_cooldown.as_secs())
+            .await
+        {
+            Ok(keys) => keys,
+            Err(e) => {
+                warn!("[cgroup-pressure] couldn't check recent incidents: {e}");
+                HashSet::new()
             }
         }
     }
@@ -1254,6 +1284,39 @@ mod tests {
             incidents.len(),
             1,
             "repeat findings inside the cooldown must not duplicate incidents"
+        );
+
+        // A fresh monitor — the daemon restarted, so the bounded in-memory
+        // cooldown map is empty — must not re-record either. The store, not
+        // the map, is the source of truth for what was persisted.
+        let mut mon2 = CgroupPressureMonitor::new(Duration::from_secs(2))
+            .with_cgroup_root(tmp.path())
+            .with_max_depth(5)
+            .with_incident_store(Some(Arc::clone(&store)));
+        assert!(mon2.tick().is_empty());
+        // Stall further so the second monitor sees actionable deltas.
+        write_cgroup(
+            &tmp.path().join("system.slice/nginx.service"),
+            2_000_000 + 18_000_000,
+            100_000,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        let stalls2 = mon2.tick();
+        assert!(!stalls2.is_empty());
+        mon2.handle_stalls(&stalls2).await;
+        let incidents = store
+            .recent_filtered(10, Some("cgroup_pressure"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            incidents.len(),
+            1,
+            "a restarted monitor must not duplicate incidents the store already has"
         );
     }
 

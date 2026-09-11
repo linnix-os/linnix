@@ -16,7 +16,7 @@ use sqlx::{
     Row, SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, collections::HashSet, path::Path};
 use tracing::{debug, info, warn};
 
 /// Represents a circuit breaker incident or system event
@@ -639,6 +639,36 @@ impl IncidentStore {
     /// Get recent incidents
     pub async fn recent(&self, limit: i64) -> Result<Vec<Incident>, sqlx::Error> {
         self.recent_filtered(limit, None, None).await
+    }
+
+    /// `(target_name, verdict)` pairs for `cgroup_pressure` incidents recorded
+    /// within the last `cooldown_secs`.
+    ///
+    /// The cgroup monitor's in-memory warn-cooldown map is hard-bounded (1024
+    /// entries, oldest evicted), so with extreme cgroup counts it can re-admit
+    /// an already-reported stall on the next scan — and a daemon restart
+    /// clears the map entirely. The store is the source of truth for what was
+    /// actually persisted: consulting it here keeps a repeat finding from
+    /// becoming a repeat row no matter what the bounded map forgot. The
+    /// verdict lives inside the `system_snapshot` JSON; `json_extract` reads
+    /// it without parsing rows in Rust.
+    pub async fn recent_cgroup_pressure_keys(
+        &self,
+        cooldown_secs: u64,
+    ) -> Result<HashSet<(String, String)>, sqlx::Error> {
+        let since = Utc::now().timestamp() - cooldown_secs as i64;
+        let rows = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT target_name, json_extract(system_snapshot, '$.verdict') \
+             FROM incidents \
+             WHERE event_type = 'cgroup_pressure' AND timestamp > ?",
+        )
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(target, verdict)| Some((target?, verdict?)))
+            .collect())
     }
 
     /// Get recent incidents, optionally filtered by event type and analysis state

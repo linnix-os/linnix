@@ -41,6 +41,11 @@ pub struct IncidentView {
     /// The model's reply verbatim. Kept even when nothing grounded, which is
     /// the only way to tell a broken endpoint from a model that answers badly.
     pub llm_analysis: Option<String>,
+    /// The trigger context the daemon stored with the incident — for
+    /// `cgroup_pressure` rows this is where the verdict and the stall numbers
+    /// live. Rendered under "Recorded measurements" when no investigation
+    /// exists to interpret it.
+    pub system_snapshot: Option<String>,
     pub psi_after: Option<f32>,
     pub recovery_time_ms: Option<i64>,
 }
@@ -84,6 +89,11 @@ impl IncidentView {
                 .investigation_rendered
                 .map(|inner| inner.as_deref().map(strip_terminal_controls)),
             llm_analysis: self.llm_analysis.as_deref().map(single_line),
+            // The renderer parses this as JSON and single-lines each value
+            // before printing, so embedded newlines cannot forge layout;
+            // stripping terminal controls here keeps every other consumer of
+            // the raw field safe too.
+            system_snapshot: self.system_snapshot.as_deref().map(strip_terminal_controls),
             ..self
         }
     }
@@ -188,10 +198,55 @@ pub fn render(incident: &IncidentView, id: i64, color: bool) -> String {
                 }
                 (None, None) => "No analysis has run for this incident.\n",
             });
+            // With no investigation to interpret it, the stored trigger
+            // context is the evidence. Rendered mechanically as key/value
+            // pairs — the daemon's own stored data, not a restatement — so a
+            // `cgroup_pressure` incident's verdict and stall numbers are
+            // visible without requesting raw JSON.
+            if let Some(snapshot) = incident.system_snapshot.as_deref() {
+                render_snapshot_measurements(snapshot, &mut out);
+            }
         }
     }
 
     out
+}
+
+/// Renders a stored `system_snapshot` as flat `key: value` lines, one nesting
+/// level deep. Arrays and nulls are skipped: they carry structure, not
+/// measurements, and the raw record stays one `detail=raw` call away.
+fn render_snapshot_measurements(snapshot: &str, out: &mut String) {
+    let Ok(serde_json::Value::Object(fields)) = serde_json::from_str::<serde_json::Value>(snapshot)
+    else {
+        return;
+    };
+    let mut lines = Vec::new();
+    let mut scalar = |prefix: String, value: &serde_json::Value| {
+        let text = match value {
+            serde_json::Value::String(s) => single_line(s),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            _ => return,
+        };
+        lines.push(format!("{}: {text}", single_line(&prefix)));
+    };
+    for (key, value) in &fields {
+        match value {
+            serde_json::Value::Object(inner) => {
+                for (inner_key, inner_value) in inner {
+                    scalar(format!("{key}.{inner_key}"), inner_value);
+                }
+            }
+            _ => scalar(key.clone(), value),
+        }
+    }
+    if lines.is_empty() {
+        return;
+    }
+    out.push_str("  Recorded measurements:\n");
+    for line in lines {
+        out.push_str(&format!("    {line}\n"));
+    }
 }
 
 /// Flattens a value onto one line, so it cannot forge the layout around it.
@@ -269,6 +324,7 @@ mod tests {
             investigation_rendered: None,
             investigation: None,
             llm_analysis: None,
+            system_snapshot: None,
             psi_after: None,
             recovery_time_ms: None,
         }
@@ -544,5 +600,50 @@ mod tests {
 
         // Never measured must not read as a finding.
         assert!(render(&incident(), 7, false).contains("not measured"));
+    }
+
+    #[test]
+    fn snapshot_measurements_render_without_investigation() {
+        let mut view = incident();
+        view.event_type = "cgroup_pressure".to_string();
+        view.target_name = Some("system.slice/nginx.service".to_string());
+        view.target_pid = None;
+        view.system_snapshot = Some(
+            r#"{"cgroup":"system.slice/nginx.service","verdict":"CpuContended","cpu_stall_pct":87.3,"oom_kills":0,"evidence":{"verdict":"inferred","stall_percentages":"measured"}}"#
+                .to_string(),
+        );
+
+        let out = render(&view, 12, false);
+        assert!(out.contains("No analysis has run"), "{out}");
+        assert!(out.contains("Recorded measurements:"), "{out}");
+        assert!(out.contains("verdict: CpuContended"), "{out}");
+        assert!(out.contains("cpu_stall_pct: 87.3"), "{out}");
+        assert!(out.contains("evidence.verdict: inferred"), "{out}");
+    }
+
+    #[test]
+    fn snapshot_values_cannot_forge_layout() {
+        // A hostile value smuggling a newline must not become its own line:
+        // layout is meaning, and the renderer's own header rows are the
+        // prize. Matches the guarantee `sanitized` documents for the other
+        // fields.
+        let mut view = incident();
+        view.system_snapshot = Some(r#"{"cgroup":"evil\n  Afterwards: recovered"}"#.to_string());
+
+        let out = render(&view.sanitized(), 12, false);
+        assert!(
+            !out.lines().any(|line| line == "  Afterwards: recovered"),
+            "{out}"
+        );
+        assert!(
+            out.contains(r"cgroup: evil\n  Afterwards: recovered"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn no_snapshot_means_no_measurements_section() {
+        let out = render(&incident(), 7, false);
+        assert!(!out.contains("Recorded measurements:"), "{out}");
     }
 }
