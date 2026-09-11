@@ -641,27 +641,29 @@ impl IncidentStore {
         self.recent_filtered(limit, None, None).await
     }
 
-    /// `(target_name, verdict)` pairs for `cgroup_pressure` incidents recorded
+    /// `(target_name, verdict)` pairs for incidents of `event_type` recorded
     /// within the last `cooldown_secs`.
     ///
-    /// The cgroup monitor's in-memory warn-cooldown map is hard-bounded (1024
-    /// entries, oldest evicted), so with extreme cgroup counts it can re-admit
-    /// an already-reported stall on the next scan — and a daemon restart
+    /// The monitors' in-memory warn-cooldown maps are hard-bounded (1024
+    /// entries, oldest evicted), so with extreme cardinality they can re-admit
+    /// an already-reported finding on the next scan — and a daemon restart
     /// clears the map entirely. The store is the source of truth for what was
     /// actually persisted: consulting it here keeps a repeat finding from
     /// becoming a repeat row no matter what the bounded map forgot. The
     /// verdict lives inside the `system_snapshot` JSON; `json_extract` reads
     /// it without parsing rows in Rust.
-    pub async fn recent_cgroup_pressure_keys(
+    pub async fn recent_incident_keys(
         &self,
+        event_type: &str,
         cooldown_secs: u64,
     ) -> Result<HashSet<(String, String)>, sqlx::Error> {
         let since = Utc::now().timestamp() - cooldown_secs as i64;
         let rows = sqlx::query_as::<_, (Option<String>, Option<String>)>(
             "SELECT target_name, json_extract(system_snapshot, '$.verdict') \
              FROM incidents \
-             WHERE event_type = 'cgroup_pressure' AND timestamp > ?",
+             WHERE event_type = ? AND timestamp > ?",
         )
+        .bind(event_type)
         .bind(since)
         .fetch_all(&self.pool)
         .await?;
@@ -669,6 +671,26 @@ impl IncidentStore {
             .into_iter()
             .filter_map(|(target, verdict)| Some((target?, verdict?)))
             .collect())
+    }
+
+    /// `(target_name, verdict)` pairs for `cgroup_pressure` incidents recorded
+    /// within the last `cooldown_secs`. Kept for the cgroup pressure
+    /// monitor; new callers should use [`IncidentStore::recent_incident_keys`]
+    /// directly.
+    pub async fn recent_cgroup_pressure_keys(
+        &self,
+        cooldown_secs: u64,
+    ) -> Result<HashSet<(String, String)>, sqlx::Error> {
+        self.recent_incident_keys("cgroup_pressure", cooldown_secs)
+            .await
+    }
+
+    /// Test-only: simulates a transient store outage by closing the pool,
+    /// so inserts and queries fail with `PoolClosed`. The pool cannot be
+    /// reopened — build a new store to recover.
+    #[cfg(test)]
+    pub(crate) async fn close_pool_for_test(&self) {
+        self.pool.close().await;
     }
 
     /// Get recent incidents, optionally filtered by event type and analysis state
