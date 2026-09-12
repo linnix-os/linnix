@@ -112,7 +112,15 @@ pub struct CgroupStall {
     /// % of the window with at least one task stalled on IO.
     pub io_stall_pct: f64,
     /// Seconds of CPU time throttled away by `cpu.max` in the window.
+    /// 0.0 when the `throttled_usec` counter was unreadable; check
+    /// `throttled_measured` before treating this as a measurement.
     pub throttled_secs: f64,
+    /// Whether `throttled_secs` came from a real counter delta this window.
+    /// False when the cgroup has no CPU controller (`cpu.stat` carries no
+    /// `throttled_usec` key): a missing counter is not a measurement of zero
+    /// throttling. Classification still treats it as 0 — no evidence either
+    /// way must not push a cgroup into a throttled verdict.
+    pub throttled_measured: bool,
     /// Times `memory.high` was breached in the window.
     pub mem_high_events: u64,
     /// OOM kills in the window.
@@ -514,9 +522,12 @@ impl CgroupPressureMonitor {
                     let cpu_full_pct = pct(delta_us(cur.cpu_full_total, prev.cpu_full_total));
                     let mem_stall_pct = pct(delta_us(cur.mem_some_total, prev.mem_some_total));
                     let io_stall_pct = pct(delta_us(cur.io_some_total, prev.io_some_total));
-                    let throttled_secs = delta_us(cur.throttled_usec, prev.throttled_usec)
-                        .map(|d| d as f64 / 1e6)
-                        .unwrap_or(0.0);
+                    let throttled_delta =
+                        delta_us(cur.throttled_usec, prev.throttled_usec).map(|d| d as f64 / 1e6);
+                    // A missing counter is no evidence either way: it must not
+                    // push the verdict toward throttled, but the finding must
+                    // not claim a measurement either (see `throttled_measured`).
+                    let throttled_secs = throttled_delta.unwrap_or(0.0);
                     let mem_high_events = delta_us(cur.mem_high, prev.mem_high).unwrap_or(0);
                     let oom_kills = delta_us(cur.oom_kill, prev.oom_kill).unwrap_or(0);
                     let verdict = classify(
@@ -534,6 +545,7 @@ impl CgroupPressureMonitor {
                             mem_stall_pct,
                             io_stall_pct,
                             throttled_secs,
+                            throttled_measured: throttled_delta.is_some(),
                             mem_high_events,
                             oom_kills,
                             verdict,
@@ -658,10 +670,11 @@ fn incident_from_stall(stall: &CgroupStall) -> Incident {
         "mem_high_events": stall.mem_high_events,
         "oom_kills": stall.oom_kills,
         // The percentages are measured kernel counters; the verdict is
-        // inferred from their combination.
+        // inferred from their combination. throttled_secs is only "measured"
+        // when the counter was actually readable this window.
         "evidence": {
             "stall_percentages": "measured",
-            "throttled_secs": "measured",
+            "throttled_secs": if stall.throttled_measured { "measured" } else { "unavailable" },
             "event_counts": "measured",
             "verdict": "inferred",
         },
@@ -691,10 +704,23 @@ fn incident_from_stall(stall: &CgroupStall) -> Incident {
 /// `measured` kernel counters.
 fn report(stall: &CgroupStall) {
     match stall.verdict {
-        StallVerdict::CpuContended => warn!(
-            "[cgroup-pressure] {} CPU-stalled {:.0}% (full {:.0}%), IO-stalled {:.0}% with no throttling -- genuine CPU contention, likely a noisy neighbor or undersized CPU [inferred]",
-            stall.cgroup, stall.cpu_stall_pct, stall.cpu_full_pct, stall.io_stall_pct
-        ),
+        StallVerdict::CpuContended => {
+            // "No throttling" is only claimable when the counter was read;
+            // otherwise the honest statement is that it wasn't there to read.
+            let throttle_note = if stall.throttled_measured {
+                "with no throttling -- genuine CPU contention, likely a noisy neighbor or undersized CPU"
+            } else {
+                "throttle counter unavailable -- CPU contention likely (noisy neighbor or undersized CPU), but a CPU limit can't be ruled out"
+            };
+            warn!(
+                "[cgroup-pressure] {} CPU-stalled {:.0}% (full {:.0}%), IO-stalled {:.0}% {} [inferred]",
+                stall.cgroup,
+                stall.cpu_stall_pct,
+                stall.cpu_full_pct,
+                stall.io_stall_pct,
+                throttle_note
+            )
+        }
         StallVerdict::IoContended => warn!(
             "[cgroup-pressure] {} IO-stalled {:.0}% with no CPU stall -- storage contention (slow disk or noisy neighbor on the block device), not a CPU problem [inferred]",
             stall.cgroup, stall.io_stall_pct
@@ -867,6 +893,69 @@ mod tests {
             .expect("nginx.service should be reported");
         assert_eq!(nginx.verdict, StallVerdict::Throttled);
         assert!(nginx.throttled_secs >= THROTTLED_SECS);
+    }
+
+    /// Fixture for a cgroup with no CPU controller: `cpu.stat` carries no
+    /// `throttled_usec` key, so the throttle counter is absent, not zero.
+    fn write_cgroup_no_throttle_counter(dir: &Path, cpu_some: u64, cpu_full: u64) {
+        fs::write(
+            dir.join("cpu.pressure"),
+            format!("some avg10=0.00 avg60=0.00 avg300=0.00 total={cpu_some}\nfull avg10=0.00 avg60=0.00 avg300=0.00 total={cpu_full}\n"),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("memory.pressure"),
+            "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("io.pressure"),
+            "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("cpu.stat"),
+            "usage_usec 1000\nuser_usec 800\nsystem_usec 200\nnr_periods 10\nnr_throttled 2\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("memory.events"),
+            "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn missing_throttle_counter_is_unavailable_not_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = tmp.path().join("system.slice/nginx.service");
+        fs::create_dir_all(&svc).unwrap();
+        write_cgroup_no_throttle_counter(&svc, 2_000_000, 100_000);
+        let mut mon = CgroupPressureMonitor::new(Duration::from_secs(2))
+            .with_cgroup_root(tmp.path())
+            .with_max_depth(5);
+        mon.tick(); // baseline
+        std::thread::sleep(Duration::from_millis(50));
+        // Heavy CPU stall, still no throttle counter on either side.
+        write_cgroup_no_throttle_counter(&svc, 2_000_000 + 9_000_000, 100_000);
+        let stalls = mon.tick();
+        let nginx = stalls
+            .iter()
+            .find(|s| s.cgroup == "system.slice/nginx.service")
+            .expect("pressure-only stall must still be reported");
+        // Classification is unchanged: heavy pressure, no throttle evidence.
+        assert_eq!(nginx.verdict, StallVerdict::CpuContended);
+        assert!(nginx.cpu_stall_pct >= CONTENDED_STALL_PCT);
+        // But the finding must not claim a measurement that never happened.
+        assert_eq!(nginx.throttled_secs, 0.0);
+        assert!(
+            !nginx.throttled_measured,
+            "absent throttle counter is not a measured zero"
+        );
+        let incident = incident_from_stall(nginx);
+        let snapshot: serde_json::Value =
+            serde_json::from_str(incident.system_snapshot.as_deref().unwrap()).unwrap();
+        assert_eq!(snapshot["evidence"]["throttled_secs"], "unavailable");
     }
 
     #[test]
@@ -1060,6 +1149,7 @@ mod tests {
             mem_stall_pct: 0.0,
             io_stall_pct: 0.0,
             throttled_secs: 0.0,
+            throttled_measured: true,
             mem_high_events: 0,
             oom_kills: 0,
             verdict: StallVerdict::CpuContended,
@@ -1206,6 +1296,7 @@ mod tests {
             mem_stall_pct: 0.0,
             io_stall_pct: 5.2,
             throttled_secs: 0.0,
+            throttled_measured: true,
             mem_high_events: 0,
             oom_kills: 0,
             verdict: StallVerdict::CpuContended,
@@ -1227,6 +1318,7 @@ mod tests {
         assert!((snapshot["cpu_stall_pct"].as_f64().unwrap() - 87.3).abs() < 1e-9);
         assert_eq!(snapshot["evidence"]["verdict"], "inferred");
         assert_eq!(snapshot["evidence"]["stall_percentages"], "measured");
+        assert_eq!(snapshot["evidence"]["throttled_secs"], "measured");
     }
 
     #[tokio::test]
