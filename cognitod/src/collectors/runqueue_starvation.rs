@@ -9,12 +9,18 @@
 //!
 //! * **Signal (measured):** per-thread `schedstat` Δ over a 10s sliding
 //!   window ⇒ ms each thread spent waiting for a CPU. Polled every 5s.
-//!   Warn at >= 2000 ms waited per 10s window (20% of a CPU's time spent
-//!   waiting), critical at >= 5000 ms (50%). Thresholds are grounded in a
-//!   quick experiment on a 2-CPU sandbox: an uncontended spinner waited
+//!   Findings are per-*process*: a process's wait is the sum of its
+//!   measured threads' window waits, so starvation spread across threads
+//!   fires even when no single thread crosses the line on its own. Warn
+//!   at >= 2000 ms aggregate per 10s window (2 thread-seconds lost to
+//!   runqueue waiting), critical at >= 5000 ms. The constants reuse the
+//!   per-thread experiment grounding (an uncontended spinner waited
 //!   ~31 ms / 5s, while the same spinner against 4 hogs waited ~6514 ms /
-//!   10s — the thresholds sit cleanly between idle noise and real
-//!   saturation.
+//!   10s): for a single-threaded process the aggregate *is* the thread's
+//!   wait, so behavior there is unchanged. Short-lived threads can't
+//!   double-count the aggregate: a thread contributes only once it has
+//!   two samples in the window, and a regressing counter (TID recycled)
+//!   re-baselines instead of fabricating a Δ.
 //! * **Cost bound:** `schedstat` is read only for the threads of the top-50
 //!   processes by recent CPU time (`utime+stime` Δ from `/proc/<pid>/stat`,
 //!   per the spec). One cheap `stat` read per process ranks the field;
@@ -75,14 +81,15 @@ const TOP_WAITERS_IN_SNAPSHOT: usize = 5;
 /// recent CPU time — the spec's cost bound for the 5s poll.
 const TOP_PROCESSES_BY_CPU: usize = 50;
 
-/// What a thread's measured runqueue wait means.
+/// What a process's measured aggregate runqueue wait means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StarvationVerdict {
     Healthy,
-    /// Thread spent >= 20% of the window waiting for a CPU: something is
-    /// eating its share.
+    /// Process's threads spent >= 2000 ms waiting in aggregate: something
+    /// is eating its share.
     StarvationWarning,
-    /// Thread spent >= 50% of the window waiting: effectively starved.
+    /// Process's threads spent >= 5000 ms waiting in aggregate:
+    /// effectively starved.
     StarvationCritical,
 }
 
@@ -93,36 +100,43 @@ impl StarvationVerdict {
     }
 }
 
-/// One actionable starvation finding for a scan window: the worst waiter.
+/// One actionable starvation finding for a scan window: the worst-waiting
+/// process, with its wait aggregated across measured threads.
 #[derive(Debug, Clone)]
 pub struct CpuStarvation {
-    /// The starving thread.
+    /// The victim process's worst-waiting measured thread — the thread to
+    /// look at first. Equals `tgid` for single-threaded processes.
     pub tid: u32,
-    /// Its thread-group leader (process).
+    /// Its thread-group leader (process): the finding's identity.
     pub tgid: u32,
     pub comm: Option<String>,
-    /// Measured ms spent waiting on a runqueue inside the window.
+    /// Measured ms the process's threads spent waiting on a runqueue
+    /// inside the window, summed across measured threads. For
+    /// single-threaded processes this equals the thread's wait.
     pub wait_ms: f64,
+    /// The worst single thread's wait, for context: how concentrated the
+    /// starvation is.
+    pub worst_thread_wait_ms: f64,
+    /// How many of the process's threads were measured this poll.
+    pub thread_count: usize,
     /// Seconds the window covers.
     pub window_secs: f64,
     /// Worst waiters for snapshot context: `(tid, tgid, comm, wait_ms)`,
-    /// worst first, including this finding's victim at index 0.
+    /// worst first, across all measured processes.
     pub top_waiters: Vec<(u32, u32, Option<String>, f64)>,
     pub verdict: StarvationVerdict,
 }
 
 impl CpuStarvation {
     /// Stable identity for cooldown and incident-dedup keys: the victim
-    /// thread plus its command name. TIDs are unique per thread
-    /// system-wide, so this distinguishes two `java` workers where a
-    /// comm-only key suppressed every same-named victim for the whole
-    /// cooldown. A recycled TID's counters regress, which re-baselines
-    /// the measurement — and the store keys the verdict to this identity,
-    /// so the new thread dedups against its own history, not another
-    /// victim's. The tgid rides along in the incident snapshot.
+    /// process plus its command name. Process-scoped — not per-thread —
+    /// on purpose: which thread waits most can flap poll to poll while
+    /// the starving process stays the same, and per-thread identities
+    /// would let one process's starvation record a row per thread. Two
+    /// same-named processes stay distinct via the tgid.
     fn victim_label(&self) -> String {
         let comm = self.comm.clone().unwrap_or_else(|| "unknown".to_string());
-        format!("{comm} (tid={}, tgid={})", self.tid, self.tgid)
+        format!("{comm} (tgid={})", self.tgid)
     }
 }
 
@@ -256,6 +270,16 @@ struct ThreadBaseline {
     /// `(sampled_at, runqueue_wait_ns)` within the sliding window.
     samples: VecDeque<(Instant, u64)>,
     last_seen: Instant,
+}
+
+/// Per-process wait aggregate for one poll: the sum of the process's
+/// measured threads' window waits, plus the worst thread for context.
+#[derive(Default)]
+struct ProcAggregate {
+    total_ms: f64,
+    worst_tid: u32,
+    worst_ms: f64,
+    threads: usize,
 }
 
 /// Stateful runqueue-starvation monitor.
@@ -420,9 +444,9 @@ impl RunqueueStarvationMonitor {
     }
 
     /// One poll: rank processes by recent CPU time, refresh the top-50's
-    /// threads' wait baselines, rank by window wait, and return a finding
-    /// for the worst waiter when it is actionable. The first sighting of a
-    /// thread only establishes its baseline.
+    /// threads' wait baselines, aggregate waits to the process, and return
+    /// a finding for the worst-waiting process when it is actionable. The
+    /// first sighting of a thread only establishes its baseline.
     pub fn tick(&mut self) -> Option<CpuStarvation> {
         self.tick_at(Instant::now())
     }
@@ -491,8 +515,30 @@ impl RunqueueStarvationMonitor {
         self.schedstat_available = Some(true);
 
         waiters.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(Ordering::Equal));
-        let &(tid, tgid, wait_ms) = waiters.first()?;
-        let verdict = classify(wait_ms);
+        // Aggregate to the process: sum each measured thread's window wait
+        // under its tgid. A thread contributes at most its own Δ per poll —
+        // short-lived threads only appear once they have two samples, and
+        // recycled TIDs re-baseline on counter regression — so the sum
+        // can't double-count.
+        let mut agg: HashMap<u32, ProcAggregate> = HashMap::new();
+        for &(tid, tgid, wait_ms) in &waiters {
+            let e = agg.entry(tgid).or_default();
+            e.total_ms += wait_ms;
+            e.threads += 1;
+            if wait_ms > e.worst_ms {
+                e.worst_tid = tid;
+                e.worst_ms = wait_ms;
+            }
+        }
+        // Worst process by aggregate wait; ties break toward the lowest
+        // tgid so the pick is deterministic.
+        let (&tgid, worst) = agg.iter().max_by(|a, b| {
+            a.1.total_ms
+                .partial_cmp(&b.1.total_ms)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| b.0.cmp(a.0))
+        })?;
+        let verdict = classify(worst.total_ms);
         if !verdict.actionable() {
             return None;
         }
@@ -508,12 +554,18 @@ impl RunqueueStarvationMonitor {
                 )
             })
             .collect();
-        let comm = top_waiters.first().and_then(|(_, _, comm, _)| comm.clone());
+        let comm = read_task_comm(&self.proc_root, tgid, tgid)
+            // The leader's comm can be momentarily unreadable (exec in
+            // flight); fall back to the worst thread's rather than
+            // reporting unknown.
+            .or_else(|| read_task_comm(&self.proc_root, tgid, worst.worst_tid));
         Some(CpuStarvation {
-            tid,
+            tid: worst.worst_tid,
             tgid,
             comm,
-            wait_ms,
+            wait_ms: worst.total_ms,
+            worst_thread_wait_ms: worst.worst_ms,
+            thread_count: worst.threads,
             window_secs: WINDOW.as_secs_f64(),
             top_waiters,
             verdict,
@@ -619,8 +671,10 @@ impl RunqueueStarvationMonitor {
 /// Field mapping, kept honest about what this monitor measures:
 /// * `psi_cpu` / `psi_memory` / `cpu_percent` / `load_avg` are host-level
 ///   fields this monitor doesn't sample, so they're zero/empty; the
-///   triggering reading is the runqueue wait, carried in `system_snapshot`.
-/// * `target_pid` / `target_name` name the *measured* victim thread.
+///   triggering reading is the process's aggregate runqueue wait, carried
+///   in `system_snapshot`.
+/// * `target_pid` / `target_name` name the *measured* victim process
+///   (tgid); the worst thread rides along in the snapshot.
 /// * The offender is `unavailable`: naming which threads preempted the
 ///   victim needs eBPF `sched_switch` (spec §4). Correlate with
 ///   `cgroup_pressure` incidents for the `inferred` version.
@@ -641,7 +695,12 @@ fn incident_from_finding(finding: &CpuStarvation) -> Incident {
         "tid": finding.tid,
         "tgid": finding.tgid,
         "comm": finding.comm,
+        // The thresholded quantity: the process's aggregate wait across
+        // its measured threads. worst_thread_wait_ms says how
+        // concentrated it is.
         "wait_ms": finding.wait_ms,
+        "worst_thread_wait_ms": finding.worst_thread_wait_ms,
+        "thread_count": finding.thread_count,
         "window_secs": finding.window_secs,
         "top_waiters": top_waiters,
         "source_tier": "polling",
@@ -662,7 +721,7 @@ fn incident_from_finding(finding: &CpuStarvation) -> Incident {
         cpu_percent: 0.0,
         load_avg: String::new(),
         action: "alert".to_string(),
-        target_pid: Some(finding.tid as i32),
+        target_pid: Some(finding.tgid as i32),
         target_name: Some(finding.victim_label()),
         system_snapshot: serde_json::to_string(&snapshot).ok(),
         llm_analysis: None,
@@ -675,19 +734,36 @@ fn incident_from_finding(finding: &CpuStarvation) -> Incident {
 
 /// One human- and agent-readable line per actionable finding. The wait is
 /// `measured`; no offender is named — the tag says which is which.
+/// Single-threaded victims keep the historic per-thread line (the
+/// aggregate *is* the thread's wait there); multi-threaded victims report
+/// the aggregate plus the worst thread.
 fn report(finding: &CpuStarvation) {
-    let victim = match finding.comm.as_deref() {
-        Some(comm) => format!("{comm} (tid={})", finding.tid),
-        None => format!("tid={}", finding.tid),
+    let name = finding.comm.as_deref().unwrap_or("unknown");
+    let (victim, detail) = if finding.thread_count <= 1 {
+        let pct = finding.wait_ms / 1000.0 / finding.window_secs * 100.0;
+        (
+            format!("thread {name} (tid={})", finding.tid),
+            format!("{pct:.0}% of window"),
+        )
+    } else {
+        (
+            format!(
+                "process {name} (tgid={}, {} threads)",
+                finding.tgid, finding.thread_count
+            ),
+            format!(
+                "worst thread tid={}: {:.0}ms",
+                finding.tid, finding.worst_thread_wait_ms
+            ),
+        )
     };
-    let pct = finding.wait_ms / 1000.0 / finding.window_secs * 100.0;
     match finding.verdict {
         StarvationVerdict::StarvationWarning => warn!(
-            "[runqueue] WARNING: thread {victim} waited {:.0}ms for CPU over the last {:.0}s ({pct:.0}% of window) [wait measured, offender unavailable]",
+            "[runqueue] WARNING: {victim} waited {:.0}ms for CPU over the last {:.0}s ({detail}) [wait measured, offender unavailable]",
             finding.wait_ms, finding.window_secs
         ),
         StarvationVerdict::StarvationCritical => warn!(
-            "[runqueue] CRITICAL: thread {victim} waited {:.0}ms for CPU over the last {:.0}s ({pct:.0}% of window) — effectively starved [wait measured, offender unavailable]",
+            "[runqueue] CRITICAL: {victim} waited {:.0}ms for CPU over the last {:.0}s ({detail}) — effectively starved [wait measured, offender unavailable]",
             finding.wait_ms, finding.window_secs
         ),
         StarvationVerdict::Healthy => {}
@@ -771,6 +847,8 @@ mod tests {
             tgid: 4242,
             comm: Some(comm.to_string()),
             wait_ms: 2500.0,
+            worst_thread_wait_ms: 2500.0,
+            thread_count: 1,
             window_secs: 10.0,
             top_waiters: vec![(4242, 4242, Some(comm.to_string()), 2500.0)],
             verdict: StarvationVerdict::StarvationWarning,
@@ -890,9 +968,10 @@ mod tests {
     }
 
     #[test]
-    fn same_comm_victims_do_not_suppress_each_other() {
-        // Two threads sharing a comm (think `java` workers): the dedup
-        // identity includes the TID, so each victim warns on its own.
+    fn same_process_victims_share_one_identity() {
+        // Identity is the process now: two threads of the same tgid are
+        // one victim — aggregation subsumes per-thread findings — while
+        // two same-comm *processes* still warn independently.
         let mut mon = RunqueueStarvationMonitor::new(Duration::from_secs(5));
         let a = CpuStarvation {
             tid: 7,
@@ -904,31 +983,95 @@ mod tests {
             tgid: 1,
             ..warning_finding("worker")
         };
+        let c = CpuStarvation {
+            tid: 9,
+            tgid: 2,
+            ..warning_finding("worker")
+        };
         assert!(mon.should_warn(&a), "first victim must warn");
         assert!(
-            mon.should_warn(&b),
-            "a different TID with the same comm must warn too"
+            !mon.should_warn(&b),
+            "a second thread of the same process is the same victim"
+        );
+        assert!(
+            mon.should_warn(&c),
+            "a different tgid with the same comm must warn too"
         );
     }
 
     #[test]
-    fn ranks_worst_waiter_first() {
+    fn worst_process_by_aggregate_wins() {
+        // Process 1: one thread at 4000 ms. Process 2: three threads at
+        // 1500 ms each — no single thread actionable, but the 4500 ms
+        // aggregate beats process 1's 4000 ms. Per-thread ranking would
+        // have picked process 1; aggregation picks process 2.
         let fake = FakeProc::new();
-        fake.set_thread(1, 7, "hungry", 0);
-        fake.set_thread(1, 8, "full", 0);
+        fake.set_thread(1, 1, "solo", 0);
+        for tid in [2u32, 10, 11, 12] {
+            fake.set_thread(2, tid, "spread", 0);
+        }
         let mut mon = fake.monitor();
         let t0 = Instant::now();
         assert!(mon.tick_at(t0).is_none());
-        fake.set_thread(1, 7, "hungry", 4_000_000_000);
-        fake.set_thread(1, 8, "full", 100_000_000);
+        fake.set_thread(1, 1, "solo", 4_000_000_000);
+        for tid in [10u32, 11, 12] {
+            fake.set_thread(2, tid, "spread", 1_500_000_000);
+        }
         let finding = mon
             .tick_at(t0 + Duration::from_secs(10))
-            .expect("worst waiter must fire");
-        assert_eq!(finding.tid, 7);
-        assert_eq!(finding.comm.as_deref(), Some("hungry"));
-        assert_eq!(finding.top_waiters.len(), 2);
-        assert_eq!(finding.top_waiters[0].0, 7);
-        assert_eq!(finding.top_waiters[1].0, 8);
+            .expect("the 4500ms aggregate must fire");
+        assert_eq!(finding.tgid, 2);
+        assert_eq!(finding.verdict, StarvationVerdict::StarvationWarning);
+        assert!((finding.wait_ms - 4500.0).abs() < 1e-9);
+        assert!((finding.worst_thread_wait_ms - 1500.0).abs() < 1e-9);
+        assert_eq!(finding.thread_count, 4);
+        assert_eq!(finding.comm.as_deref(), Some("spread"));
+    }
+
+    #[test]
+    fn process_aggregate_fires_when_no_single_thread_crosses() {
+        // Three worker threads at 800 ms each: every thread is healthy on
+        // its own, but the 2400 ms process aggregate warns. This is the
+        // serving-workload shape — starvation spread across threads.
+        let fake = FakeProc::new();
+        for tid in [1u32, 7, 8, 9] {
+            fake.set_thread(1, tid, "serving", 0);
+        }
+        let mut mon = fake.monitor();
+        let t0 = Instant::now();
+        assert!(mon.tick_at(t0).is_none());
+        for tid in [7u32, 8, 9] {
+            fake.set_thread(1, tid, "serving", 800_000_000);
+        }
+        let finding = mon
+            .tick_at(t0 + Duration::from_secs(10))
+            .expect("2400ms aggregate must warn");
+        assert_eq!(finding.tgid, 1);
+        assert_eq!(finding.verdict, StarvationVerdict::StarvationWarning);
+        assert!((finding.wait_ms - 2400.0).abs() < 1e-9);
+        assert_eq!(finding.thread_count, 4);
+        assert_eq!(finding.victim_label(), "serving (tgid=1)");
+    }
+
+    #[test]
+    fn process_aggregate_under_threshold_stays_silent() {
+        // Three threads at 600 ms each: 1800 ms aggregate sits under the
+        // 2000 ms warn line, so no finding — aggregation doesn't invent
+        // verdicts.
+        let fake = FakeProc::new();
+        for tid in [1u32, 7, 8, 9] {
+            fake.set_thread(1, tid, "serving", 0);
+        }
+        let mut mon = fake.monitor();
+        let t0 = Instant::now();
+        assert!(mon.tick_at(t0).is_none());
+        for tid in [7u32, 8, 9] {
+            fake.set_thread(1, tid, "serving", 600_000_000);
+        }
+        assert!(
+            mon.tick_at(t0 + Duration::from_secs(10)).is_none(),
+            "an 1800ms aggregate must not warn"
+        );
     }
 
     #[test]
@@ -1125,7 +1268,9 @@ mod tests {
             tid: 4242,
             tgid: 4200,
             comm: Some("hungry".to_string()),
-            wait_ms: 6500.0,
+            wait_ms: 8600.0,
+            worst_thread_wait_ms: 6500.0,
+            thread_count: 2,
             window_secs: 10.0,
             top_waiters: vec![
                 (4242, 4200, Some("hungry".to_string()), 6500.0),
@@ -1136,11 +1281,11 @@ mod tests {
         let incident = incident_from_finding(&finding);
         assert_eq!(incident.event_type, "cpu_starvation");
         assert_eq!(incident.action, "alert");
-        assert_eq!(incident.target_pid, Some(4242));
+        assert_eq!(incident.target_pid, Some(4200));
         assert_eq!(
             incident.target_name.as_deref(),
-            Some("hungry (tid=4242, tgid=4200)"),
-            "the incident identity names the victim thread, not just the comm"
+            Some("hungry (tgid=4200)"),
+            "the incident identity names the victim process, not the thread"
         );
         // Host-level fields this monitor doesn't sample stay zero/empty;
         // the triggering reading lives in the snapshot.
@@ -1150,7 +1295,9 @@ mod tests {
             serde_json::from_str(incident.system_snapshot.as_deref().unwrap()).unwrap();
         assert_eq!(snapshot["verdict"], "StarvationCritical");
         assert_eq!(snapshot["source_tier"], "polling");
-        assert!((snapshot["wait_ms"].as_f64().unwrap() - 6500.0).abs() < 1e-9);
+        assert!((snapshot["wait_ms"].as_f64().unwrap() - 8600.0).abs() < 1e-9);
+        assert!((snapshot["worst_thread_wait_ms"].as_f64().unwrap() - 6500.0).abs() < 1e-9);
+        assert_eq!(snapshot["thread_count"], 2);
         assert_eq!(snapshot["top_waiters"].as_array().unwrap().len(), 2);
         // The victim's wait is measured; the offender is honestly
         // unavailable — naming it needs eBPF.
@@ -1185,7 +1332,7 @@ mod tests {
         assert_eq!(incidents[0].event_type, "cpu_starvation");
         assert_eq!(
             incidents[0].target_name.as_deref(),
-            Some("hungry (tid=7, tgid=1)")
+            Some("hungry (tgid=1)")
         );
 
         // The store already has this finding: handling it again must not
@@ -1225,9 +1372,9 @@ mod tests {
     #[tokio::test]
     async fn same_comm_victims_record_independently() {
         // The store dedup key is (target_name, verdict) and the target
-        // name carries the TID: two same-comm victims are two identities,
-        // so both record — one `java` victim no longer suppresses the
-        // others for the whole cooldown.
+        // name carries the tgid: two same-comm *processes* are two
+        // identities, so both record — one `java` process no longer
+        // suppresses the others for the whole cooldown.
         let db_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(
             IncidentStore::new(db_dir.path().join("incidents.db"))
@@ -1243,7 +1390,7 @@ mod tests {
         };
         let b = CpuStarvation {
             tid: 8,
-            tgid: 1,
+            tgid: 2,
             ..warning_finding("worker")
         };
         mon.handle_finding(&a).await;
