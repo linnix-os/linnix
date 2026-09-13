@@ -990,11 +990,14 @@ impl WatchSelector {
     }
 
     /// How many of the three selectors are set. Exactly one is valid.
+    /// An empty or whitespace-only string counts as unset: `cgroup = ""`
+    /// would otherwise substring-match every readable process cgroup on
+    /// the host, and an empty `comm` can never match anything.
     pub fn selector_count(&self) -> usize {
         [
             self.pid.is_some(),
-            self.cgroup.is_some(),
-            self.comm.is_some(),
+            self.cgroup.as_deref().is_some_and(|s| !s.trim().is_empty()),
+            self.comm.as_deref().is_some_and(|s| !s.trim().is_empty()),
         ]
         .into_iter()
         .filter(|is_set| *is_set)
@@ -1046,6 +1049,12 @@ fn default_watch_baseline_secs() -> u64 {
     3600
 }
 
+/// Minimum `baseline_secs` that can actually complete watch warm-up:
+/// 12 baseline samples at ~5s polls span just over a minute, and the
+/// window prunes samples by age — a 60s window would prune the oldest
+/// sample just as the 12th arrives, so the target could never evaluate.
+const MIN_WATCH_BASELINE_SECS: u64 = 120;
+
 impl WatchTargetConfig {
     /// Strict validation, shared by `--check-config` and the daemon's own
     /// target loading: a config that never passed `--check-config` must
@@ -1070,9 +1079,9 @@ impl WatchTargetConfig {
                 self.elevation_factor
             ));
         }
-        if self.baseline_secs < 60 {
+        if self.baseline_secs < MIN_WATCH_BASELINE_SECS {
             problems.push(format!(
-                "`baseline_secs` must be >= 60 (found {})",
+                "`baseline_secs` must be >= {MIN_WATCH_BASELINE_SECS} (found {})",
                 self.baseline_secs
             ));
         }
@@ -1833,8 +1842,23 @@ baseline_secs = 120
             ),
             (
                 "baseline too short",
-                "comm = \"x\"\nslo_p99_ms = 100.0\nbaseline_secs = 30\n",
-                "`baseline_secs` must be >= 60",
+                "comm = \"x\"\nslo_p99_ms = 100.0\nbaseline_secs = 119\n",
+                "`baseline_secs` must be >= 120",
+            ),
+            (
+                "empty cgroup selector",
+                "cgroup = \"\"\nslo_p99_ms = 100.0\n",
+                "exactly one of `pid`, `cgroup`, `comm`",
+            ),
+            (
+                "empty comm selector",
+                "comm = \"\"\nslo_p99_ms = 100.0\n",
+                "exactly one of `pid`, `cgroup`, `comm`",
+            ),
+            (
+                "whitespace comm selector",
+                "comm = \"   \"\nslo_p99_ms = 100.0\n",
+                "exactly one of `pid`, `cgroup`, `comm`",
             ),
         ];
         for (name, target_toml, expected) in cases {

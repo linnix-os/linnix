@@ -1836,7 +1836,7 @@ pub struct AppState {
     /// Sender for SLO p99 samples posted via `POST /v1/watch/latency`.
     /// `None` when watch mode is disarmed — the endpoint then answers 503
     /// instead of silently eating samples.
-    pub watch_latency_tx: Option<mpsc::UnboundedSender<LatencySample>>,
+    pub watch_latency_tx: Option<mpsc::Sender<LatencySample>>,
 }
 
 /// Every application route the daemon serves over the API listener.
@@ -2198,15 +2198,22 @@ async fn post_watch_latency(
             "watch mode is not armed (no [watch] targets configured)".to_string(),
         )
     })?;
-    tx.send(LatencySample {
+    tx.try_send(LatencySample {
         selector: req.selector,
         p99_ms: req.p99_ms,
     })
-    .map_err(|_| {
-        (
+    .map_err(|e| match e {
+        // The channel is bounded so a stuck or malicious producer can't
+        // grow daemon memory without limit; shed load with 429 — the
+        // sample is best-effort telemetry, not a durable write.
+        mpsc::error::TrySendError::Full(_) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "watch latency channel full; sample dropped".to_string(),
+        ),
+        mpsc::error::TrySendError::Closed(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
             "watch latency channel closed".to_string(),
-        )
+        ),
     })?;
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
@@ -5221,8 +5228,10 @@ mod tests {
     fn watch_latency_app_state(
         auth_token: Option<String>,
         armed: bool,
-    ) -> (Arc<AppState>, mpsc::UnboundedReceiver<LatencySample>) {
-        let (tx, rx) = mpsc::unbounded_channel::<LatencySample>();
+    ) -> (Arc<AppState>, mpsc::Receiver<LatencySample>) {
+        let (tx, rx) = mpsc::channel::<LatencySample>(
+            cognitod::collectors::runqueue_starvation::WATCH_LATENCY_CHANNEL_CAP,
+        );
         let app_state = Arc::new(AppState {
             context: Arc::new(ContextStore::new(Duration::from_secs(60), 10, None)),
             metrics: Arc::new(Metrics::new()),
@@ -5308,9 +5317,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn watch_latency_429_when_channel_full() {
+        // The latency channel is bounded: a producer flooding the endpoint
+        // must get 429s, not an ever-growing queue.
+        let cap = cognitod::collectors::runqueue_starvation::WATCH_LATENCY_CHANNEL_CAP;
+        let (app_state, _rx) = watch_latency_app_state(None, true);
+        for _ in 0..cap {
+            let (status, _) = post_watch_latency_body(
+                &app_state,
+                serde_json::json!({"pid": 1, "p99_ms": 12.0}),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let (status, _) = post_watch_latency_body(
+            &app_state,
+            serde_json::json!({"pid": 1, "p99_ms": 12.0}),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "a full latency channel must shed load, not queue unboundedly"
+        );
+    }
+
+    #[tokio::test]
     async fn watch_latency_rejects_zero_or_multiple_selectors() {
         for body in [
             serde_json::json!({"p99_ms": 12.0}),
+            serde_json::json!({"comm": "", "p99_ms": 12.0}),
             serde_json::json!({"pid": 1, "comm": "x", "p99_ms": 12.0}),
             serde_json::json!({"pid": 1, "cgroup": "/x", "comm": "y", "p99_ms": 12.0}),
         ] {

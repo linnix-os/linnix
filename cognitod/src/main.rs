@@ -1105,9 +1105,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // monitor over this channel. The sender rides on AppState; the
     // receiver goes to the monitor. Watch mode is armed only when
     // `[watch]` holds at least one valid target.
-    let (watch_latency_tx, watch_latency_rx) = tokio::sync::mpsc::unbounded_channel::<
-        cognitod::collectors::runqueue_starvation::LatencySample,
-    >();
+    let (watch_latency_tx, watch_latency_rx) =
+        tokio::sync::mpsc::channel::<cognitod::collectors::runqueue_starvation::LatencySample>(
+            cognitod::collectors::runqueue_starvation::WATCH_LATENCY_CHANNEL_CAP,
+        );
     {
         let monitor = cognitod::collectors::runqueue_starvation::RunqueueStarvationMonitor::new(
             std::time::Duration::from_secs(5),

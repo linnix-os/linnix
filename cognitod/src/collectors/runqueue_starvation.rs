@@ -101,6 +101,12 @@ const MIN_WATCH_BASELINE_SAMPLES: usize = 12;
 /// signal is stale and the dual condition cannot be evaluated — the
 /// target stays silent.
 const WATCH_LATENCY_TTL: Duration = Duration::from_secs(90);
+/// Bound for the latency-sample channel feeding the monitor. The monitor
+/// drains it once per 5s poll, so without a bound a stuck or malicious
+/// producer could grow daemon memory without limit. Samples are
+/// best-effort telemetry: past the bound the endpoint sheds load with
+/// 429 instead of queueing.
+pub const WATCH_LATENCY_CHANNEL_CAP: usize = 128;
 
 /// What a process's measured aggregate runqueue wait means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -364,17 +370,19 @@ impl WatchFinding {
 }
 
 /// A configured watch target plus its rolling state. One baseline deque
-/// per target (not per process): the selector names a workload, and every
-/// matched process's per-poll aggregate feeds that workload's baseline.
+/// per matched process (keyed by tgid): the selector names a workload,
+/// but the elevation promise is per process — a shared deque would let
+/// one process's waits set another's baseline, and N matched processes
+/// would satisfy the warm-up sample count in a single poll.
 struct WatchTarget {
     selector: WatchSelector,
     slo_p99_ms: f64,
     elevation_factor: f64,
     baseline_secs: u64,
-    /// `(sampled_at, aggregate_wait_ms)`: this poll's aggregate for every
-    /// matched process that was actually measured, pruned to
-    /// `baseline_secs`.
-    baseline: VecDeque<(Instant, f64)>,
+    /// tgid -> `(sampled_at, aggregate_wait_ms)`: each matched process's
+    /// own rolling baseline, pruned to `baseline_secs`. Only polls where
+    /// the process was actually measured feed its deque.
+    baselines: HashMap<u32, VecDeque<(Instant, f64)>>,
     /// `(received_at, p99_ms)` from the latency endpoint, pruned to the
     /// 90s TTL.
     latency: VecDeque<(Instant, f64)>,
@@ -393,7 +401,7 @@ impl WatchTarget {
             slo_p99_ms: cfg.slo_p99_ms,
             elevation_factor: cfg.elevation_factor,
             baseline_secs: cfg.baseline_secs,
-            baseline: VecDeque::new(),
+            baselines: HashMap::new(),
             latency: VecDeque::new(),
         })
     }
@@ -455,7 +463,7 @@ pub struct RunqueueStarvationMonitor {
     watch_targets: Vec<WatchTarget>,
     /// SLO samples posted via `POST /v1/watch/latency`. `None` keeps the
     /// monitor threshold-only.
-    latency_rx: Option<mpsc::UnboundedReceiver<LatencySample>>,
+    latency_rx: Option<mpsc::Receiver<LatencySample>>,
 }
 
 impl RunqueueStarvationMonitor {
@@ -535,7 +543,7 @@ impl RunqueueStarvationMonitor {
     /// a receiver the monitor stays threshold-only even with targets
     /// configured (their baselines still build, but the dual condition
     /// can never evaluate).
-    pub fn with_latency_receiver(mut self, rx: mpsc::UnboundedReceiver<LatencySample>) -> Self {
+    pub fn with_latency_receiver(mut self, rx: mpsc::Receiver<LatencySample>) -> Self {
         self.latency_rx = Some(rx);
         self
     }
@@ -879,21 +887,24 @@ impl RunqueueStarvationMonitor {
     }
 
     /// Watch-mode evaluation over one poll's scan. For every target, every
-    /// matched process that was actually measured this poll feeds the
-    /// target's rolling baseline; a finding fires only when the process's
-    /// wait is elevated against that baseline AND a fresh p99 sample is
-    /// breaching the SLO. Either condition alone stays silent. A stale or
-    /// absent signal means the dual condition cannot be evaluated, so the
-    /// target stays silent — debug, never warn.
+    /// matched process that was actually measured this poll feeds its own
+    /// per-process rolling baseline; a finding fires only when the
+    /// process's wait is elevated against that baseline AND a fresh p99
+    /// sample is breaching the SLO. Either condition alone stays silent.
+    /// A stale or absent signal means the dual condition cannot be
+    /// evaluated, so the target stays silent — debug, never warn.
     fn evaluate_watch(&mut self, poll: &Poll, now: Instant) -> Vec<WatchFinding> {
         let mut findings = Vec::new();
         for target in &mut self.watch_targets {
             let label = target.selector.label();
-            // Prune the PRIOR points to the configured window first.
+            // Prune each process's PRIOR points to the configured window
+            // first, and drop deques that pruned to empty so dead pids
+            // don't accumulate entries across pid reuse.
             let baseline_window = Duration::from_secs(target.baseline_secs);
-            target
-                .baseline
-                .retain(|(at, _)| now.duration_since(*at) <= baseline_window);
+            for deque in target.baselines.values_mut() {
+                deque.retain(|(at, _)| now.duration_since(*at) <= baseline_window);
+            }
+            target.baselines.retain(|_, deque| !deque.is_empty());
             // And the SLO signal to its TTL.
             target
                 .latency
@@ -910,70 +921,79 @@ impl RunqueueStarvationMonitor {
                 }
             }
 
-            if target.baseline.len() < MIN_WATCH_BASELINE_SAMPLES {
-                debug!(
-                    "[runqueue] watch {label}: {}/{} baseline samples, not evaluating yet",
-                    target.baseline.len(),
-                    MIN_WATCH_BASELINE_SAMPLES
-                );
-            } else {
-                let median = median_of(target.baseline.iter().map(|&(_, w)| w).collect());
-                let breaching_p99 = match target.latency.back() {
-                    Some(&(_, p99)) if p99 >= target.slo_p99_ms => Some(p99),
-                    _ => None,
-                };
-                match breaching_p99 {
-                    None => debug!(
+            let breaching_p99 = match target.latency.back() {
+                Some(&(_, p99)) if p99 >= target.slo_p99_ms => Some(p99),
+                _ => {
+                    debug!(
                         "[runqueue] watch {label}: no SLO sample breaching {:.1}ms within TTL; staying silent",
                         target.slo_p99_ms
-                    ),
-                    Some(p99) => {
-                        for &(tgid, wait_ms, _worst_tid, worst_ms, threads) in &matched {
-                            if wait_ms <= target.elevation_factor * median {
-                                continue;
-                            }
-                            let top_waiters: Vec<(u32, u32, Option<String>, f64)> = poll
-                                .waiters
-                                .iter()
-                                .take(TOP_WAITERS_IN_SNAPSHOT)
-                                .map(|&(tid, tgid, wait_ms)| {
-                                    (
-                                        tid,
-                                        tgid,
-                                        read_task_comm(&self.proc_root, tgid, tid),
-                                        wait_ms,
-                                    )
-                                })
-                                .collect();
-                            findings.push(WatchFinding {
-                                tgid,
-                                comm: read_task_comm(&self.proc_root, tgid, tgid),
-                                wait_ms,
-                                worst_thread_wait_ms: worst_ms,
-                                thread_count: threads,
-                                window_secs: WINDOW.as_secs_f64(),
-                                baseline_median_ms: median,
-                                // The divisor floor keeps the snapshot serializable
-                                // when the baseline median is exactly zero (any
-                                // positive wait is then infinitely elevated).
-                                elevation: wait_ms / median.max(1e-6),
-                                elevation_factor: target.elevation_factor,
-                                slo_p99_ms: p99,
-                                slo_threshold_ms: target.slo_p99_ms,
-                                watch_selector: label.clone(),
-                                top_waiters,
-                            });
-                        }
-                    }
+                    );
+                    None
                 }
+            };
+
+            for &(tgid, wait_ms, _worst_tid, worst_ms, threads) in &matched {
+                // Each process is evaluated against its OWN baseline: a
+                // shared median would let one process's waits set
+                // another's reference.
+                let prior = target.baselines.get(&tgid).map(VecDeque::len).unwrap_or(0);
+                if prior < MIN_WATCH_BASELINE_SAMPLES {
+                    debug!(
+                        "[runqueue] watch {label} tgid={tgid}: {prior}/{} baseline samples, not evaluating yet",
+                        MIN_WATCH_BASELINE_SAMPLES
+                    );
+                    continue;
+                }
+                let median = median_of(target.baselines[&tgid].iter().map(|&(_, w)| w).collect());
+                let Some(p99) = breaching_p99 else {
+                    continue;
+                };
+                if wait_ms <= target.elevation_factor * median {
+                    continue;
+                }
+                let top_waiters: Vec<(u32, u32, Option<String>, f64)> = poll
+                    .waiters
+                    .iter()
+                    .take(TOP_WAITERS_IN_SNAPSHOT)
+                    .map(|&(tid, tgid, wait_ms)| {
+                        (
+                            tid,
+                            tgid,
+                            read_task_comm(&self.proc_root, tgid, tid),
+                            wait_ms,
+                        )
+                    })
+                    .collect();
+                findings.push(WatchFinding {
+                    tgid,
+                    comm: read_task_comm(&self.proc_root, tgid, tgid),
+                    wait_ms,
+                    worst_thread_wait_ms: worst_ms,
+                    thread_count: threads,
+                    window_secs: WINDOW.as_secs_f64(),
+                    baseline_median_ms: median,
+                    // The divisor floor keeps the snapshot serializable
+                    // when the baseline median is exactly zero (any
+                    // positive wait is then infinitely elevated).
+                    elevation: wait_ms / median.max(1e-6),
+                    elevation_factor: target.elevation_factor,
+                    slo_p99_ms: p99,
+                    slo_threshold_ms: target.slo_p99_ms,
+                    watch_selector: label.clone(),
+                    top_waiters,
+                });
             }
 
-            // Feed this poll's matched measurements into the rolling
-            // baseline AFTER evaluation, whether or not anything fired:
-            // the baseline tracks the workload continuously, and the next
-            // poll's median sees this poll as a prior point.
-            for &(_, wait_ms, _, _, _) in &matched {
-                target.baseline.push_back((now, wait_ms));
+            // Feed this poll's matched measurements into each process's
+            // rolling baseline AFTER evaluation, whether or not anything
+            // fired: the baseline tracks the workload continuously, and
+            // the next poll's median sees this poll as a prior point.
+            for &(tgid, wait_ms, _, _, _) in &matched {
+                target
+                    .baselines
+                    .entry(tgid)
+                    .or_default()
+                    .push_back((now, wait_ms));
             }
         }
         findings
@@ -1416,11 +1436,8 @@ mod tests {
         fn watch_monitor(
             &self,
             targets: Vec<WatchTargetConfig>,
-        ) -> (
-            RunqueueStarvationMonitor,
-            mpsc::UnboundedSender<LatencySample>,
-        ) {
-            let (tx, rx) = mpsc::unbounded_channel::<LatencySample>();
+        ) -> (RunqueueStarvationMonitor, mpsc::Sender<LatencySample>) {
+            let (tx, rx) = mpsc::channel::<LatencySample>(WATCH_LATENCY_CHANNEL_CAP);
             let mon = self
                 .monitor()
                 .with_watch_config(WatchConfig {
@@ -2119,7 +2136,7 @@ mod tests {
             "watched",
             elevated_wait_ns(13, 5_000_000, 100_000_000),
         );
-        tx.send(LatencySample {
+        tx.try_send(LatencySample {
             selector: WatchSelector::pid(100),
             p99_ms: 142.5,
         })
@@ -2144,6 +2161,62 @@ mod tests {
     }
 
     #[test]
+    fn watch_baselines_are_per_process() {
+        // One comm selector matching two processes: each is evaluated
+        // against its OWN baseline. Spiking only pid 101 must fire only
+        // for 101 — a shared baseline would let 101's spike (or 100's
+        // calm) set the other's reference.
+        let t0 = Instant::now();
+        let fake = FakeProc::new();
+        let target = WatchTargetConfig {
+            selector: WatchSelector::comm("svc".to_string()),
+            slo_p99_ms: 100.0,
+            elevation_factor: 3.0,
+            baseline_secs: 3600,
+            ..Default::default()
+        };
+        let (mut mon, tx) = fake.watch_monitor(vec![target]);
+        let mut t = t0;
+        for k in 0..13 {
+            for pid in [100u32, 101] {
+                fake.set_thread(pid, pid, "svc", k as u64 * 5_000_000);
+            }
+            let findings = mon.watch_tick_at(t);
+            assert!(
+                findings.is_empty(),
+                "no finding expected while baselines build (poll {k})"
+            );
+            t += Duration::from_secs(5);
+        }
+        // Poll 14: pid 101's wait jumps to 100ms (10x its own 10ms
+        // median); pid 100 stays at baseline; pid 102 appears for the
+        // first time and is still warming up.
+        fake.set_thread(100, 100, "svc", 13 * 5_000_000);
+        fake.set_thread(
+            101,
+            101,
+            "svc",
+            elevated_wait_ns(13, 5_000_000, 100_000_000),
+        );
+        fake.set_thread(102, 102, "svc", 3 * 5_000_000);
+        tx.try_send(LatencySample {
+            selector: WatchSelector::comm("svc".to_string()),
+            p99_ms: 142.5,
+        })
+        .unwrap();
+        let findings = mon.watch_tick_at(t);
+        assert_eq!(
+            findings.len(),
+            1,
+            "only the spiked process may fire, on its own baseline"
+        );
+        let f = &findings[0];
+        assert_eq!(f.tgid, 101);
+        assert!((f.baseline_median_ms - 10.0).abs() < 1e-9);
+        assert_eq!(f.watch_selector, "comm=svc");
+    }
+
+    #[test]
     fn watch_silent_when_slo_healthy() {
         // Elevated wait alone must not fire: the SLO signal is the noise
         // guard.
@@ -2158,7 +2231,7 @@ mod tests {
             "watched",
             elevated_wait_ns(13, 5_000_000, 100_000_000),
         );
-        tx.send(LatencySample {
+        tx.try_send(LatencySample {
             selector: WatchSelector::pid(100),
             p99_ms: 50.0, // healthy: under the 100ms SLO
         })
@@ -2185,7 +2258,7 @@ mod tests {
             "watched",
             elevated_wait_ns(13, 5_000_000, 12_000_000),
         ); // +12ms: at baseline
-        tx.send(LatencySample {
+        tx.try_send(LatencySample {
             selector: WatchSelector::pid(100),
             p99_ms: 142.5, // breaching
         })
@@ -2234,7 +2307,7 @@ mod tests {
             "watched",
             elevated_wait_ns(13, 5_000_000, 100_000_000),
         );
-        tx.send(LatencySample {
+        tx.try_send(LatencySample {
             selector: WatchSelector::pid(100),
             p99_ms: 142.5,
         })
@@ -2277,7 +2350,7 @@ mod tests {
             "watched",
             elevated_wait_ns(12, 5_000_000, 100_000_000),
         );
-        tx.send(LatencySample {
+        tx.try_send(LatencySample {
             selector: WatchSelector::pid(100),
             p99_ms: 142.5,
         })
@@ -2295,7 +2368,7 @@ mod tests {
             "watched",
             elevated_wait_ns(13, 5_000_000, 100_000_000),
         );
-        tx.send(LatencySample {
+        tx.try_send(LatencySample {
             selector: WatchSelector::pid(100),
             p99_ms: 142.5,
         })
@@ -2338,7 +2411,7 @@ mod tests {
             elevated_wait_ns(13, 200_000_000, 450_000_000),
         );
         for pid in [100u32, 200] {
-            tx.send(LatencySample {
+            tx.try_send(LatencySample {
                 selector: WatchSelector::pid(pid),
                 p99_ms: 142.5,
             })
@@ -2402,17 +2475,17 @@ mod tests {
             "grouped",
             elevated_wait_ns(13, 5_000_000, 100_000_000),
         );
-        tx.send(LatencySample {
+        tx.try_send(LatencySample {
             selector: WatchSelector::pid(300),
             p99_ms: 142.5,
         })
         .unwrap();
-        tx.send(LatencySample {
+        tx.try_send(LatencySample {
             selector: WatchSelector::comm("byname".to_string()),
             p99_ms: 142.5,
         })
         .unwrap();
-        tx.send(LatencySample {
+        tx.try_send(LatencySample {
             selector: WatchSelector::cgroup("/kubepods/burstable/podabc".to_string()),
             p99_ms: 142.5,
         })
@@ -2463,7 +2536,7 @@ mod tests {
             "watched",
             elevated_wait_ns(13, 5_000_000, 100_000_000),
         );
-        tx.send(LatencySample {
+        tx.try_send(LatencySample {
             selector: WatchSelector::pid(42),
             p99_ms: 142.5,
         })
@@ -2573,7 +2646,7 @@ mod tests {
         );
         let t0 = Instant::now();
         let fake = FakeProc::new();
-        let (tx, rx) = mpsc::unbounded_channel::<LatencySample>();
+        let (tx, rx) = mpsc::channel::<LatencySample>(WATCH_LATENCY_CHANNEL_CAP);
         let mut mon = fake
             .monitor()
             .with_watch_config(WatchConfig {
@@ -2590,7 +2663,7 @@ mod tests {
             "watched",
             elevated_wait_ns(13, 5_000_000, 100_000_000),
         );
-        tx.send(LatencySample {
+        tx.try_send(LatencySample {
             selector: WatchSelector::pid(100),
             p99_ms: 142.5,
         })
