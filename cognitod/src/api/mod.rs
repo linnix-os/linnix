@@ -35,17 +35,19 @@ use tokio_stream::wrappers::{BroadcastStream, IntervalStream, errors::BroadcastS
 use crate::ProcessEvent;
 #[cfg(test)]
 use crate::ProcessEventWire;
-use crate::config::{OfflineGuard, ReasonerConfig};
+use crate::config::{OfflineGuard, ReasonerConfig, WatchSelector};
 use crate::context::ContextStore;
 use crate::insights::{InsightRecord, InsightStore as InsightsStore};
 use crate::metrics::Metrics;
 use crate::types::ProcessAlert;
 use crate::types::SystemSnapshot;
 use cognitod::alerts::Alert;
+use cognitod::collectors::runqueue_starvation::LatencySample;
 use cognitod::{Incident, IncidentStats, IncidentStore};
 use linnix_ai_ebpf_common::EventType;
 use sysinfo::{Pid, System};
 use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -1831,6 +1833,10 @@ pub struct AppState {
     pub k8s: Option<Arc<cognitod::k8s::K8sContext>>,
     /// Noisy-neighbour counters fed by the PSI monitor's attribution sink.
     pub blame_metrics: Arc<cognitod::attribution::BlameMetrics>,
+    /// Sender for SLO p99 samples posted via `POST /v1/watch/latency`.
+    /// `None` when watch mode is disarmed — the endpoint then answers 503
+    /// instead of silently eating samples.
+    pub watch_latency_tx: Option<mpsc::UnboundedSender<LatencySample>>,
 }
 
 /// Every application route the daemon serves over the API listener.
@@ -1875,6 +1881,7 @@ fn base_router() -> Router<Arc<AppState>> {
         .route("/actions/{id}", get(get_action_by_id))
         .route("/actions/{id}/approve", axum::routing::post(approve_action))
         .route("/actions/{id}/reject", axum::routing::post(reject_action))
+        .route("/v1/watch/latency", post(post_watch_latency))
 }
 
 /// Slack callbacks are authenticated by Slack's request signature rather than
@@ -2144,6 +2151,63 @@ async fn submit_feedback_api(
 
     app.metrics.inc_feedback_entry();
 
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+// ========================================
+// Watch-mode latency ingestion
+// ========================================
+
+/// Body for `POST /v1/watch/latency`: one SLO signal sample for the
+/// processes a selector names. Exactly one of `pid` / `cgroup` / `comm`
+/// must be set — a sample naming zero or several processes is ambiguous
+/// and rejected with 400.
+#[derive(Debug, Deserialize)]
+struct WatchLatencyRequest {
+    #[serde(flatten)]
+    selector: WatchSelector,
+    p99_ms: f64,
+}
+
+/// Records one SLO p99 sample for the runqueue-starvation monitor's watch
+/// mode. Structurally part of `base_router`, so it sits behind the same
+/// Bearer auth as every other API route. The sample is matched to
+/// configured watch targets by exact selector equality; samples naming an
+/// unconfigured selector are dropped downstream (the monitor debug-logs
+/// them). Answers 503 when watch mode is disarmed rather than silently
+/// eating samples.
+async fn post_watch_latency(
+    State(app): State<Arc<AppState>>,
+    Json(req): Json<WatchLatencyRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if req.selector.selector_count() != 1 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "exactly one of pid, cgroup, comm is required".to_string(),
+        ));
+    }
+    if !req.p99_ms.is_finite() || req.p99_ms <= 0.0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "p99_ms must be a positive finite number".to_string(),
+        ));
+    }
+    let tx = app.watch_latency_tx.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "watch mode is not armed (no [watch] targets configured)".to_string(),
+        )
+    })?;
+    tx.send(LatencySample {
+        selector: req.selector,
+        p99_ms: req.p99_ms,
+    })
+    .map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "watch latency channel closed".to_string(),
+        )
+    })?;
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
@@ -2790,6 +2854,7 @@ mod tests {
             incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+            watch_latency_tx: None,
         })
     }
 
@@ -2813,6 +2878,7 @@ mod tests {
             incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+            watch_latency_tx: None,
         })
     }
 
@@ -3179,6 +3245,7 @@ mod tests {
             incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+            watch_latency_tx: None,
         })
     }
 
@@ -3229,6 +3296,7 @@ mod tests {
             incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+            watch_latency_tx: None,
         });
         let app = all_routes(Arc::clone(&app_state));
         let resp = app
@@ -3292,6 +3360,7 @@ mod tests {
             incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+            watch_latency_tx: None,
         });
         let Json(resp) = super::status_handler(State(app_state)).await;
         let val = serde_json::to_value(resp).unwrap();
@@ -3344,6 +3413,7 @@ mod tests {
             incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+            watch_latency_tx: None,
         });
 
         let Json(resp) = super::metrics_handler(State(app_state)).await;
@@ -3379,6 +3449,7 @@ mod tests {
             incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+            watch_latency_tx: None,
         });
         let router = super::metrics_routes(Arc::clone(&app_state));
         let response = router
@@ -3417,6 +3488,7 @@ mod tests {
             incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+            watch_latency_tx: None,
         });
         let router = super::metrics_routes(Arc::clone(&app_state));
         let response = router
@@ -3469,6 +3541,7 @@ mod tests {
             incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+            watch_latency_tx: None,
         });
         let router = super::all_routes(app_state);
         let response = router
@@ -3574,6 +3647,7 @@ mod tests {
             slack_signing_secret: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+            watch_latency_tx: None,
         });
         let router = super::all_routes(app_state);
         let response = router
@@ -3624,6 +3698,7 @@ mod tests {
             incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+            watch_latency_tx: None,
         });
 
         for request in [
@@ -3694,6 +3769,7 @@ mod tests {
             slack_signing_secret: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+            watch_latency_tx: None,
         });
         let router = super::all_routes(app_state);
         let response = router
@@ -3732,6 +3808,7 @@ mod tests {
             slack_signing_secret: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+            watch_latency_tx: None,
         });
         let router = super::all_routes(app_state);
         let response = router
@@ -3770,6 +3847,7 @@ mod tests {
             slack_signing_secret: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+            watch_latency_tx: None,
         });
         let router = super::all_routes(app_state);
         let response = router
@@ -4047,6 +4125,7 @@ mod tests {
             incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::clone(&blame),
+            watch_latency_tx: None,
         });
 
         let response = super::metrics_routes(app_state)
@@ -4331,6 +4410,7 @@ mod tests {
             incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+            watch_latency_tx: None,
         });
 
         let get = |uri: String, state: Arc<AppState>| async move {
@@ -4445,6 +4525,7 @@ mod tests {
             incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+            watch_latency_tx: None,
         });
 
         let get = |uri: String, state: Arc<AppState>| async move {
@@ -4772,6 +4853,7 @@ mod tests {
             incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+            watch_latency_tx: None,
         });
 
         let response = super::all_routes(app_state)
@@ -4919,6 +5001,7 @@ mod tests {
             incident_retention_days: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+            watch_latency_tx: None,
         });
 
         let response = super::all_routes(app_state)
@@ -5029,6 +5112,7 @@ mod tests {
             slack_signing_secret: None,
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+            watch_latency_tx: None,
         });
 
         let unauthenticated = || {
@@ -5129,5 +5213,168 @@ mod tests {
         let action = enforcement.get_by_id(&action_id).await.unwrap();
         assert_eq!(action.status, ActionStatus::Approved);
         assert_eq!(action.approved_by.as_deref(), Some("uds-peer"));
+    }
+
+    /// AppState with the watch latency channel; `armed` controls whether
+    /// the endpoint has a sender. Returns the receiver so tests can assert
+    /// the posted sample arrives intact.
+    fn watch_latency_app_state(
+        auth_token: Option<String>,
+        armed: bool,
+    ) -> (Arc<AppState>, mpsc::UnboundedReceiver<LatencySample>) {
+        let (tx, rx) = mpsc::unbounded_channel::<LatencySample>();
+        let app_state = Arc::new(AppState {
+            context: Arc::new(ContextStore::new(Duration::from_secs(60), 10, None)),
+            metrics: Arc::new(Metrics::new()),
+            alerts: None,
+            insights: Arc::new(InsightStore::new(16, None)),
+            offline: Arc::new(OfflineGuard::new(false)),
+            transport: "userspace",
+            probe_state: ProbeState::disabled(),
+            require_kernel_instrumentation: true,
+            enforcement: None,
+            reasoner: ReasonerConfig::default(),
+            prometheus_enabled: false,
+            alert_history: Arc::new(AlertHistory::new(16)),
+            auth_token,
+            slack_signing_secret: None,
+            incident_store: None,
+            incident_retention_days: None,
+            k8s: None,
+            blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+            watch_latency_tx: armed.then_some(tx),
+        });
+        (app_state, rx)
+    }
+
+    async fn post_watch_latency_body(
+        app_state: &Arc<AppState>,
+        body: serde_json::Value,
+        token: Option<&str>,
+    ) -> (StatusCode, Vec<u8>) {
+        let mut builder = Request::builder()
+            .uri("/v1/watch/latency")
+            .method("POST")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        let resp = all_routes(Arc::clone(app_state))
+            .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, bytes)
+    }
+
+    #[tokio::test]
+    async fn watch_latency_accepts_all_three_selector_shapes() {
+        let cases = [
+            (
+                serde_json::json!({"pid": 1234, "p99_ms": 12.0}),
+                WatchSelector::pid(1234),
+                12.0,
+            ),
+            (
+                serde_json::json!({"comm": "myserver", "p99_ms": 142.5}),
+                WatchSelector::comm("myserver".to_string()),
+                142.5,
+            ),
+            (
+                serde_json::json!({"cgroup": "/kubepods/x", "p99_ms": 99.9}),
+                WatchSelector::cgroup("/kubepods/x".to_string()),
+                99.9,
+            ),
+        ];
+        for (body, selector, p99_ms) in cases {
+            let (app_state, mut rx) = watch_latency_app_state(None, true);
+            let (status, bytes) = post_watch_latency_body(&app_state, body, None).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "selector {selector:?} must be accepted"
+            );
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(v["status"], "ok");
+            assert_eq!(
+                rx.try_recv().expect("posted sample must reach the channel"),
+                LatencySample { selector, p99_ms }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn watch_latency_rejects_zero_or_multiple_selectors() {
+        for body in [
+            serde_json::json!({"p99_ms": 12.0}),
+            serde_json::json!({"pid": 1, "comm": "x", "p99_ms": 12.0}),
+            serde_json::json!({"pid": 1, "cgroup": "/x", "comm": "y", "p99_ms": 12.0}),
+        ] {
+            let (app_state, _) = watch_latency_app_state(None, true);
+            let (status, _) = post_watch_latency_body(&app_state, body.clone(), None).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "ambiguous selector body {body} must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn watch_latency_rejects_non_positive_p99() {
+        for p99_ms in [-5.0, 0.0] {
+            let (app_state, _) = watch_latency_app_state(None, true);
+            let (status, _) = post_watch_latency_body(
+                &app_state,
+                serde_json::json!({"pid": 1, "p99_ms": p99_ms}),
+                None,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "p99_ms={p99_ms} must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn watch_latency_503_when_watch_disarmed() {
+        // No sender on AppState: the endpoint 503s instead of silently
+        // eating the sample.
+        let (app_state, _) = watch_latency_app_state(None, false);
+        let (status, _) = post_watch_latency_body(
+            &app_state,
+            serde_json::json!({"pid": 1, "p99_ms": 12.0}),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn watch_latency_sits_behind_bearer_auth() {
+        // Registered on base_router, so the Bearer middleware applies.
+        // (_rx kept alive: dropping the receiver would close the channel
+        // and the handler would 503.)
+        let (app_state, _rx) = watch_latency_app_state(Some("test-token".to_string()), true);
+        let (status, _) = post_watch_latency_body(
+            &app_state,
+            serde_json::json!({"pid": 1, "p99_ms": 12.0}),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = post_watch_latency_body(
+            &app_state,
+            serde_json::json!({"pid": 1, "p99_ms": 12.0}),
+            Some("test-token"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
     }
 }

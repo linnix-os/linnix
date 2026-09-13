@@ -48,6 +48,17 @@
 //! dedup discipline as the other monitors: the incident store — not the
 //! bounded in-memory warn map — is the source of truth for what was already
 //! persisted, so map eviction and daemon restarts cannot duplicate rows.
+//!
+//! **Latency/SLO watch mode** (`[watch]` config): the calibration work
+//! showed no global threshold is safe — ambient baseline wait varies by
+//! more than 10x across hosts — so for the workload the customer actually
+//! watches, the operator names targets (pid, cgroup, or comm) plus an SLO
+//! signal instead of a lower magic number. Watched processes bypass the
+//! top-50 measurement gate, each target keeps its own rolling baseline of
+//! per-poll aggregates, and a finding fires only when the wait is
+//! elevated against that baseline AND a fresh p99 sample is breaching the
+//! SLO. Either condition alone stays silent; there is deliberately no
+//! absolute wait floor. The SLO-breach requirement is the noise guard.
 
 use log::{debug, info, warn};
 use std::cmp::Ordering;
@@ -55,8 +66,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 use tokio::time::sleep;
 
+use crate::config::{WatchConfig, WatchSelector, WatchTargetConfig};
 use crate::incidents::{Incident, IncidentStore};
 
 /// Sliding window over which per-thread runqueue wait is accumulated.
@@ -80,6 +93,14 @@ const TOP_WAITERS_IN_SNAPSHOT: usize = 5;
 /// `schedstat` is read only for the threads of this many top processes by
 /// recent CPU time — the spec's cost bound for the 5s poll.
 const TOP_PROCESSES_BY_CPU: usize = 50;
+/// Minimum per-target baseline samples before watch evaluation. With the
+/// default 5s poll this is ~60s of history; a median from fewer points is
+/// not a baseline, it's noise.
+const MIN_WATCH_BASELINE_SAMPLES: usize = 12;
+/// How long a posted p99 sample stays usable. Older than this, the SLO
+/// signal is stale and the dual condition cannot be evaluated — the
+/// target stays silent.
+const WATCH_LATENCY_TTL: Duration = Duration::from_secs(90);
 
 /// What a process's measured aggregate runqueue wait means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -282,6 +303,128 @@ struct ProcAggregate {
     threads: usize,
 }
 
+/// One poll's measured data, shared by the global-threshold path and the
+/// watch path so both evaluate the same scan.
+struct Poll {
+    /// Per-process aggregate wait for every measured process this poll.
+    agg: HashMap<u32, ProcAggregate>,
+    /// `(tid, tgid, wait_ms)` for every measured thread, worst first.
+    waiters: Vec<(u32, u32, f64)>,
+}
+
+/// One SLO signal sample posted via `POST /v1/watch/latency`: the observed
+/// p99 latency (ms) for the processes a selector names. Carried from the
+/// API layer to the monitor over an mpsc channel; the monitor stamps
+/// arrival time itself, so the sample carries no clock.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LatencySample {
+    pub selector: WatchSelector,
+    pub p99_ms: f64,
+}
+
+/// One watch-mode finding: a watched process whose runqueue wait is
+/// elevated against its own rolling baseline while its SLO is breaching.
+#[derive(Debug, Clone)]
+pub struct WatchFinding {
+    /// The watched victim process (tgid).
+    pub tgid: u32,
+    pub comm: Option<String>,
+    /// This poll's aggregate wait (ms) — measured.
+    pub wait_ms: f64,
+    pub worst_thread_wait_ms: f64,
+    pub thread_count: usize,
+    pub window_secs: f64,
+    /// The target's rolling baseline median (ms) the wait is compared
+    /// against.
+    pub baseline_median_ms: f64,
+    /// `wait_ms / baseline_median_ms` — how elevated this poll is
+    /// (inferred).
+    pub elevation: f64,
+    pub elevation_factor: f64,
+    /// The breaching p99 sample (ms) — measured.
+    pub slo_p99_ms: f64,
+    /// The configured breach threshold (ms).
+    pub slo_threshold_ms: f64,
+    /// `comm=myserver` / `pid=1234` / `cgroup=...` — which target fired.
+    pub watch_selector: String,
+    /// Worst waiters for snapshot context: `(tid, tgid, comm, wait_ms)`,
+    /// worst first, across all measured processes.
+    pub top_waiters: Vec<(u32, u32, Option<String>, f64)>,
+}
+
+impl WatchFinding {
+    /// Stable identity for cooldown and incident-dedup keys. The `"watch"`
+    /// verdict component keeps watch incidents from colliding with the
+    /// global-threshold path's `(victim, StarvationWarning)` keys: the
+    /// same process can be incidented by both paths independently.
+    fn victim_label(&self) -> String {
+        let comm = self.comm.clone().unwrap_or_else(|| "unknown".to_string());
+        format!("{comm} (tgid={})", self.tgid)
+    }
+}
+
+/// A configured watch target plus its rolling state. One baseline deque
+/// per target (not per process): the selector names a workload, and every
+/// matched process's per-poll aggregate feeds that workload's baseline.
+struct WatchTarget {
+    selector: WatchSelector,
+    slo_p99_ms: f64,
+    elevation_factor: f64,
+    baseline_secs: u64,
+    /// `(sampled_at, aggregate_wait_ms)`: this poll's aggregate for every
+    /// matched process that was actually measured, pruned to
+    /// `baseline_secs`.
+    baseline: VecDeque<(Instant, f64)>,
+    /// `(received_at, p99_ms)` from the latency endpoint, pruned to the
+    /// 90s TTL.
+    latency: VecDeque<(Instant, f64)>,
+}
+
+impl WatchTarget {
+    /// `None` when the config entry fails validation — the daemon skips
+    /// such targets with a warning instead of arming nonsense. Mirrors
+    /// `--check-config` so a config that was never checked is still safe.
+    fn from_config(cfg: &WatchTargetConfig) -> Option<Self> {
+        if !cfg.is_valid() {
+            return None;
+        }
+        Some(Self {
+            selector: cfg.selector.clone(),
+            slo_p99_ms: cfg.slo_p99_ms,
+            elevation_factor: cfg.elevation_factor,
+            baseline_secs: cfg.baseline_secs,
+            baseline: VecDeque::new(),
+            latency: VecDeque::new(),
+        })
+    }
+
+    /// Whether the selector names this tgid right now.
+    fn matches(&self, tgid: u32, proc_root: &Path) -> bool {
+        match &self.selector {
+            WatchSelector { pid: Some(pid), .. } => tgid == *pid,
+            WatchSelector {
+                comm: Some(comm), ..
+            } => read_task_comm(proc_root, tgid, tgid).as_deref() == Some(comm.as_str()),
+            WatchSelector {
+                cgroup: Some(want), ..
+            } => std::fs::read_to_string(proc_root.join(tgid.to_string()).join("cgroup"))
+                .is_ok_and(|contents| contents.contains(want.as_str())),
+            _ => false,
+        }
+    }
+}
+
+/// Median of a sample set. Pure for testability.
+fn median_of(mut vals: Vec<f64>) -> f64 {
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    let n = vals.len();
+    if n % 2 == 1 {
+        vals[n / 2]
+    } else {
+        (vals[n / 2 - 1] + vals[n / 2]) / 2.0
+    }
+}
+
 /// Stateful runqueue-starvation monitor.
 pub struct RunqueueStarvationMonitor {
     proc_root: PathBuf,
@@ -295,8 +438,11 @@ pub struct RunqueueStarvationMonitor {
     schedstat_available: Option<bool>,
     warn_cooldown: Duration,
     max_iterations: Option<u64>,
-    /// When each victim+verdict was last warned about.
-    last_warned: HashMap<(String, StarvationVerdict), Instant>,
+    /// When each victim+verdict was last warned about. The verdict
+    /// component is the `Debug` verdict for the threshold path and the
+    /// literal `"watch"` for watch findings, so the two paths dedup
+    /// independently.
+    last_warned: HashMap<(String, String), Instant>,
     /// Whether the last incident-record attempt failed (warn-once, then
     /// debug until a record succeeds — `handle_burst` retries every scan).
     record_unhealthy: bool,
@@ -304,6 +450,12 @@ pub struct RunqueueStarvationMonitor {
     /// and MCP tools, not just the daemon logs. `None` keeps the monitor
     /// log-only.
     incident_store: Option<Arc<IncidentStore>>,
+    /// Configured watch targets (empty when `[watch]` is absent — watch
+    /// mode disarmed).
+    watch_targets: Vec<WatchTarget>,
+    /// SLO samples posted via `POST /v1/watch/latency`. `None` keeps the
+    /// monitor threshold-only.
+    latency_rx: Option<mpsc::UnboundedReceiver<LatencySample>>,
 }
 
 impl RunqueueStarvationMonitor {
@@ -319,6 +471,8 @@ impl RunqueueStarvationMonitor {
             last_warned: HashMap::new(),
             record_unhealthy: false,
             incident_store: None,
+            watch_targets: Vec::new(),
+            latency_rx: None,
         }
     }
 
@@ -351,6 +505,41 @@ impl RunqueueStarvationMonitor {
         self
     }
 
+    /// Arms the latency/SLO watch mode from `[watch]` config. Invalid
+    /// target entries are skipped with a warning — the same validation
+    /// `--check-config` applies — so an unchecked config can't arm a
+    /// nonsense target.
+    pub fn with_watch_config(mut self, watch: WatchConfig) -> Self {
+        for (i, cfg) in watch.targets.iter().enumerate() {
+            match WatchTarget::from_config(cfg) {
+                Some(target) => {
+                    info!(
+                        "[runqueue] watch target armed: {} (slo_p99_ms={:.1}, elevation_factor={:.1}, baseline_secs={})",
+                        target.selector.label(),
+                        target.slo_p99_ms,
+                        target.elevation_factor,
+                        target.baseline_secs
+                    );
+                    self.watch_targets.push(target);
+                }
+                None => warn!(
+                    "[runqueue] ignoring invalid [[watch.targets]] #{i}: {}",
+                    cfg.problems().join("; ")
+                ),
+            }
+        }
+        self
+    }
+
+    /// Receives SLO samples posted via `POST /v1/watch/latency`. Without
+    /// a receiver the monitor stays threshold-only even with targets
+    /// configured (their baselines still build, but the dual condition
+    /// can never evaluate).
+    pub fn with_latency_receiver(mut self, rx: mpsc::UnboundedReceiver<LatencySample>) -> Self {
+        self.latency_rx = Some(rx);
+        self
+    }
+
     /// Log-reporting gate: true the first time a victim reports a given
     /// verdict, and again once the cooldown has elapsed. A verdict *change*
     /// for the same victim always reports. This gates the log line only —
@@ -358,10 +547,16 @@ impl RunqueueStarvationMonitor {
     /// `handle_finding`), so a failed insert is retried on the next scan
     /// instead of being swallowed by this cooldown.
     fn should_warn(&mut self, finding: &CpuStarvation) -> bool {
+        self.should_warn_key((finding.victim_label(), format!("{:?}", finding.verdict)))
+    }
+
+    /// The same gate keyed explicitly. Watch findings use the literal
+    /// `"watch"` verdict component so their cooldown is independent of the
+    /// threshold path's.
+    fn should_warn_key(&mut self, key: (String, String)) -> bool {
         if self.warn_cooldown.is_zero() {
             return true;
         }
-        let key = (finding.victim_label(), finding.verdict);
         let now = Instant::now();
         if let Some(last) = self.last_warned.get(&key)
             && now.duration_since(*last) < self.warn_cooldown
@@ -443,21 +638,50 @@ impl RunqueueStarvationMonitor {
         Some(last_w.saturating_sub(first_w) as f64 / 1e6)
     }
 
-    /// One poll: rank processes by recent CPU time, refresh the top-50's
-    /// threads' wait baselines, aggregate waits to the process, and return
-    /// a finding for the worst-waiting process when it is actionable. The
-    /// first sighting of a thread only establishes its baseline.
+    /// One poll of the global-threshold path: rank processes by recent CPU
+    /// time, refresh the top-50's threads' wait baselines, aggregate waits
+    /// to the process, and return a finding for the worst-waiting process
+    /// when it is actionable. The first sighting of a thread only
+    /// establishes its baseline.
     pub fn tick(&mut self) -> Option<CpuStarvation> {
         self.tick_at(Instant::now())
     }
 
     fn tick_at(&mut self, now: Instant) -> Option<CpuStarvation> {
+        let poll = self.poll_at(now)?;
+        self.threshold_finding(&poll)
+    }
+
+    /// One poll driving both detection paths off the same scan: the
+    /// global-threshold finding (if any) plus every watch-mode finding.
+    fn tick_full_at(&mut self, now: Instant) -> (Option<CpuStarvation>, Vec<WatchFinding>) {
+        self.drain_latency(now);
+        let Some(poll) = self.poll_at(now) else {
+            return (None, Vec::new());
+        };
+        let threshold = self.threshold_finding(&poll);
+        let watch = self.evaluate_watch(&poll, now);
+        (threshold, watch)
+    }
+
+    /// Test entry for the watch path: one poll's watch findings.
+    #[cfg(test)]
+    fn watch_tick_at(&mut self, now: Instant) -> Vec<WatchFinding> {
+        self.tick_full_at(now).1
+    }
+
+    /// One poll: rank processes by recent CPU time, refresh measured
+    /// threads' wait baselines, and aggregate waits to the process.
+    /// Returns `None` when schedstat is unreadable (degradation — both
+    /// detection paths stay silent).
+    fn poll_at(&mut self, now: Instant) -> Option<Poll> {
         // Phase 1: rank processes by CPU time consumed since the last poll
         // (`utime+stime` Δ). A first sighting has no Δ yet and ranks zero —
         // ranking converges from the second poll. Absence is not zero, so
         // unreadable stat files simply don't rank.
         let mut deltas: Vec<(u32, u64)> = Vec::new();
         let mut cpu_now: HashMap<u32, u64> = HashMap::new();
+        let mut pids: Vec<u32> = Vec::new();
         for pid in list_pids(&self.proc_root) {
             let Some(cputime) = read_stat_cputime(&self.proc_root, pid) else {
                 continue;
@@ -465,19 +689,26 @@ impl RunqueueStarvationMonitor {
             let last = self.cpu_baselines.get(&pid).copied().unwrap_or(cputime);
             deltas.push((pid, cputime.saturating_sub(last)));
             cpu_now.insert(pid, cputime);
+            pids.push(pid);
         }
         self.cpu_baselines = cpu_now;
         let top: HashSet<u32> = top_pids_by_cpu(&mut deltas).into_iter().collect();
+        // Watch targets bypass the top-50 gate: the operator explicitly
+        // asked for these processes, and the cost is a few extra schedstat
+        // reads.
+        let watched = self.resolve_watched_tgids(&pids);
 
-        // Phase 2: read schedstat only for the top-50's threads — the cost
-        // bound. Threads outside the top-50 aren't measured this poll;
-        // their baselines keep aging and are pruned after 60s idle.
+        // Phase 2: read schedstat for the top-50's threads plus every
+        // watched process's threads — the cost bound, widened only by the
+        // explicit watch list. Threads outside both sets aren't measured
+        // this poll; their baselines keep aging and are pruned after 60s
+        // idle.
         let mut any_schedstat = false;
         // `(tid, tgid, wait_ms)` for every measured thread with a
         // measurable window.
         let mut waiters: Vec<(u32, u32, f64)> = Vec::new();
         for (tgid, tid) in list_threads(&self.proc_root) {
-            if !top.contains(&tgid) {
+            if !top.contains(&tgid) && !watched.contains(&tgid) {
                 continue;
             }
             let sched_path = thread_file(&self.proc_root, tgid, tid, "schedstat");
@@ -530,9 +761,16 @@ impl RunqueueStarvationMonitor {
                 e.worst_ms = wait_ms;
             }
         }
+        Some(Poll { agg, waiters })
+    }
+
+    /// The worst-waiting process in one poll's scan, classified against the
+    /// global 2000/5000 ms thresholds. Unchanged behavior — the coarse net
+    /// stays exactly as it was.
+    fn threshold_finding(&self, poll: &Poll) -> Option<CpuStarvation> {
         // Worst process by aggregate wait; ties break toward the lowest
         // tgid so the pick is deterministic.
-        let (&tgid, worst) = agg.iter().max_by(|a, b| {
+        let (&tgid, worst) = poll.agg.iter().max_by(|a, b| {
             a.1.total_ms
                 .partial_cmp(&b.1.total_ms)
                 .unwrap_or(Ordering::Equal)
@@ -542,7 +780,8 @@ impl RunqueueStarvationMonitor {
         if !verdict.actionable() {
             return None;
         }
-        let top_waiters: Vec<(u32, u32, Option<String>, f64)> = waiters
+        let top_waiters: Vec<(u32, u32, Option<String>, f64)> = poll
+            .waiters
             .iter()
             .take(TOP_WAITERS_IN_SNAPSHOT)
             .map(|&(tid, tgid, wait_ms)| {
@@ -572,12 +811,184 @@ impl RunqueueStarvationMonitor {
         })
     }
 
+    /// tgids the watch selectors name this poll, for the top-50 bypass.
+    fn resolve_watched_tgids(&self, pids: &[u32]) -> HashSet<u32> {
+        let mut out = HashSet::new();
+        if self.watch_targets.is_empty() {
+            return out;
+        }
+        for target in &self.watch_targets {
+            match &target.selector {
+                WatchSelector { pid: Some(pid), .. } => {
+                    if pids.contains(pid) {
+                        out.insert(*pid);
+                    }
+                }
+                WatchSelector {
+                    comm: Some(comm), ..
+                } => {
+                    for pid in pids {
+                        if read_task_comm(&self.proc_root, *pid, *pid).as_deref()
+                            == Some(comm.as_str())
+                        {
+                            out.insert(*pid);
+                        }
+                    }
+                }
+                WatchSelector {
+                    cgroup: Some(want), ..
+                } => {
+                    for pid in pids {
+                        let path = self.proc_root.join(pid.to_string()).join("cgroup");
+                        if std::fs::read_to_string(&path)
+                            .is_ok_and(|contents| contents.contains(want.as_str()))
+                        {
+                            out.insert(*pid);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Pulls every pending SLO sample off the channel into its target's
+    /// latency deque, stamped with arrival time. Samples naming no
+    /// configured target are dropped (debug): posting for a selector
+    /// nobody watches is not an error.
+    fn drain_latency(&mut self, now: Instant) {
+        let Some(rx) = &mut self.latency_rx else {
+            return;
+        };
+        while let Ok(sample) = rx.try_recv() {
+            let mut matched = false;
+            for target in &mut self.watch_targets {
+                if target.selector == sample.selector {
+                    target.latency.push_back((now, sample.p99_ms));
+                    matched = true;
+                }
+            }
+            if !matched {
+                debug!(
+                    "[runqueue] watch latency sample for unconfigured selector {}; dropping",
+                    sample.selector.label()
+                );
+            }
+        }
+    }
+
+    /// Watch-mode evaluation over one poll's scan. For every target, every
+    /// matched process that was actually measured this poll feeds the
+    /// target's rolling baseline; a finding fires only when the process's
+    /// wait is elevated against that baseline AND a fresh p99 sample is
+    /// breaching the SLO. Either condition alone stays silent. A stale or
+    /// absent signal means the dual condition cannot be evaluated, so the
+    /// target stays silent — debug, never warn.
+    fn evaluate_watch(&mut self, poll: &Poll, now: Instant) -> Vec<WatchFinding> {
+        let mut findings = Vec::new();
+        for target in &mut self.watch_targets {
+            let label = target.selector.label();
+            // Prune the PRIOR points to the configured window first.
+            let baseline_window = Duration::from_secs(target.baseline_secs);
+            target
+                .baseline
+                .retain(|(at, _)| now.duration_since(*at) <= baseline_window);
+            // And the SLO signal to its TTL.
+            target
+                .latency
+                .retain(|(at, _)| now.duration_since(*at) <= WATCH_LATENCY_TTL);
+
+            // Collect this poll's matched measurements, but do NOT feed
+            // them into the baseline yet: evaluation compares the current
+            // wait against the median of PRIOR points, so an elevated
+            // sample can never raise its own reference.
+            let mut matched: Vec<(u32, f64, u32, f64, usize)> = Vec::new();
+            for (&tgid, agg) in &poll.agg {
+                if target.matches(tgid, &self.proc_root) {
+                    matched.push((tgid, agg.total_ms, agg.worst_tid, agg.worst_ms, agg.threads));
+                }
+            }
+
+            if target.baseline.len() < MIN_WATCH_BASELINE_SAMPLES {
+                debug!(
+                    "[runqueue] watch {label}: {}/{} baseline samples, not evaluating yet",
+                    target.baseline.len(),
+                    MIN_WATCH_BASELINE_SAMPLES
+                );
+            } else {
+                let median = median_of(target.baseline.iter().map(|&(_, w)| w).collect());
+                let breaching_p99 = match target.latency.back() {
+                    Some(&(_, p99)) if p99 >= target.slo_p99_ms => Some(p99),
+                    _ => None,
+                };
+                match breaching_p99 {
+                    None => debug!(
+                        "[runqueue] watch {label}: no SLO sample breaching {:.1}ms within TTL; staying silent",
+                        target.slo_p99_ms
+                    ),
+                    Some(p99) => {
+                        for &(tgid, wait_ms, _worst_tid, worst_ms, threads) in &matched {
+                            if wait_ms <= target.elevation_factor * median {
+                                continue;
+                            }
+                            let top_waiters: Vec<(u32, u32, Option<String>, f64)> = poll
+                                .waiters
+                                .iter()
+                                .take(TOP_WAITERS_IN_SNAPSHOT)
+                                .map(|&(tid, tgid, wait_ms)| {
+                                    (
+                                        tid,
+                                        tgid,
+                                        read_task_comm(&self.proc_root, tgid, tid),
+                                        wait_ms,
+                                    )
+                                })
+                                .collect();
+                            findings.push(WatchFinding {
+                                tgid,
+                                comm: read_task_comm(&self.proc_root, tgid, tgid),
+                                wait_ms,
+                                worst_thread_wait_ms: worst_ms,
+                                thread_count: threads,
+                                window_secs: WINDOW.as_secs_f64(),
+                                baseline_median_ms: median,
+                                // The divisor floor keeps the snapshot serializable
+                                // when the baseline median is exactly zero (any
+                                // positive wait is then infinitely elevated).
+                                elevation: wait_ms / median.max(1e-6),
+                                elevation_factor: target.elevation_factor,
+                                slo_p99_ms: p99,
+                                slo_threshold_ms: target.slo_p99_ms,
+                                watch_selector: label.clone(),
+                                top_waiters,
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Feed this poll's matched measurements into the rolling
+            // baseline AFTER evaluation, whether or not anything fired:
+            // the baseline tracks the workload continuously, and the next
+            // poll's median sees this poll as a prior point.
+            for &(_, wait_ms, _, _, _) in &matched {
+                target.baseline.push_back((now, wait_ms));
+            }
+        }
+        findings
+    }
+
     pub async fn run(mut self) {
         info!("[runqueue] starting runqueue starvation monitor");
         let mut iterations = 0u64;
         loop {
-            if let Some(finding) = self.tick() {
+            let (threshold, watch) = self.tick_full_at(Instant::now());
+            if let Some(finding) = threshold {
                 self.handle_finding(&finding).await;
+            }
+            for finding in &watch {
+                self.handle_watch_finding(finding).await;
             }
             iterations += 1;
             if let Some(max) = self.max_iterations
@@ -664,6 +1075,56 @@ impl RunqueueStarvationMonitor {
             }
         }
     }
+
+    /// Watch-mode counterpart to `handle_finding`: the cooldown key uses
+    /// the literal `"watch"` verdict and the store-backed dedup reads the
+    /// same `(victim, "watch")` pair from `$.verdict`, so the same victim
+    /// can be incidented by the threshold path and the watch path without
+    /// either suppressing the other.
+    async fn handle_watch_finding(&mut self, finding: &WatchFinding) {
+        if self.should_warn_key((finding.victim_label(), "watch".to_string())) {
+            report_watch(finding);
+        }
+        let key = (finding.victim_label(), "watch".to_string());
+        if self.recently_recorded_keys().await.contains(&key) {
+            return;
+        }
+        self.record_watch_incident(finding).await;
+    }
+
+    /// Best-effort insert of a watch finding as a `cpu_starvation`
+    /// incident. Shares the failure discipline with `record_incident`:
+    /// warn once, debug on repeats, retried on every scan while the
+    /// condition holds.
+    async fn record_watch_incident(&mut self, finding: &WatchFinding) {
+        let Some(store) = &self.incident_store else {
+            return;
+        };
+        let incident = incident_from_watch_finding(finding);
+        match store.insert(&incident).await {
+            Ok(id) => {
+                debug!(
+                    "[runqueue] recorded watch incident #{id} for {}",
+                    finding.victim_label()
+                );
+                self.record_unhealthy = false;
+            }
+            Err(e) => {
+                if self.record_unhealthy {
+                    debug!(
+                        "[runqueue] still failing to record watch incident for {}: {e}",
+                        finding.victim_label()
+                    );
+                } else {
+                    warn!(
+                        "[runqueue] failed to record watch incident for {}: {e}",
+                        finding.victim_label()
+                    );
+                    self.record_unhealthy = true;
+                }
+            }
+        }
+    }
 }
 
 /// Builds the `cpu_starvation` incident row for one finding.
@@ -730,6 +1191,108 @@ fn incident_from_finding(finding: &CpuStarvation) -> Incident {
         recovery_time_ms: None,
         psi_after: None,
     }
+}
+
+/// Builds the `cpu_starvation` incident row for a watch-mode finding.
+/// The verdict is the literal `"watch"`, and the store-backed dedup reads
+/// `$.verdict` from the snapshot, so `recent_incident_keys` returns
+/// `(victim, "watch")` pairs that never collide with the threshold path's
+/// `StarvationWarning`/`StarvationCritical` keys.
+///
+/// Field mapping, kept honest about what watch mode measures:
+/// * `detection_mode: "watch"` marks the path that fired.
+/// * `wait_ms` / `baseline_median_ms` / `elevation` / `elevation_factor`
+///   describe the wait against the workload's own baseline.
+/// * `slo_p99_ms` / `slo_threshold_ms` describe the breaching SLO signal.
+/// * `watch_selector` names the configured target that fired.
+/// * `target_pid` / `target_name` name the *measured* victim process
+///   (tgid); the worst thread rides along in the snapshot.
+/// * The offender is `unavailable`: naming which threads preempted the
+///   victim needs eBPF `sched_switch` (spec §4).
+fn incident_from_watch_finding(finding: &WatchFinding) -> Incident {
+    let top_waiters: Vec<serde_json::Value> = finding
+        .top_waiters
+        .iter()
+        .map(|(tid, tgid, comm, wait_ms)| {
+            serde_json::json!({
+                "tid": tid,
+                "tgid": tgid,
+                "comm": comm,
+                "wait_ms": wait_ms,
+            })
+        })
+        .collect();
+    let snapshot = serde_json::json!({
+        "detection_mode": "watch",
+        "tgid": finding.tgid,
+        "comm": finding.comm,
+        // This poll's aggregate wait across the victim's measured
+        // threads; worst_thread_wait_ms says how concentrated it is.
+        "wait_ms": finding.wait_ms,
+        "worst_thread_wait_ms": finding.worst_thread_wait_ms,
+        "thread_count": finding.thread_count,
+        "window_secs": finding.window_secs,
+        // The target's own rolling baseline this wait is judged against.
+        "baseline_median_ms": finding.baseline_median_ms,
+        "elevation": finding.elevation,
+        "elevation_factor": finding.elevation_factor,
+        // The breaching SLO signal that armed the finding.
+        "slo_p99_ms": finding.slo_p99_ms,
+        "slo_threshold_ms": finding.slo_threshold_ms,
+        "watch_selector": finding.watch_selector,
+        "top_waiters": top_waiters,
+        "source_tier": "polling",
+        // Literal "watch": the store-backed dedup key reads $.verdict.
+        "verdict": "watch",
+        // The wait and the SLO breach are measured kernel/endpoint
+        // readings; the elevation is inferred (higher *than usual for
+        // this workload*, not higher than an absolute line); the offender
+        // is not identified — that needs eBPF.
+        "evidence": {
+            "runqueue_wait": "measured",
+            "baseline_elevation": "inferred",
+            "slo_breach": "measured",
+            "offender": "unavailable",
+        },
+    });
+    Incident {
+        id: None,
+        timestamp: chrono::Utc::now().timestamp(),
+        event_type: "cpu_starvation".to_string(),
+        psi_cpu: 0.0,
+        psi_memory: 0.0,
+        cpu_percent: 0.0,
+        load_avg: String::new(),
+        action: "alert".to_string(),
+        target_pid: Some(finding.tgid as i32),
+        target_name: Some(finding.victim_label()),
+        system_snapshot: serde_json::to_string(&snapshot).ok(),
+        llm_analysis: None,
+        llm_analyzed_at: None,
+        investigation: None,
+        recovery_time_ms: None,
+        psi_after: None,
+    }
+}
+
+/// One human- and agent-readable line per watch finding: wait and SLO
+/// breach are `measured`, the elevation against the baseline is
+/// `inferred`, no offender is named.
+fn report_watch(finding: &WatchFinding) {
+    let name = finding.comm.as_deref().unwrap_or("unknown");
+    warn!(
+        "[runqueue] WATCH: process {name} (tgid={}) waited {:.0}ms for CPU over the last {:.0}s \
+         ({:.1}x its {:.0}ms baseline, factor {:.1}) while p99 {:.1}ms breached SLO {:.1}ms \
+         [wait measured, elevation inferred, SLO breach measured, offender unavailable]",
+        finding.tgid,
+        finding.wait_ms,
+        finding.window_secs,
+        finding.elevation,
+        finding.baseline_median_ms,
+        finding.elevation_factor,
+        finding.slo_p99_ms,
+        finding.slo_threshold_ms
+    );
 }
 
 /// One human- and agent-readable line per actionable finding. The wait is
@@ -839,6 +1402,34 @@ mod tests {
         fn monitor(&self) -> RunqueueStarvationMonitor {
             RunqueueStarvationMonitor::new(Duration::from_secs(5)).with_proc_root(self.dir.path())
         }
+
+        /// Writes `<pid>/cgroup` with the given contents, for
+        /// cgroup-selector watch tests.
+        fn set_cgroup(&self, pid: u32, contents: &str) {
+            let d = self.dir.path().join(pid.to_string());
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("cgroup"), contents).unwrap();
+        }
+
+        /// Monitor with watch targets armed and a latency channel;
+        /// returns the sender so tests can post SLO samples.
+        fn watch_monitor(
+            &self,
+            targets: Vec<WatchTargetConfig>,
+        ) -> (
+            RunqueueStarvationMonitor,
+            mpsc::UnboundedSender<LatencySample>,
+        ) {
+            let (tx, rx) = mpsc::unbounded_channel::<LatencySample>();
+            let mon = self
+                .monitor()
+                .with_watch_config(WatchConfig {
+                    targets,
+                    ..Default::default()
+                })
+                .with_latency_receiver(rx);
+            (mon, tx)
+        }
     }
 
     fn warning_finding(comm: &str) -> CpuStarvation {
@@ -853,6 +1444,56 @@ mod tests {
             top_waiters: vec![(4242, 4242, Some(comm.to_string()), 2500.0)],
             verdict: StarvationVerdict::StarvationWarning,
         }
+    }
+
+    /// A `[watch]` target for tests: pid selector, SLO p99 100ms,
+    /// 3x elevation factor, 1h baseline window.
+    fn pid_target(pid: u32) -> WatchTargetConfig {
+        WatchTargetConfig {
+            selector: WatchSelector::pid(pid),
+            slo_p99_ms: 100.0,
+            elevation_factor: 3.0,
+            baseline_secs: 3600,
+            ..Default::default()
+        }
+    }
+
+    /// Runs `n` polls at 5s intervals, advancing `wait_ns` by `step_ns`
+    /// per poll for the given thread. Returns the time of the last poll.
+    /// Note the monitor measures wait over a 10s window while polls are 5s
+    /// apart, so a steady `step_ns`/poll advance reads as `2 * step_ns`
+    /// per poll once the window fills (the first poll reads `step_ns`).
+    #[allow(clippy::too_many_arguments)]
+    fn run_baseline_polls(
+        fake: &FakeProc,
+        mon: &mut RunqueueStarvationMonitor,
+        pid: u32,
+        tid: u32,
+        comm: &str,
+        n: usize,
+        step_ns: u64,
+        t0: Instant,
+    ) -> Instant {
+        let mut t = t0;
+        for k in 0..n {
+            fake.set_thread(pid, tid, comm, k as u64 * step_ns);
+            let findings = mon.watch_tick_at(t);
+            assert!(
+                findings.is_empty(),
+                "no watch finding expected while the baseline is building (poll {k})"
+            );
+            t += Duration::from_secs(5);
+        }
+        t
+    }
+
+    /// `wait_ns` to write for the "elevated" poll after `n_polls`
+    /// baseline polls of `step_ns`/poll: the monitor's 10s window anchors
+    /// on the sample two polls back, so the measured wait is
+    /// `wait_ns - (n_polls - 2) * step_ns`. A `jump_ns` here reads as
+    /// exactly `jump_ns` ms of wait.
+    fn elevated_wait_ns(n_polls: u64, step_ns: u64, jump_ns: u64) -> u64 {
+        (n_polls - 2) * step_ns + jump_ns
     }
 
     #[test]
@@ -1330,10 +1971,7 @@ mod tests {
             .unwrap();
         assert_eq!(incidents.len(), 1, "one finding, one incident");
         assert_eq!(incidents[0].event_type, "cpu_starvation");
-        assert_eq!(
-            incidents[0].target_name.as_deref(),
-            Some("hungry (tgid=1)")
-        );
+        assert_eq!(incidents[0].target_name.as_deref(), Some("hungry (tgid=1)"));
 
         // The store already has this finding: handling it again must not
         // write a second row. Recording is decided against the store, not
@@ -1451,5 +2089,544 @@ mod tests {
         let mut mon = RunqueueStarvationMonitor::new(Duration::from_secs(5))
             .with_warn_cooldown(Duration::ZERO);
         mon.handle_finding(&warning_finding("hungry")).await;
+    }
+
+    #[test]
+    fn median_of_is_correct() {
+        assert_eq!(median_of(vec![3.0, 1.0, 2.0]), 2.0);
+        assert_eq!(median_of(vec![4.0, 1.0, 3.0, 2.0]), 2.5);
+        assert_eq!(median_of(vec![7.0]), 7.0);
+    }
+
+    #[test]
+    fn watch_fires_on_elevated_wait_plus_slo_breach() {
+        let t0 = Instant::now();
+        let fake = FakeProc::new();
+        let (mut mon, tx) = fake.watch_monitor(vec![pid_target(100)]);
+
+        // 13 polls at 10ms/poll build the baseline: 12 measured samples
+        // (median 10ms). The first poll only establishes the thread
+        // baseline and yields no measurement, so 13 polls give 12 priors.
+        let t = run_baseline_polls(&fake, &mut mon, 100, 100, "watched", 13, 5_000_000, t0);
+
+        // Poll 14: wait jumps to 100ms (10x the 10ms prior median, factor
+        // 3x) while p99 142.5ms breaches the 100ms SLO. Both conditions
+        // hold against the 12 PRIOR samples — the 100ms point itself is
+        // only appended to the baseline after evaluation.
+        fake.set_thread(
+            100,
+            100,
+            "watched",
+            elevated_wait_ns(13, 5_000_000, 100_000_000),
+        );
+        tx.send(LatencySample {
+            selector: WatchSelector::pid(100),
+            p99_ms: 142.5,
+        })
+        .unwrap();
+        let (threshold, watch) = mon.tick_full_at(t);
+        assert!(
+            threshold.is_none(),
+            "100ms is far under the 2000ms global threshold — watch mode fires on its own"
+        );
+        assert_eq!(watch.len(), 1, "dual condition met: must fire exactly once");
+        let f = &watch[0];
+        assert_eq!(f.tgid, 100);
+        assert_eq!(f.comm.as_deref(), Some("watched"));
+        assert!((f.wait_ms - 100.0).abs() < 1e-9);
+        assert!((f.baseline_median_ms - 10.0).abs() < 1e-9);
+        assert!((f.elevation - 10.0).abs() < 1e-9);
+        assert_eq!(f.elevation_factor, 3.0);
+        assert!((f.slo_p99_ms - 142.5).abs() < 1e-9);
+        assert!((f.slo_threshold_ms - 100.0).abs() < 1e-9);
+        assert_eq!(f.watch_selector, "pid=100");
+        assert_eq!(f.victim_label(), "watched (tgid=100)");
+    }
+
+    #[test]
+    fn watch_silent_when_slo_healthy() {
+        // Elevated wait alone must not fire: the SLO signal is the noise
+        // guard.
+        let t0 = Instant::now();
+        let fake = FakeProc::new();
+        let (mut mon, tx) = fake.watch_monitor(vec![pid_target(100)]);
+        let t = run_baseline_polls(&fake, &mut mon, 100, 100, "watched", 13, 5_000_000, t0);
+
+        fake.set_thread(
+            100,
+            100,
+            "watched",
+            elevated_wait_ns(13, 5_000_000, 100_000_000),
+        );
+        tx.send(LatencySample {
+            selector: WatchSelector::pid(100),
+            p99_ms: 50.0, // healthy: under the 100ms SLO
+        })
+        .unwrap();
+        let (_, watch) = mon.tick_full_at(t);
+        assert!(
+            watch.is_empty(),
+            "elevated wait with a healthy SLO must stay silent"
+        );
+    }
+
+    #[test]
+    fn watch_silent_when_wait_at_baseline() {
+        // A breaching SLO alone must not fire: without elevated wait it
+        // is some other bottleneck's problem, not runqueue starvation.
+        let t0 = Instant::now();
+        let fake = FakeProc::new();
+        let (mut mon, tx) = fake.watch_monitor(vec![pid_target(100)]);
+        let t = run_baseline_polls(&fake, &mut mon, 100, 100, "watched", 13, 5_000_000, t0);
+
+        fake.set_thread(
+            100,
+            100,
+            "watched",
+            elevated_wait_ns(13, 5_000_000, 12_000_000),
+        ); // +12ms: at baseline
+        tx.send(LatencySample {
+            selector: WatchSelector::pid(100),
+            p99_ms: 142.5, // breaching
+        })
+        .unwrap();
+        let (_, watch) = mon.tick_full_at(t);
+        assert!(
+            watch.is_empty(),
+            "breaching SLO with baseline-level wait must stay silent"
+        );
+    }
+
+    #[test]
+    fn watch_silent_without_latency_signal() {
+        // No SLO signal at all: the dual condition cannot be evaluated.
+        let t0 = Instant::now();
+        let fake = FakeProc::new();
+        let (mut mon, _tx) = fake.watch_monitor(vec![pid_target(100)]);
+        let t = run_baseline_polls(&fake, &mut mon, 100, 100, "watched", 13, 5_000_000, t0);
+
+        fake.set_thread(
+            100,
+            100,
+            "watched",
+            elevated_wait_ns(13, 5_000_000, 100_000_000),
+        );
+        let watch = mon.watch_tick_at(t);
+        assert!(
+            watch.is_empty(),
+            "elevated wait with no SLO signal must stay silent"
+        );
+    }
+
+    #[test]
+    fn watch_silent_with_stale_latency_signal() {
+        // A breaching sample older than the 90s TTL is stale: the dual
+        // condition cannot be evaluated.
+        let t0 = Instant::now();
+        let fake = FakeProc::new();
+        let (mut mon, tx) = fake.watch_monitor(vec![pid_target(100)]);
+        let t = run_baseline_polls(&fake, &mut mon, 100, 100, "watched", 13, 5_000_000, t0);
+
+        // Poll 14: elevated wait + fresh breaching sample -> fires.
+        fake.set_thread(
+            100,
+            100,
+            "watched",
+            elevated_wait_ns(13, 5_000_000, 100_000_000),
+        );
+        tx.send(LatencySample {
+            selector: WatchSelector::pid(100),
+            p99_ms: 142.5,
+        })
+        .unwrap();
+        let (_, watch) = mon.tick_full_at(t);
+        assert_eq!(watch.len(), 1, "fresh signal must fire");
+
+        // Poll 15, 140s later: the sample is stale, the wait is still
+        // elevated. Only the signal's age changed -> silent.
+        let t2 = t + Duration::from_secs(140);
+        fake.set_thread(
+            100,
+            100,
+            "watched",
+            elevated_wait_ns(14, 5_000_000, 100_000_000),
+        );
+        let (_, watch) = mon.tick_full_at(t2);
+        assert!(
+            watch.is_empty(),
+            "a stale SLO signal must not arm the finding"
+        );
+    }
+
+    #[test]
+    fn watch_needs_twelve_baseline_samples() {
+        // 11 measured samples is not a baseline: the 12th poll stays
+        // silent even with both conditions met, because evaluation needs
+        // 12 PRIOR samples. The 12th poll's measurement still feeds the
+        // baseline, so the 13th poll (12 priors) fires.
+        let t0 = Instant::now();
+        let fake = FakeProc::new();
+        let (mut mon, tx) = fake.watch_monitor(vec![pid_target(100)]);
+        // 12 polls -> 11 measurements (the first poll only establishes
+        // the thread baseline).
+        let t = run_baseline_polls(&fake, &mut mon, 100, 100, "watched", 12, 5_000_000, t0);
+
+        fake.set_thread(
+            100,
+            100,
+            "watched",
+            elevated_wait_ns(12, 5_000_000, 100_000_000),
+        );
+        tx.send(LatencySample {
+            selector: WatchSelector::pid(100),
+            p99_ms: 142.5,
+        })
+        .unwrap();
+        let (_, watch) = mon.tick_full_at(t);
+        assert!(
+            watch.is_empty(),
+            "no evaluation before 12 PRIOR baseline samples"
+        );
+
+        // The 13th measured sample has 12 priors: same conditions now fire.
+        fake.set_thread(
+            100,
+            100,
+            "watched",
+            elevated_wait_ns(13, 5_000_000, 100_000_000),
+        );
+        tx.send(LatencySample {
+            selector: WatchSelector::pid(100),
+            p99_ms: 142.5,
+        })
+        .unwrap();
+        let (_, watch) = mon.tick_full_at(t + Duration::from_secs(5));
+        assert_eq!(
+            watch.len(),
+            1,
+            "the 13th measured sample (12 priors) must arm evaluation"
+        );
+    }
+
+    #[test]
+    fn watch_targets_have_independent_baselines() {
+        // Pid 100 idles at 10ms/poll; pid 200 idles at 400ms/poll. A 100ms
+        // wait is 10x elevated for pid 100 but baseline-level for pid 200
+        // — only pid 100 may fire.
+        let t0 = Instant::now();
+        let fake = FakeProc::new();
+        let (mut mon, tx) = fake.watch_monitor(vec![pid_target(100), pid_target(200)]);
+
+        let mut t = t0;
+        for k in 0..13 {
+            fake.set_thread(100, 100, "low", k * 5_000_000);
+            fake.set_thread(200, 200, "high", k * 200_000_000);
+            assert!(mon.watch_tick_at(t).is_empty());
+            t += Duration::from_secs(5);
+        }
+
+        fake.set_thread(
+            100,
+            100,
+            "low",
+            elevated_wait_ns(13, 5_000_000, 100_000_000),
+        );
+        fake.set_thread(
+            200,
+            200,
+            "high",
+            elevated_wait_ns(13, 200_000_000, 450_000_000),
+        );
+        for pid in [100u32, 200] {
+            tx.send(LatencySample {
+                selector: WatchSelector::pid(pid),
+                p99_ms: 142.5,
+            })
+            .unwrap();
+        }
+        let (_, watch) = mon.tick_full_at(t);
+        assert_eq!(
+            watch.len(),
+            1,
+            "only the target elevated against its OWN baseline may fire"
+        );
+        assert_eq!(watch[0].tgid, 100);
+        assert!((watch[0].baseline_median_ms - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn watch_resolves_pid_comm_and_cgroup_selectors() {
+        let t0 = Instant::now();
+        let fake = FakeProc::new();
+        let targets = vec![
+            WatchTargetConfig {
+                selector: WatchSelector::pid(300),
+                ..pid_target(0)
+            },
+            WatchTargetConfig {
+                selector: WatchSelector::comm("byname".to_string()),
+                ..pid_target(0)
+            },
+            WatchTargetConfig {
+                selector: WatchSelector::cgroup("/kubepods/burstable/podabc".to_string()),
+                ..pid_target(0)
+            },
+        ];
+        let (mut mon, tx) = fake.watch_monitor(targets);
+        fake.set_cgroup(302, "0::/kubepods/burstable/podabc/container1\n");
+
+        let mut t = t0;
+        for k in 0..13 {
+            fake.set_thread(300, 300, "other", k * 5_000_000);
+            fake.set_thread(301, 301, "byname", k * 5_000_000);
+            fake.set_thread(302, 302, "grouped", k * 5_000_000);
+            assert!(mon.watch_tick_at(t).is_empty());
+            t += Duration::from_secs(5);
+        }
+
+        fake.set_thread(
+            300,
+            300,
+            "other",
+            elevated_wait_ns(13, 5_000_000, 100_000_000),
+        );
+        fake.set_thread(
+            301,
+            301,
+            "byname",
+            elevated_wait_ns(13, 5_000_000, 100_000_000),
+        );
+        fake.set_thread(
+            302,
+            302,
+            "grouped",
+            elevated_wait_ns(13, 5_000_000, 100_000_000),
+        );
+        tx.send(LatencySample {
+            selector: WatchSelector::pid(300),
+            p99_ms: 142.5,
+        })
+        .unwrap();
+        tx.send(LatencySample {
+            selector: WatchSelector::comm("byname".to_string()),
+            p99_ms: 142.5,
+        })
+        .unwrap();
+        tx.send(LatencySample {
+            selector: WatchSelector::cgroup("/kubepods/burstable/podabc".to_string()),
+            p99_ms: 142.5,
+        })
+        .unwrap();
+        let (_, watch) = mon.tick_full_at(t);
+        let mut fired: Vec<(u32, String)> = watch
+            .iter()
+            .map(|f| (f.tgid, f.watch_selector.clone()))
+            .collect();
+        fired.sort();
+        assert_eq!(
+            fired,
+            vec![
+                (300, "pid=300".to_string()),
+                (301, "comm=byname".to_string()),
+                (302, "cgroup=/kubepods/burstable/podabc".to_string()),
+            ],
+            "pid, comm and cgroup selectors must each resolve their process"
+        );
+    }
+
+    #[test]
+    fn watch_bypasses_top_50_cpu_gate() {
+        // The watched process burns no CPU (Δ=0 every poll) while 60
+        // fillers burn plenty: it can never rank in the top-50, so without
+        // the bypass it would never even be measured.
+        let t0 = Instant::now();
+        let fake = FakeProc::new();
+        let (mut mon, tx) = fake.watch_monitor(vec![pid_target(42)]);
+        let mut t = t0;
+        for k in 0..13u64 {
+            for f in 0..60u32 {
+                fake.set_stat(1000 + f, 1_000_000 + k * 1_000, 0); // Δ=1000 ticks/poll
+            }
+            fake.set_thread(42, 42, "watched", k * 5_000_000); // Δ=0 CPU, 10ms wait/poll
+            assert!(
+                mon.watch_tick_at(t).is_empty(),
+                "baseline still building (poll {k})"
+            );
+            t += Duration::from_secs(5);
+        }
+        for f in 0..60u32 {
+            fake.set_stat(1000 + f, 1_000_000 + 13 * 1_000, 0);
+        }
+        fake.set_thread(
+            42,
+            42,
+            "watched",
+            elevated_wait_ns(13, 5_000_000, 100_000_000),
+        );
+        tx.send(LatencySample {
+            selector: WatchSelector::pid(42),
+            p99_ms: 142.5,
+        })
+        .unwrap();
+        let (_, watch) = mon.tick_full_at(t);
+        assert_eq!(
+            watch.len(),
+            1,
+            "the watched process must be measured despite ranking outside the top-50"
+        );
+        assert_eq!(watch[0].tgid, 42);
+    }
+
+    #[test]
+    fn watch_snapshot_carries_mode_and_all_four_evidence_labels() {
+        let finding = WatchFinding {
+            tgid: 100,
+            comm: Some("watched".to_string()),
+            wait_ms: 100.0,
+            worst_thread_wait_ms: 100.0,
+            thread_count: 1,
+            window_secs: 10.0,
+            baseline_median_ms: 10.0,
+            elevation: 10.0,
+            elevation_factor: 3.0,
+            slo_p99_ms: 142.5,
+            slo_threshold_ms: 100.0,
+            watch_selector: "pid=100".to_string(),
+            top_waiters: vec![(100, 100, Some("watched".to_string()), 100.0)],
+        };
+        let incident = incident_from_watch_finding(&finding);
+        assert_eq!(incident.event_type, "cpu_starvation");
+        assert_eq!(incident.target_name.as_deref(), Some("watched (tgid=100)"));
+        assert_eq!(incident.target_pid, Some(100));
+        let snap: serde_json::Value =
+            serde_json::from_str(incident.system_snapshot.as_deref().unwrap()).unwrap();
+        assert_eq!(snap["detection_mode"], "watch");
+        assert_eq!(snap["wait_ms"], 100.0);
+        assert_eq!(snap["baseline_median_ms"], 10.0);
+        assert_eq!(snap["elevation"], 10.0);
+        assert_eq!(snap["elevation_factor"], 3.0);
+        assert_eq!(snap["slo_p99_ms"], 142.5);
+        assert_eq!(snap["slo_threshold_ms"], 100.0);
+        assert_eq!(snap["watch_selector"], "pid=100");
+        // The verdict the dedup key reads must be the literal "watch".
+        assert_eq!(snap["verdict"], "watch");
+        assert_eq!(snap["evidence"]["runqueue_wait"], "measured");
+        assert_eq!(snap["evidence"]["baseline_elevation"], "inferred");
+        assert_eq!(snap["evidence"]["slo_breach"], "measured");
+        assert_eq!(snap["evidence"]["offender"], "unavailable");
+    }
+
+    #[test]
+    fn watch_dedup_key_is_independent_from_threshold_verdicts() {
+        // The same victim can be incidented by the threshold path and the
+        // watch path without either suppressing the other.
+        let watch = WatchFinding {
+            tgid: 4242,
+            comm: Some("hungry".to_string()),
+            wait_ms: 100.0,
+            worst_thread_wait_ms: 100.0,
+            thread_count: 1,
+            window_secs: 10.0,
+            baseline_median_ms: 10.0,
+            elevation: 10.0,
+            elevation_factor: 3.0,
+            slo_p99_ms: 142.5,
+            slo_threshold_ms: 100.0,
+            watch_selector: "pid=4242".to_string(),
+            top_waiters: vec![],
+        };
+        let threshold = warning_finding("hungry");
+        let watch_key = (watch.victim_label(), "watch".to_string());
+        let threshold_key = (threshold.victim_label(), format!("{:?}", threshold.verdict));
+        assert_eq!(watch.victim_label(), threshold.victim_label());
+        assert_ne!(
+            watch_key, threshold_key,
+            "watch and threshold dedup keys must not collide"
+        );
+    }
+
+    #[test]
+    fn watch_skips_invalid_targets_but_arms_valid_ones() {
+        // with_watch_config mirrors --check-config: invalid entries are
+        // skipped with a warning, valid ones still arm.
+        let fake = FakeProc::new();
+        let targets = vec![
+            pid_target(100),
+            WatchTargetConfig {
+                selector: WatchSelector::pid(200),
+                slo_p99_ms: 0.0, // invalid: must be skipped
+                ..pid_target(200)
+            },
+        ];
+        let (mon, _tx) = fake.watch_monitor(targets);
+        assert_eq!(mon.watch_targets.len(), 1, "only the valid target must arm");
+        assert_eq!(mon.watch_targets[0].selector, WatchSelector::pid(100));
+    }
+
+    #[tokio::test]
+    async fn watch_findings_record_as_incidents_with_watch_verdict() {
+        let db_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            IncidentStore::new(db_dir.path().join("incidents.db"))
+                .await
+                .unwrap(),
+        );
+        let t0 = Instant::now();
+        let fake = FakeProc::new();
+        let (tx, rx) = mpsc::unbounded_channel::<LatencySample>();
+        let mut mon = fake
+            .monitor()
+            .with_watch_config(WatchConfig {
+                targets: vec![pid_target(100)],
+                ..Default::default()
+            })
+            .with_latency_receiver(rx)
+            .with_incident_store(Some(Arc::clone(&store)));
+        let t = run_baseline_polls(&fake, &mut mon, 100, 100, "watched", 13, 5_000_000, t0);
+
+        fake.set_thread(
+            100,
+            100,
+            "watched",
+            elevated_wait_ns(13, 5_000_000, 100_000_000),
+        );
+        tx.send(LatencySample {
+            selector: WatchSelector::pid(100),
+            p99_ms: 142.5,
+        })
+        .unwrap();
+        let (_, watch) = mon.tick_full_at(t);
+        assert_eq!(watch.len(), 1);
+        mon.handle_watch_finding(&watch[0]).await;
+        let incidents = store
+            .recent_filtered(10, Some("cpu_starvation"), None)
+            .await
+            .unwrap();
+        assert_eq!(incidents.len(), 1, "watch finding must record");
+        let snap: serde_json::Value =
+            serde_json::from_str(incidents[0].system_snapshot.as_deref().unwrap()).unwrap();
+        assert_eq!(snap["detection_mode"], "watch");
+        assert_eq!(snap["verdict"], "watch");
+
+        // Handling it again must not duplicate the row.
+        mon.handle_watch_finding(&watch[0]).await;
+        let incidents = store
+            .recent_filtered(10, Some("cpu_starvation"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            incidents.len(),
+            1,
+            "repeat watch finding must not duplicate"
+        );
+
+        // And the threshold path's verdict keys can't suppress it: the
+        // (victim, "watch") pair is distinct from (victim,
+        // StarvationWarning).
+        let keys = store
+            .recent_incident_keys("cpu_starvation", 3600)
+            .await
+            .unwrap();
+        assert!(keys.contains(&("watched (tgid=100)".to_string(), "watch".to_string())));
     }
 }
