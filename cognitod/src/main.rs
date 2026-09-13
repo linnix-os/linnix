@@ -1100,13 +1100,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // over a 10s window, polled every 5s. The victim's wait is measured;
     // offender identity is eBPF-only and stays unlabeled. Degrades
     // gracefully on kernels without CONFIG_SCHEDSTATS.
+    //
+    // Latency/SLO watch mode: the API endpoint feeds p99 samples into the
+    // monitor over this channel. The sender rides on AppState; the
+    // receiver goes to the monitor. Watch mode is armed only when
+    // `[watch]` holds at least one valid target.
+    let (watch_latency_tx, watch_latency_rx) =
+        tokio::sync::mpsc::channel::<cognitod::collectors::runqueue_starvation::LatencySample>(
+            cognitod::collectors::runqueue_starvation::WATCH_LATENCY_CHANNEL_CAP,
+        );
     {
         let monitor = cognitod::collectors::runqueue_starvation::RunqueueStarvationMonitor::new(
             std::time::Duration::from_secs(5),
         )
         // Starvation findings become queryable incidents for the API and
         // MCP tools, not just log lines.
-        .with_incident_store(incident_store.clone());
+        .with_incident_store(incident_store.clone())
+        // Watch targets from `[watch]` (invalid entries are skipped with a
+        // warning inside the builder) plus the p99 sample channel.
+        .with_watch_config(config.watch.clone())
+        .with_latency_receiver(watch_latency_rx);
         tokio::spawn(async move {
             monitor.run().await;
         });
@@ -1601,6 +1614,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         incident_retention_days: retention_days.filter(|d| *d > 0),
         k8s: k8s_context.clone(),
         blame_metrics: blame_metrics.clone(),
+        // The latency endpoint 503s when watch mode is disarmed so a
+        // misconfigured client finds out instead of having samples
+        // silently dropped.
+        watch_latency_tx: config
+            .watch
+            .targets
+            .iter()
+            .any(|t| t.is_valid())
+            .then_some(watch_latency_tx),
     });
 
     let listen_addr = std::env::var("LINNIX_LISTEN_ADDR").unwrap_or(config.api.listen_addr.clone());

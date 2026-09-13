@@ -216,6 +216,11 @@ pub struct Config {
     pub episode_capture: EpisodeCaptureConfig,
     #[serde(default)]
     pub incidents: IncidentsConfig,
+    /// Latency/SLO watch mode for the runqueue-starvation monitor: named
+    /// processes plus an SLO signal, evaluated against each process's own
+    /// rolling baseline instead of a global wait threshold.
+    #[serde(default)]
+    pub watch: WatchConfig,
     #[serde(default)]
     pub telemetry: TelemetrySettings,
     /// Opt-in shipment of evidence batches to the Linnix Cloud edge.
@@ -365,6 +370,21 @@ impl Config {
                 "unrecognised key `{key}` in [incidents] (not read by the daemon)"
             ));
         }
+        for key in config.watch.unknown.keys() {
+            problems.push(format!(
+                "unrecognised key `{key}` in [watch] (not read by the daemon)"
+            ));
+        }
+        for (i, target) in config.watch.targets.iter().enumerate() {
+            for key in target.unknown.keys() {
+                problems.push(format!(
+                    "unrecognised key `{key}` in [[watch.targets]] #{i} (not read by the daemon)"
+                ));
+            }
+            for problem in target.problems() {
+                problems.push(format!("[[watch.targets]] #{i}: {problem}"));
+            }
+        }
         for key in config.cloud.unknown.keys() {
             problems.push(format!(
                 "unrecognised key `{key}` in [cloud] (not read by the daemon)"
@@ -427,6 +447,19 @@ impl Config {
                  These are not read by the daemon and have no effect. \
                  Run `cognitod --check-config` to validate.",
                 keys.join(", ")
+            );
+        }
+        let mut watch_unknown: Vec<String> =
+            self.watch.unknown.keys().map(|k| k.to_string()).collect();
+        for (i, target) in self.watch.targets.iter().enumerate() {
+            watch_unknown.extend(target.unknown.keys().map(|k| format!("targets[#{i}].{k}")));
+        }
+        if !watch_unknown.is_empty() {
+            log::warn!(
+                "[config] ignoring unrecognised key(s) in [watch]: {}. \
+                 These are not read by the daemon and have no effect. \
+                 Run `cognitod --check-config` to validate.",
+                watch_unknown.join(", ")
             );
         }
     }
@@ -887,6 +920,178 @@ pub struct IncidentsConfig {
     /// having configured nothing, and pruning would stay silently disabled.
     #[serde(flatten)]
     pub unknown: std::collections::BTreeMap<String, toml::Value>,
+}
+
+/// `[watch]` — latency/SLO watch mode for the runqueue-starvation monitor.
+///
+/// The calibration work showed no global runqueue-wait threshold is safe:
+/// a host's ambient baseline wait varies by more than 10x, so any absolute
+/// number either misses real contention or false-positives on a
+/// busy-but-healthy machine. Watch mode sidesteps the magic number: the
+/// operator names the processes they actually care about plus an SLO
+/// signal, and a finding fires only when a watched process's wait is
+/// elevated relative to *its own* rolling baseline AND the SLO is
+/// breaching. Either condition alone stays silent.
+///
+/// Absent `[watch]` — or a target list with no valid entries — leaves
+/// watch mode disarmed; the 2000/5000 ms global thresholds keep working as
+/// the coarse net.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct WatchConfig {
+    /// Watch targets. Each gets its own rolling baseline and SLO signal.
+    #[serde(default)]
+    pub targets: Vec<WatchTargetConfig>,
+    /// Keys present in `[watch]` that no field matches.
+    #[serde(flatten)]
+    pub unknown: std::collections::BTreeMap<String, toml::Value>,
+}
+
+/// Selects the process(es) a watch target — or a posted latency sample —
+/// names. Exactly one of the three must be set: `pid` names one process
+/// directly, `comm` matches the leader comm (the kernel truncates comm to
+/// 15 bytes, so use the truncated form), `cgroup` substring-matches
+/// `/proc/<pid>/cgroup` contents.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Deserialize)]
+pub struct WatchSelector {
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub cgroup: Option<String>,
+    #[serde(default)]
+    pub comm: Option<String>,
+}
+
+impl WatchSelector {
+    /// Selector naming one process directly.
+    pub fn pid(pid: u32) -> Self {
+        Self {
+            pid: Some(pid),
+            cgroup: None,
+            comm: None,
+        }
+    }
+
+    /// Selector matching the leader comm.
+    pub fn comm(comm: String) -> Self {
+        Self {
+            pid: None,
+            cgroup: None,
+            comm: Some(comm),
+        }
+    }
+
+    /// Selector substring-matching `/proc/<pid>/cgroup` contents.
+    pub fn cgroup(cgroup: String) -> Self {
+        Self {
+            pid: None,
+            cgroup: Some(cgroup),
+            comm: None,
+        }
+    }
+
+    /// How many of the three selectors are set. Exactly one is valid.
+    /// An empty or whitespace-only string counts as unset: `cgroup = ""`
+    /// would otherwise substring-match every readable process cgroup on
+    /// the host, and an empty `comm` can never match anything.
+    pub fn selector_count(&self) -> usize {
+        [
+            self.pid.is_some(),
+            self.cgroup.as_deref().is_some_and(|s| !s.trim().is_empty()),
+            self.comm.as_deref().is_some_and(|s| !s.trim().is_empty()),
+        ]
+        .into_iter()
+        .filter(|is_set| *is_set)
+        .count()
+    }
+
+    /// `pid=1234`, `cgroup=/kubepods/...`, `comm=myserver` — for logs and
+    /// incident snapshots.
+    pub fn label(&self) -> String {
+        if let Some(pid) = self.pid {
+            format!("pid={pid}")
+        } else if let Some(cgroup) = &self.cgroup {
+            format!("cgroup={cgroup}")
+        } else if let Some(comm) = &self.comm {
+            format!("comm={comm}")
+        } else {
+            "none".to_string()
+        }
+    }
+}
+
+/// One `[[watch.targets]]` entry: which processes to watch and what counts
+/// as their SLO breaching.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct WatchTargetConfig {
+    #[serde(flatten)]
+    pub selector: WatchSelector,
+    /// Observed p99 latency (ms) at or above which the SLO signal counts
+    /// as breaching. Required — there is no sensible default for someone
+    /// else's SLO.
+    pub slo_p99_ms: f64,
+    /// Fire when the process's aggregate wait exceeds this multiple of its
+    /// own rolling baseline median.
+    #[serde(default = "default_watch_elevation_factor")]
+    pub elevation_factor: f64,
+    /// How far back the rolling baseline reaches, in seconds.
+    #[serde(default = "default_watch_baseline_secs")]
+    pub baseline_secs: u64,
+    /// Keys present in the target table that no field matches.
+    #[serde(flatten)]
+    pub unknown: std::collections::BTreeMap<String, toml::Value>,
+}
+
+fn default_watch_elevation_factor() -> f64 {
+    3.0
+}
+
+fn default_watch_baseline_secs() -> u64 {
+    3600
+}
+
+/// Minimum `baseline_secs` that can actually complete watch warm-up:
+/// 12 baseline samples at ~5s polls span just over a minute, and the
+/// window prunes samples by age — a 60s window would prune the oldest
+/// sample just as the 12th arrives, so the target could never evaluate.
+const MIN_WATCH_BASELINE_SECS: u64 = 120;
+
+impl WatchTargetConfig {
+    /// Strict validation, shared by `--check-config` and the daemon's own
+    /// target loading: a config that never passed `--check-config` must
+    /// not arm a nonsense target either.
+    pub fn problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        let selectors = self.selector.selector_count();
+        if selectors != 1 {
+            problems.push(format!(
+                "must set exactly one of `pid`, `cgroup`, `comm` (found {selectors})"
+            ));
+        }
+        if !self.slo_p99_ms.is_finite() || self.slo_p99_ms <= 0.0 {
+            problems.push(format!(
+                "`slo_p99_ms` must be a positive number (found {})",
+                self.slo_p99_ms
+            ));
+        }
+        if !self.elevation_factor.is_finite() || self.elevation_factor <= 1.0 {
+            problems.push(format!(
+                "`elevation_factor` must be > 1.0 (found {})",
+                self.elevation_factor
+            ));
+        }
+        if self.baseline_secs < MIN_WATCH_BASELINE_SECS {
+            problems.push(format!(
+                "`baseline_secs` must be >= {MIN_WATCH_BASELINE_SECS} (found {})",
+                self.baseline_secs
+            ));
+        }
+        problems
+    }
+
+    /// True when the target passes every validation rule.
+    pub fn is_valid(&self) -> bool {
+        self.problems().is_empty()
+    }
 }
 
 fn default_attribution_threshold_ms() -> u64 {
@@ -1551,6 +1756,176 @@ timeout_ms = 30000
             Config::check(file.path()).is_empty(),
             "a correct [incidents] section must be clean"
         );
+    }
+
+    #[test]
+    fn watch_target_defaults() {
+        // Only the selector and the SLO are required; the tuning knobs
+        // fall back to the report's recommended values.
+        let toml = r#"[watch]
+[[watch.targets]]
+comm = "myserver"
+slo_p99_ms = 100.0
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.watch.targets.len(), 1);
+        let t = &cfg.watch.targets[0];
+        assert_eq!(t.selector.comm.as_deref(), Some("myserver"));
+        assert!(t.selector.pid.is_none());
+        assert!((t.slo_p99_ms - 100.0).abs() < 1e-9);
+        assert!((t.elevation_factor - 3.0).abs() < 1e-9);
+        assert_eq!(t.baseline_secs, 3600);
+        assert!(t.is_valid());
+    }
+
+    #[test]
+    fn watch_selector_shapes_parse() {
+        let toml = r#"[watch]
+[[watch.targets]]
+pid = 1234
+slo_p99_ms = 50.0
+[[watch.targets]]
+cgroup = "/kubepods/burstable/podabc"
+slo_p99_ms = 50.0
+elevation_factor = 2.0
+baseline_secs = 120
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.watch.targets.len(), 2);
+        assert_eq!(cfg.watch.targets[0].selector.pid, Some(1234));
+        assert_eq!(
+            cfg.watch.targets[0].selector.label(),
+            "pid=1234".to_string()
+        );
+        assert_eq!(
+            cfg.watch.targets[1].selector.cgroup.as_deref(),
+            Some("/kubepods/burstable/podabc")
+        );
+        assert!((cfg.watch.targets[1].elevation_factor - 2.0).abs() < 1e-9);
+        assert_eq!(cfg.watch.targets[1].baseline_secs, 120);
+        assert!(cfg.watch.targets.iter().all(|t| t.is_valid()));
+    }
+
+    #[test]
+    fn check_rejects_invalid_watch_targets() {
+        // Each case must produce at least one problem naming the target.
+        let cases = [
+            (
+                "no selector",
+                "slo_p99_ms = 100.0\n",
+                "exactly one of `pid`, `cgroup`, `comm`",
+            ),
+            (
+                "two selectors",
+                "pid = 1\ncomm = \"x\"\nslo_p99_ms = 100.0\n",
+                "exactly one of `pid`, `cgroup`, `comm`",
+            ),
+            (
+                "zero slo",
+                "comm = \"x\"\nslo_p99_ms = 0.0\n",
+                "`slo_p99_ms` must be a positive number",
+            ),
+            (
+                "negative slo",
+                "comm = \"x\"\nslo_p99_ms = -5.0\n",
+                "`slo_p99_ms` must be a positive number",
+            ),
+            (
+                "elevation at unity",
+                "comm = \"x\"\nslo_p99_ms = 100.0\nelevation_factor = 1.0\n",
+                "`elevation_factor` must be > 1.0",
+            ),
+            (
+                "elevation below unity",
+                "comm = \"x\"\nslo_p99_ms = 100.0\nelevation_factor = 0.5\n",
+                "`elevation_factor` must be > 1.0",
+            ),
+            (
+                "baseline too short",
+                "comm = \"x\"\nslo_p99_ms = 100.0\nbaseline_secs = 119\n",
+                "`baseline_secs` must be >= 120",
+            ),
+            (
+                "empty cgroup selector",
+                "cgroup = \"\"\nslo_p99_ms = 100.0\n",
+                "exactly one of `pid`, `cgroup`, `comm`",
+            ),
+            (
+                "empty comm selector",
+                "comm = \"\"\nslo_p99_ms = 100.0\n",
+                "exactly one of `pid`, `cgroup`, `comm`",
+            ),
+            (
+                "whitespace comm selector",
+                "comm = \"   \"\nslo_p99_ms = 100.0\n",
+                "exactly one of `pid`, `cgroup`, `comm`",
+            ),
+        ];
+        for (name, target_toml, expected) in cases {
+            let mut file = NamedTempFile::new().unwrap();
+            writeln!(file, "[watch]\n[[watch.targets]]\n{target_toml}").unwrap();
+            let problems = Config::check(file.path());
+            assert!(
+                problems
+                    .iter()
+                    .any(|p| p.contains("[[watch.targets]]") && p.contains(expected)),
+                "{name}: expected a problem containing {expected:?}, got: {problems:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_flags_a_misspelled_watch_key() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[watch]\n[[watch.targets]]\ncomm = \"x\"\nslo_p99m = 100.0"
+        )
+        .unwrap();
+        let problems = Config::check(file.path());
+        // `slo_p99m` is a typo: the required `slo_p99_ms` is missing, so
+        // this is a parse error naming the missing field...
+        assert!(
+            problems.iter().any(|p| p.contains("slo_p99_ms")),
+            "a typo'd slo key must surface, got: {problems:?}"
+        );
+
+        // ...while a typo'd *optional* key is captured, not swallowed.
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[watch]\n[[watch.targets]]\ncomm = \"x\"\nslo_p99_ms = 100.0\nelevation_faktor = 2.0"
+        )
+        .unwrap();
+        let problems = Config::check(file.path());
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("elevation_faktor") && p.contains("[[watch.targets]]")),
+            "a typo'd optional watch key must be flagged, got: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn check_passes_a_correct_watch_section() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[watch]\n[[watch.targets]]\ncomm = \"myserver\"\nslo_p99_ms = 100.0\n\
+             [[watch.targets]]\npid = 4321\nslo_p99_ms = 250.0\nelevation_factor = 4.0\nbaseline_secs = 600"
+        )
+        .unwrap();
+        assert!(
+            Config::check(file.path()).is_empty(),
+            "a correct [watch] section must be clean"
+        );
+    }
+
+    #[test]
+    fn watch_absent_by_default() {
+        let cfg: Config = toml::from_str("[runtime]\noffline = true\n").unwrap();
+        assert!(cfg.watch.targets.is_empty());
+        assert!(cfg.watch.unknown.is_empty());
     }
 
     #[test]
