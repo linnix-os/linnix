@@ -45,6 +45,7 @@ curl -H "Authorization: Bearer <token>" http://localhost:3000/status
 | `/processes` | GET | - |
 | `/processes/live` | GET | - |
 | `/processes/{pid}` | GET | - |
+| `/processes/{pid}/contention` | GET | - |
 | `/status` | GET | - |
 | `/stream` | GET | - |
 | `/system` | GET | - |
@@ -76,6 +77,23 @@ Returns all tracked processes with CPU/memory metrics.
 
 ```bash
 curl http://localhost:3000/processes | jq
+```
+
+#### GET /processes/{pid}/contention
+Returns the per-process runqueue-wait finding from the userspace schedstat
+detector (label `measured`): ms the process's threads spent waiting on a
+runqueue inside the 10s measurement window, plus the deterministic verdict
+against the frozen 2000/5000 ms thresholds. This is the same measurement the
+`cpu_starvation` incidents come from, exposed read-only per PID — not a new
+sensor. An explicit query pins the PID so subsequent polls measure it even
+outside the top-50 CPU gate.
+
+- `404` — the PID doesn't exist, or exists but hasn't been measured yet
+  (typed absence, never a fabricated zero).
+- `503` — the detector is degraded (schedstat unreadable) or not running.
+
+```bash
+curl http://localhost:3000/processes/1234/contention | jq
 ```
 
 #### GET /graph/{pid}

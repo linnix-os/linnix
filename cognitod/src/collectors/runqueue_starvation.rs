@@ -61,11 +61,13 @@
 //! absolute wait floor. The SLO-breach requirement is the noise guard.
 
 use log::{debug, info, warn};
+use serde::Serialize;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 
@@ -124,6 +126,147 @@ impl StarvationVerdict {
     /// `false` for `Healthy`; used to filter log/report noise.
     pub fn actionable(self) -> bool {
         !matches!(self, StarvationVerdict::Healthy)
+    }
+
+    /// Stable wire string for the queryable snapshot: a deterministic
+    /// classification of the measured wait, never a reinterpretation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StarvationVerdict::Healthy => "healthy",
+            StarvationVerdict::StarvationWarning => "starvation_warning",
+            StarvationVerdict::StarvationCritical => "starvation_critical",
+        }
+    }
+}
+
+/// One per-process contention snapshot, published for the queryable
+/// `GET /processes/{pid}/contention` endpoint.
+///
+/// This is the SAME measurement the monitor's threshold path evaluates —
+/// the per-process aggregate runqueue wait from the schedstat baselines —
+/// exposed read-only per PID. No new sensor: publishing reads the poll
+/// aggregates the monitor already computes for `cpu_starvation` incidents.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessContentionSnapshot {
+    /// The process (tgid) this finding describes — the snapshot's identity.
+    pub tgid: u32,
+    pub comm: Option<String>,
+    /// Process birth identity: `/proc/<pid>/stat` field 22 (`starttime`,
+    /// clock ticks since boot) read in the same poll as the measurement.
+    /// Together with `boot_id` this names one process *incarnation* — a
+    /// recycled PID gets a different starttime. `None` when uncapturable;
+    /// a consumer binding evidence to a process identity must treat `None`
+    /// as unbindable (never as matching).
+    pub start_ticks: Option<u64>,
+    /// Kernel boot ID read from the outlet's `/proc` root — the other half
+    /// of the incarnation identity. `None` when unreadable.
+    pub boot_id: Option<String>,
+    /// Epistemic label of the measurement — always `"measured"`. The
+    /// wait is read from kernel schedstat accounting, not inferred.
+    pub label: &'static str,
+    /// Deterministic classification of the measured wait against the
+    /// frozen 2000/5000 ms thresholds (see [`StarvationVerdict`]).
+    pub verdict: &'static str,
+    /// Measured ms the process's threads spent waiting on a runqueue
+    /// inside the window, summed across measured threads.
+    pub wait_ms: f64,
+    /// The worst single thread's wait, for context.
+    pub worst_thread_wait_ms: f64,
+    /// How many of the process's threads were measured this poll.
+    pub measured_thread_count: usize,
+    /// Seconds the measurement window covers.
+    pub window_secs: f64,
+    /// Wall-clock unix seconds when the snapshot was taken —
+    /// presentation/correlation only, never part of a measurement digest.
+    pub measured_at_unix: u64,
+}
+
+/// Shared state between the runqueue monitor task and the API layer for
+/// `GET /processes/{pid}/contention`.
+///
+/// The monitor replaces the snapshot map after every poll; the endpoint
+/// reads it. A process that stops being measured ages out of the map —
+/// the endpoint then answers 404 (typed absence: nothing measured),
+/// never a stale or fabricated number.
+///
+/// PIDs named by API queries bypass the top-50 measurement gate exactly
+/// like configured watch targets: an explicit query is explicit intent
+/// to measure that process. Pinned entries age out after
+/// [`STALE_BASELINE`] without fresh queries, so the cost bound stays
+/// intact.
+pub struct ContentionOutlet {
+    proc_root: PathBuf,
+    snapshots: std::sync::RwLock<HashMap<u32, ProcessContentionSnapshot>>,
+    pinned: std::sync::Mutex<HashMap<u32, Instant>>,
+    degraded: AtomicBool,
+    /// Kernel boot ID captured once at construction — host-boot-scoped
+    /// half of the process incarnation identity (see
+    /// [`ProcessContentionSnapshot::boot_id`]).
+    boot_id: Option<String>,
+}
+
+impl ContentionOutlet {
+    /// `proc_root` is the `/proc` the monitor scans; the endpoint uses it
+    /// for PID-existence checks so both sides agree on what "exists" means.
+    pub fn new(proc_root: PathBuf) -> Self {
+        let boot_id = read_boot_id(&proc_root);
+        Self {
+            proc_root,
+            snapshots: std::sync::RwLock::new(HashMap::new()),
+            pinned: std::sync::Mutex::new(HashMap::new()),
+            degraded: AtomicBool::new(false),
+            boot_id,
+        }
+    }
+
+    /// The `/proc` root the monitor scans.
+    pub fn proc_root(&self) -> &Path {
+        &self.proc_root
+    }
+
+    /// The latest published snapshot for `tgid`, if the monitor measured
+    /// it on the last poll.
+    pub fn snapshot(&self, tgid: u32) -> Option<ProcessContentionSnapshot> {
+        self.snapshots.read().ok()?.get(&tgid).cloned()
+    }
+
+    /// Pin a PID for measurement on subsequent polls (top-50 bypass).
+    pub fn pin(&self, tgid: u32) {
+        if let Ok(mut pinned) = self.pinned.lock() {
+            pinned.insert(tgid, Instant::now());
+        }
+    }
+
+    /// Pinned tgids still fresh, for the monitor's measurement gate.
+    /// Prunes entries idle longer than [`STALE_BASELINE`] — the same aging
+    /// as the thread baselines.
+    pub(crate) fn fresh_pinned(&self) -> HashSet<u32> {
+        let now = Instant::now();
+        let mut pinned = match self.pinned.lock() {
+            Ok(guard) => guard,
+            Err(_) => return HashSet::new(),
+        };
+        pinned.retain(|_, seen| now.duration_since(*seen) < STALE_BASELINE);
+        pinned.keys().copied().collect()
+    }
+
+    /// Replace the published snapshot map (one call per monitor poll).
+    pub fn publish(&self, snapshots: HashMap<u32, ProcessContentionSnapshot>) {
+        if let Ok(mut guard) = self.snapshots.write() {
+            *guard = snapshots;
+        }
+    }
+
+    /// Whether the detector is currently degraded (schedstat unreadable).
+    pub fn set_degraded(&self, degraded: bool) {
+        self.degraded.store(degraded, AtomicOrdering::Relaxed);
+    }
+
+    /// `true` while schedstat is unreadable — the endpoint answers 503
+    /// instead of 404 so "no measurement infrastructure" isn't confused
+    /// with "this PID has no contention".
+    pub fn degraded(&self) -> bool {
+        self.degraded.load(AtomicOrdering::Relaxed)
     }
 }
 
@@ -200,6 +343,33 @@ fn read_stat_cputime(proc_root: &Path, pid: u32) -> Option<u64> {
     let utime = fields.nth(11)?.parse::<u64>().ok()?;
     let stime = fields.next()?.parse::<u64>().ok()?;
     Some(utime.saturating_add(stime))
+}
+
+/// Process birth identity: `starttime` in clock ticks since boot from
+/// `/proc/<pid>/stat` field 22. Together with the boot ID this names one
+/// process *incarnation* — a recycled PID gets a different starttime, so a
+/// measurement can never be silently rebound to a new process. `None`
+/// when the file is missing or unparseable — absence is not zero, and the
+/// snapshot carries the `None` honestly rather than fabricating identity.
+fn read_stat_start_ticks(proc_root: &Path, pid: u32) -> Option<u64> {
+    let content = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
+    let after_comm = content.rfind(')')?;
+    let mut fields = content[after_comm + 1..].split_whitespace();
+    // fields[0] is field 3 (state); starttime is field 22.
+    fields.nth(19)?.parse::<u64>().ok()
+}
+
+/// Kernel boot ID from `/proc/sys/kernel/random/boot_id`, via the
+/// outlet's proc root. Constant for the daemon's lifetime (a reboot kills
+/// the daemon); `None` when unreadable.
+fn read_boot_id(proc_root: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(proc_root.join("sys/kernel/random/boot_id")).ok()?;
+    let id = content.trim();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
+    }
 }
 
 /// Numeric `/proc` entries: the live PID set.
@@ -464,6 +634,10 @@ pub struct RunqueueStarvationMonitor {
     /// SLO samples posted via `POST /v1/watch/latency`. `None` keeps the
     /// monitor threshold-only.
     latency_rx: Option<mpsc::Receiver<LatencySample>>,
+    /// Outlet publishing per-process contention snapshots for
+    /// `GET /processes/{pid}/contention`. `None` keeps the monitor
+    /// incident-and-log-only.
+    contention_outlet: Option<Arc<ContentionOutlet>>,
 }
 
 impl RunqueueStarvationMonitor {
@@ -481,6 +655,7 @@ impl RunqueueStarvationMonitor {
             incident_store: None,
             watch_targets: Vec::new(),
             latency_rx: None,
+            contention_outlet: None,
         }
     }
 
@@ -545,6 +720,17 @@ impl RunqueueStarvationMonitor {
     /// can never evaluate).
     pub fn with_latency_receiver(mut self, rx: mpsc::Receiver<LatencySample>) -> Self {
         self.latency_rx = Some(rx);
+        self
+    }
+
+    /// Publishes one [`ProcessContentionSnapshot`] per measured process
+    /// after every poll, for `GET /processes/{pid}/contention`. The
+    /// snapshots are the same per-process aggregates the threshold path
+    /// evaluates — read-only exposure of an existing measurement, not a
+    /// new sensor. Detection thresholds and incident behavior are
+    /// unchanged.
+    pub fn with_contention_outlet(mut self, outlet: Arc<ContentionOutlet>) -> Self {
+        self.contention_outlet = Some(outlet);
         self
     }
 
@@ -667,6 +853,44 @@ impl RunqueueStarvationMonitor {
         let Some(poll) = self.poll_at(now) else {
             return (None, Vec::new());
         };
+        // Publish one contention snapshot per measured process — the same
+        // aggregates the threshold path evaluates. A process that stops
+        // being measured drops out of the map on the next poll; the
+        // endpoint then answers 404 rather than serving stale numbers.
+        if let Some(outlet) = &self.contention_outlet {
+            let measured_at_unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let mut snapshots = HashMap::with_capacity(poll.agg.len());
+            for (&tgid, agg) in &poll.agg {
+                let comm = read_task_comm(&self.proc_root, tgid, tgid)
+                    // The leader's comm can be momentarily unreadable
+                    // (exec in flight); fall back to the worst thread's.
+                    .or_else(|| read_task_comm(&self.proc_root, tgid, agg.worst_tid));
+                // Birth identity captured in the same poll as the
+                // measurement, so the finding can never be rebound to a
+                // recycled PID incarnation at query time.
+                let start_ticks = read_stat_start_ticks(&self.proc_root, tgid);
+                snapshots.insert(
+                    tgid,
+                    ProcessContentionSnapshot {
+                        tgid,
+                        comm,
+                        start_ticks,
+                        boot_id: outlet.boot_id.clone(),
+                        label: "measured",
+                        verdict: classify(agg.total_ms).as_str(),
+                        wait_ms: agg.total_ms,
+                        worst_thread_wait_ms: agg.worst_ms,
+                        measured_thread_count: agg.threads,
+                        window_secs: WINDOW.as_secs_f64(),
+                        measured_at_unix,
+                    },
+                );
+            }
+            outlet.publish(snapshots);
+        }
         let threshold = self.threshold_finding(&poll);
         let watch = self.evaluate_watch(&poll, now);
         (threshold, watch)
@@ -705,6 +929,15 @@ impl RunqueueStarvationMonitor {
         // asked for these processes, and the cost is a few extra schedstat
         // reads.
         let watched = self.resolve_watched_tgids(&pids);
+        // API-queried PIDs bypass the gate the same way: an explicit
+        // query is explicit intent to measure that process (the endpoint
+        // pins the PID before the next poll). Entries age out after
+        // STALE_BASELINE without fresh queries.
+        let pinned = self
+            .contention_outlet
+            .as_ref()
+            .map(|o| o.fresh_pinned())
+            .unwrap_or_default();
 
         // Phase 2: read schedstat for the top-50's threads plus every
         // watched process's threads — the cost bound, widened only by the
@@ -716,7 +949,7 @@ impl RunqueueStarvationMonitor {
         // measurable window.
         let mut waiters: Vec<(u32, u32, f64)> = Vec::new();
         for (tgid, tid) in list_threads(&self.proc_root) {
-            if !top.contains(&tgid) && !watched.contains(&tgid) {
+            if !top.contains(&tgid) && !watched.contains(&tgid) && !pinned.contains(&tgid) {
                 continue;
             }
             let sched_path = thread_file(&self.proc_root, tgid, tid, "schedstat");
@@ -746,12 +979,18 @@ impl RunqueueStarvationMonitor {
                 );
             }
             self.schedstat_available = Some(false);
+            if let Some(outlet) = &self.contention_outlet {
+                outlet.set_degraded(true);
+            }
             return None;
         }
         if self.schedstat_available == Some(false) {
             info!("[runqueue] schedstat readable again; starvation detection resumed");
         }
         self.schedstat_available = Some(true);
+        if let Some(outlet) = &self.contention_outlet {
+            outlet.set_degraded(false);
+        }
 
         waiters.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(Ordering::Equal));
         // Aggregate to the process: sum each measured thread's window wait
@@ -1404,12 +1643,18 @@ mod tests {
         /// Fields 14/15 are parsed after the last `)`; the comm may itself
         /// contain parens.
         fn set_stat(&self, pid: u32, utime: u64, stime: u64) {
+            // Deterministic birth identity for the fake proc: one
+            // incarnation per pid unless set_stat_start says otherwise.
+            self.set_stat_start(pid, utime, stime, u64::from(pid) * 1000 + 42);
+        }
+
+        fn set_stat_start(&self, pid: u32, utime: u64, stime: u64, start_ticks: u64) {
             let d = self.dir.path().join(pid.to_string());
             fs::create_dir_all(&d).unwrap();
             fs::write(
                 d.join("stat"),
                 format!(
-                    "{pid} (comm (with) parens) R 0 0 0 0 0 0 0 0 0 0 {utime} {stime} 0 0 0 0 0\n"
+                    "{pid} (comm (with) parens) R 0 0 0 0 0 0 0 0 0 0 {utime} {stime} 0 0 0 0 0 0 {start_ticks}\n"
                 ),
             )
             .unwrap();
@@ -2701,5 +2946,156 @@ mod tests {
             .await
             .unwrap();
         assert!(keys.contains(&("watched (tgid=100)".to_string(), "watch".to_string())));
+    }
+
+    #[test]
+    fn contention_outlet_publishes_per_process_snapshots() {
+        let procfs = FakeProc::new();
+        procfs.set_thread(4242, 4242, "hog", 0);
+        let outlet = Arc::new(ContentionOutlet::new(procfs.dir.path().to_path_buf()));
+        let mut mon = procfs.monitor().with_contention_outlet(Arc::clone(&outlet));
+
+        let t0 = Instant::now();
+        mon.tick_full_at(t0); // baseline
+        // 2.5s of runqueue wait over the next 5s poll.
+        procfs.set_thread(4242, 4242, "hog", 2_500_000_000);
+        mon.tick_full_at(t0 + Duration::from_secs(5));
+
+        let snap = outlet
+            .snapshot(4242)
+            .expect("a measured process must have a snapshot");
+        // The finding's identity is the process it describes.
+        assert_eq!(snap.tgid, 4242);
+        // Birth identity captured at measurement time: the fake proc's
+        // deterministic starttime for this incarnation.
+        assert_eq!(snap.start_ticks, Some(4242 * 1000 + 42));
+        // The fake /proc has no sys/kernel/random/boot_id — absence is
+        // honest, not fabricated.
+        assert_eq!(snap.boot_id, None);
+        assert_eq!(snap.label, "measured");
+        assert_eq!(snap.verdict, "starvation_warning");
+        assert!(
+            (snap.wait_ms - 2500.0).abs() < 1e-6,
+            "wait_ms must be the measured schedstat Δ, got {}",
+            snap.wait_ms
+        );
+        assert!((snap.worst_thread_wait_ms - 2500.0).abs() < 1e-6);
+        assert_eq!(snap.measured_thread_count, 1);
+        assert_eq!(snap.window_secs, 10.0);
+        assert_eq!(snap.comm.as_deref(), Some("hog"));
+    }
+
+    #[test]
+    fn contention_outlet_unknown_pid_has_no_snapshot() {
+        let procfs = FakeProc::new();
+        let outlet = Arc::new(ContentionOutlet::new(procfs.dir.path().to_path_buf()));
+        // Typed absence, not zero: a process never measured has no
+        // snapshot, and the outlet is not degraded.
+        assert!(outlet.snapshot(9999).is_none());
+        assert!(!outlet.degraded());
+    }
+
+    #[test]
+    fn contention_outlet_pinned_pid_bypasses_top50_gate() {
+        let procfs = FakeProc::new();
+        // 55 busy processes that will outrank the quiet target on CPU
+        // delta, pushing it out of the top-50.
+        for pid in 1000..1055u32 {
+            procfs.set_thread(pid, pid, "busy", 0);
+        }
+        procfs.set_thread(2000, 2000, "quiet", 0);
+
+        let outlet = Arc::new(ContentionOutlet::new(procfs.dir.path().to_path_buf()));
+        let mut mon = procfs.monitor().with_contention_outlet(Arc::clone(&outlet));
+
+        let t0 = Instant::now();
+        mon.tick_full_at(t0); // baselines; every delta is zero
+        // Second poll: the busy processes burn CPU, the target stays
+        // quiet and unranked.
+        for pid in 1000..1055u32 {
+            procfs.set_stat(pid, 100_000, 0);
+        }
+        procfs.set_thread(2000, 2000, "quiet", 1_000_000_000);
+        mon.tick_full_at(t0 + Duration::from_secs(5));
+        // Outside the top-50 and unpinned: nothing measured, so no
+        // snapshot — absence, not a fabricated zero.
+        assert!(
+            outlet.snapshot(2000).is_none(),
+            "unpinned low-CPU pid must not be measured"
+        );
+
+        // An explicit query pins it (the endpoint does this); two more
+        // polls build the baseline and publish the measurement.
+        outlet.pin(2000);
+        procfs.set_thread(2000, 2000, "quiet", 2_000_000_000);
+        mon.tick_full_at(t0 + Duration::from_secs(10));
+        procfs.set_thread(2000, 2000, "quiet", 3_000_000_000);
+        mon.tick_full_at(t0 + Duration::from_secs(15));
+        let snap = outlet.snapshot(2000).expect("pinned pid must be measured");
+        assert_eq!(snap.tgid, 2000);
+        assert_eq!(snap.label, "measured");
+        assert!(
+            (snap.wait_ms - 1000.0).abs() < 1e-6,
+            "wait_ms must be the measured schedstat Δ, got {}",
+            snap.wait_ms
+        );
+    }
+
+    #[test]
+    fn contention_outlet_tracks_pid_recycle_identity() {
+        // A recycled PID must never inherit the previous incarnation's
+        // finding: the snapshot carries the birth identity captured in
+        // the same poll as the measurement.
+        let procfs = FakeProc::new();
+        procfs.set_thread(4242, 4242, "hog", 0);
+        // set_thread rewrites stat; the incarnation identity goes last.
+        procfs.set_stat_start(4242, 1000, 0, 1111); // incarnation A
+        let outlet = Arc::new(ContentionOutlet::new(procfs.dir.path().to_path_buf()));
+        let mut mon = procfs.monitor().with_contention_outlet(Arc::clone(&outlet));
+
+        let t0 = Instant::now();
+        mon.tick_full_at(t0);
+        // set_thread rewrites stat as a side effect; re-assert the
+        // incarnation after every fixture write.
+        procfs.set_thread(4242, 4242, "hog", 1_000_000_000);
+        procfs.set_stat_start(4242, 1000, 0, 1111); // incarnation A persists
+        mon.tick_full_at(t0 + Duration::from_secs(5));
+        assert_eq!(
+            outlet.snapshot(4242).unwrap().start_ticks,
+            Some(1111),
+            "snapshot must carry incarnation A's birth identity"
+        );
+
+        // The PID is recycled: same number, new process, new starttime.
+        // (A real recycle would also reset the schedstat counter; the
+        // monitor's regression check re-baselines on that.)
+        procfs.set_thread(4242, 4242, "hog", 2_000_000_000);
+        procfs.set_stat_start(4242, 2000, 0, 2222); // incarnation B
+        mon.tick_full_at(t0 + Duration::from_secs(10));
+        procfs.set_thread(4242, 4242, "hog", 3_000_000_000);
+        procfs.set_stat_start(4242, 2000, 0, 2222); // incarnation B persists
+        mon.tick_full_at(t0 + Duration::from_secs(15));
+        let snap = outlet.snapshot(4242).expect("incarnation B is measured");
+        assert_eq!(
+            snap.start_ticks,
+            Some(2222),
+            "snapshot must follow the current incarnation, not the recycled one"
+        );
+    }
+
+    #[test]
+    fn contention_outlet_reports_degraded_when_schedstat_unreadable() {
+        let procfs = FakeProc::new();
+        // A pid dir with a stat file but no schedstat anywhere: the
+        // CONFIG_SCHEDSTATS-off equivalent.
+        procfs.set_stat(4242, 100, 0);
+        let outlet = Arc::new(ContentionOutlet::new(procfs.dir.path().to_path_buf()));
+        let mut mon = procfs.monitor().with_contention_outlet(Arc::clone(&outlet));
+        mon.tick_full_at(Instant::now());
+        assert!(
+            outlet.degraded(),
+            "unreadable schedstat must degrade the outlet"
+        );
+        assert!(outlet.snapshot(4242).is_none());
     }
 }

@@ -1096,6 +1096,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
     }
 
+    // Per-process contention outlet: the runqueue monitor publishes one
+    // snapshot per measured process per poll; GET
+    // /processes/{pid}/contention reads them. This is the same
+    // measurement the cpu_starvation incidents come from, exposed
+    // read-only per PID — a daemon surface addition, not a new sensor.
+    let contention_outlet = std::sync::Arc::new(
+        cognitod::collectors::runqueue_starvation::ContentionOutlet::new(std::path::PathBuf::from(
+            "/proc",
+        )),
+    );
+
     // Runqueue starvation monitor: per-thread schedstat runqueue-wait Δ
     // over a 10s window, polled every 5s. The victim's wait is measured;
     // offender identity is eBPF-only and stays unlabeled. Degrades
@@ -1119,7 +1130,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // Watch targets from `[watch]` (invalid entries are skipped with a
         // warning inside the builder) plus the p99 sample channel.
         .with_watch_config(config.watch.clone())
-        .with_latency_receiver(watch_latency_rx);
+        .with_latency_receiver(watch_latency_rx)
+        // Per-process contention snapshots for the queryable endpoint.
+        .with_contention_outlet(std::sync::Arc::clone(&contention_outlet));
         tokio::spawn(async move {
             monitor.run().await;
         });
@@ -1623,6 +1636,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .iter()
             .any(|t| t.is_valid())
             .then_some(watch_latency_tx),
+        // The runqueue monitor publishes per-process contention snapshots
+        // here for GET /processes/{pid}/contention.
+        process_contention: Some(contention_outlet),
     });
 
     let listen_addr = std::env::var("LINNIX_LISTEN_ADDR").unwrap_or(config.api.listen_addr.clone());
