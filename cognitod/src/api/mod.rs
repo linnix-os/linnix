@@ -42,7 +42,9 @@ use crate::metrics::Metrics;
 use crate::types::ProcessAlert;
 use crate::types::SystemSnapshot;
 use cognitod::alerts::Alert;
-use cognitod::collectors::runqueue_starvation::LatencySample;
+use cognitod::collectors::runqueue_starvation::{
+    ContentionMeasureError, ContentionProbe, LatencySample,
+};
 use cognitod::{Incident, IncidentStats, IncidentStore};
 use linnix_ai_ebpf_common::EventType;
 use sysinfo::{Pid, System};
@@ -536,6 +538,53 @@ async fn get_process_by_pid(
             Json(serde_json::json!({"error": "Not found"})),
         )
             .into_response()
+    }
+}
+
+/// GET /processes/{pid}/contention — an on-demand per-process
+/// runqueue-wait measurement from the userspace schedstat detector
+/// (label `measured`).
+///
+/// Every request measures: two `schedstat` samples ~1s apart for the
+/// named PID's threads, per-thread Δ aggregated to the process. No
+/// top-50 gate, no incident store, no monitor dependency — a process
+/// that exists gets a fresh answer every time, including "healthy",
+/// which the thresholded incident path structurally cannot express.
+///
+/// Typed absence, never zero: 404 when the PID doesn't exist (checked
+/// before and after the probe, so a process that exits mid-probe is
+/// absence, not data). 503 when the PID exists but no `schedstat` is
+/// readable (`CONFIG_SCHEDSTATS` off) or the probe isn't configured, so
+/// "no measurement infrastructure" is never confused with "this PID has
+/// no contention".
+async fn get_process_contention(
+    State(app_state): State<Arc<AppState>>,
+    Path(pid): Path<u32>,
+) -> impl IntoResponse {
+    let probe = match app_state.process_contention.as_ref() {
+        Some(probe) => probe,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "process contention measurement is not configured"})),
+            )
+                .into_response();
+        }
+    };
+    match probe.measure(pid).await {
+        Ok(snapshot) => (StatusCode::OK, Json(snapshot)).into_response(),
+        Err(ContentionMeasureError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Not found"})),
+        )
+            .into_response(),
+        Err(ContentionMeasureError::Degraded) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::json!({"error": "schedstat unavailable; contention measurement degraded"}),
+            ),
+        )
+            .into_response(),
     }
 }
 
@@ -1837,6 +1886,12 @@ pub struct AppState {
     /// `None` when watch mode is disarmed — the endpoint then answers 503
     /// instead of silently eating samples.
     pub watch_latency_tx: Option<mpsc::Sender<LatencySample>>,
+    /// On-demand per-process contention probe for
+    /// `GET /processes/{pid}/contention`: two `schedstat` samples ~1s
+    /// apart for the named PID, measured synchronously per request. No
+    /// monitor dependency, no top-50 gate. `None` when the probe isn't
+    /// configured — the endpoint answers 503 instead of fabricating data.
+    pub process_contention: Option<Arc<ContentionProbe>>,
 }
 
 /// Every application route the daemon serves over the API listener.
@@ -1854,6 +1909,7 @@ fn base_router() -> Router<Arc<AppState>> {
         .route("/processes", get(get_processes))
         .route("/processes/live", get(stream_processes_live))
         .route("/processes/{pid}", get(get_process_by_pid))
+        .route("/processes/{pid}/contention", get(get_process_contention))
         .route("/ppid/{ppid}", get(get_by_ppid))
         .route("/graph/{pid}", get(get_graph))
         .route("/events", get(stream_events))
@@ -2862,6 +2918,7 @@ mod tests {
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
             watch_latency_tx: None,
+            process_contention: None,
         })
     }
 
@@ -2886,6 +2943,7 @@ mod tests {
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
             watch_latency_tx: None,
+            process_contention: None,
         })
     }
 
@@ -3253,6 +3311,7 @@ mod tests {
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
             watch_latency_tx: None,
+            process_contention: None,
         })
     }
 
@@ -3304,6 +3363,7 @@ mod tests {
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
             watch_latency_tx: None,
+            process_contention: None,
         });
         let app = all_routes(Arc::clone(&app_state));
         let resp = app
@@ -3368,6 +3428,7 @@ mod tests {
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
             watch_latency_tx: None,
+            process_contention: None,
         });
         let Json(resp) = super::status_handler(State(app_state)).await;
         let val = serde_json::to_value(resp).unwrap();
@@ -3421,6 +3482,7 @@ mod tests {
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
             watch_latency_tx: None,
+            process_contention: None,
         });
 
         let Json(resp) = super::metrics_handler(State(app_state)).await;
@@ -3457,6 +3519,7 @@ mod tests {
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
             watch_latency_tx: None,
+            process_contention: None,
         });
         let router = super::metrics_routes(Arc::clone(&app_state));
         let response = router
@@ -3496,6 +3559,7 @@ mod tests {
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
             watch_latency_tx: None,
+            process_contention: None,
         });
         let router = super::metrics_routes(Arc::clone(&app_state));
         let response = router
@@ -3549,6 +3613,7 @@ mod tests {
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
             watch_latency_tx: None,
+            process_contention: None,
         });
         let router = super::all_routes(app_state);
         let response = router
@@ -3655,6 +3720,7 @@ mod tests {
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
             watch_latency_tx: None,
+            process_contention: None,
         });
         let router = super::all_routes(app_state);
         let response = router
@@ -3706,6 +3772,7 @@ mod tests {
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
             watch_latency_tx: None,
+            process_contention: None,
         });
 
         for request in [
@@ -3777,6 +3844,7 @@ mod tests {
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
             watch_latency_tx: None,
+            process_contention: None,
         });
         let router = super::all_routes(app_state);
         let response = router
@@ -3816,6 +3884,7 @@ mod tests {
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
             watch_latency_tx: None,
+            process_contention: None,
         });
         let router = super::all_routes(app_state);
         let response = router
@@ -3855,6 +3924,7 @@ mod tests {
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
             watch_latency_tx: None,
+            process_contention: None,
         });
         let router = super::all_routes(app_state);
         let response = router
@@ -4133,6 +4203,7 @@ mod tests {
             k8s: None,
             blame_metrics: Arc::clone(&blame),
             watch_latency_tx: None,
+            process_contention: None,
         });
 
         let response = super::metrics_routes(app_state)
@@ -4418,6 +4489,7 @@ mod tests {
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
             watch_latency_tx: None,
+            process_contention: None,
         });
 
         let get = |uri: String, state: Arc<AppState>| async move {
@@ -4533,6 +4605,7 @@ mod tests {
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
             watch_latency_tx: None,
+            process_contention: None,
         });
 
         let get = |uri: String, state: Arc<AppState>| async move {
@@ -4861,6 +4934,7 @@ mod tests {
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
             watch_latency_tx: None,
+            process_contention: None,
         });
 
         let response = super::all_routes(app_state)
@@ -5009,6 +5083,7 @@ mod tests {
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
             watch_latency_tx: None,
+            process_contention: None,
         });
 
         let response = super::all_routes(app_state)
@@ -5120,6 +5195,7 @@ mod tests {
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
             watch_latency_tx: None,
+            process_contention: None,
         });
 
         let unauthenticated = || {
@@ -5252,6 +5328,7 @@ mod tests {
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
             watch_latency_tx: armed.then_some(tx),
+            process_contention: None,
         });
         (app_state, rx)
     }
@@ -5414,5 +5491,149 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    /// AppState with a contention probe over a fake /proc root: pid 4242
+    /// exists with readable schedstat (zero wait), a stat file carrying
+    /// starttime 424242, and a boot_id file. Every request measures
+    /// on demand with a 50ms probe — no monitor, no seeding.
+    fn contention_app_state() -> (Arc<AppState>, tempfile::TempDir) {
+        let proc_dir = tempfile::tempdir().unwrap();
+        let pid_dir = proc_dir.path().join("4242");
+        std::fs::create_dir_all(pid_dir.join("task/4242")).unwrap();
+        std::fs::write(pid_dir.join("task/4242/schedstat"), "1000000 0 7\n").unwrap();
+        std::fs::write(pid_dir.join("task/4242/comm"), "hog\n").unwrap();
+        // The kernel aliases /proc/<tgid>/schedstat to the leader's task
+        // file; the probe reads the leader path.
+        std::fs::write(pid_dir.join("schedstat"), "1000000 0 7\n").unwrap();
+        std::fs::write(pid_dir.join("comm"), "hog\n").unwrap();
+        // Field 22 (starttime) = 424242.
+        std::fs::write(
+            pid_dir.join("stat"),
+            "4242 (hog) R 1 4242 4242 0 -1 4194304 100 0 0 0 1000 0 0 0 20 0 1 0 424242\n",
+        )
+        .unwrap();
+        let boot_dir = proc_dir.path().join("sys/kernel/random");
+        std::fs::create_dir_all(&boot_dir).unwrap();
+        std::fs::write(boot_dir.join("boot_id"), "test-boot-id\n").unwrap();
+        let probe = Arc::new(
+            cognitod::collectors::runqueue_starvation::ContentionProbe::new(
+                proc_dir.path().to_path_buf(),
+            )
+            .with_probe_interval(Duration::from_millis(50)),
+        );
+        let app_state = Arc::new(AppState {
+            context: Arc::new(ContextStore::new(Duration::from_secs(60), 10, None)),
+            metrics: Arc::new(Metrics::new()),
+            alerts: None,
+            insights: Arc::new(InsightStore::new(16, None)),
+            offline: Arc::new(OfflineGuard::new(false)),
+            transport: "perf",
+            probe_state: ProbeState::disabled(),
+            require_kernel_instrumentation: true,
+            enforcement: None,
+            reasoner: ReasonerConfig::default(),
+            prometheus_enabled: false,
+            alert_history: Arc::new(AlertHistory::new(16)),
+            auth_token: Some("api-secret".to_string()),
+            slack_signing_secret: None,
+            incident_store: None,
+            incident_retention_days: None,
+            k8s: None,
+            blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
+            watch_latency_tx: None,
+            process_contention: Some(probe),
+        });
+        (app_state, proc_dir)
+    }
+
+    #[tokio::test]
+    async fn process_contention_endpoint_measures_on_demand() {
+        let (app_state, _proc_dir) = contention_app_state();
+        let response = super::all_routes(app_state)
+            .oneshot(
+                Request::builder()
+                    .uri("/processes/4242/contention")
+                    .header("Authorization", "Bearer api-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // The finding's identity must match the requested PID.
+        assert_eq!(v["tgid"], 4242);
+        // Birth identity rides with the finding so the consumer can bind
+        // it to one process incarnation.
+        assert_eq!(v["start_ticks"], 424242);
+        assert_eq!(v["boot_id"], "test-boot-id");
+        assert_eq!(v["label"], "measured");
+        // Zero runqueue wait is a measured healthy — the answer the
+        // incident path structurally cannot give.
+        assert_eq!(v["verdict"], "healthy");
+        assert_eq!(v["wait_ms"], 0.0);
+        assert_eq!(v["measured_thread_count"], 1);
+        assert_eq!(v["comm"], "hog");
+        // The window is the real probe spacing, positive and finite.
+        let window = v["window_secs"].as_f64().expect("window_secs is a number");
+        assert!(window > 0.0 && window.is_finite(), "got {window}");
+    }
+
+    #[tokio::test]
+    async fn process_contention_endpoint_404_is_typed_absence() {
+        let (app_state, _proc_dir) = contention_app_state();
+        let response = super::all_routes(app_state)
+            .oneshot(
+                Request::builder()
+                    .uri("/processes/9999/contention")
+                    .header("Authorization", "Bearer api-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // PID 9999: no such process — typed absence, never zero.
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"], "Not found");
+    }
+
+    #[tokio::test]
+    async fn process_contention_endpoint_503_without_schedstat() {
+        let (app_state, proc_dir) = contention_app_state();
+        // PID 4243 exists in the fake /proc but has no schedstat files —
+        // the CONFIG_SCHEDSTATS-off equivalent. Degraded measurement
+        // infrastructure is 503, never 404: "no measurement" must not be
+        // confused with "no contention".
+        std::fs::create_dir(proc_dir.path().join("4243")).unwrap();
+        let response = super::all_routes(app_state)
+            .oneshot(
+                Request::builder()
+                    .uri("/processes/4243/contention")
+                    .header("Authorization", "Bearer api-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn process_contention_endpoint_sits_behind_bearer_auth() {
+        let (app_state, _proc_dir) = contention_app_state();
+        let response = super::all_routes(app_state)
+            .oneshot(
+                Request::builder()
+                    .uri("/processes/4242/contention")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }

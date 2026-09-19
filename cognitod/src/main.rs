@@ -1096,6 +1096,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
     }
 
+    // Per-process contention probe: GET /processes/{pid}/contention
+    // measures the named PID on demand (two schedstat samples ~1s
+    // apart), independent of the monitor's top-50 poll loop.
+    let contention_probe = std::sync::Arc::new(
+        cognitod::collectors::runqueue_starvation::ContentionProbe::new(std::path::PathBuf::from(
+            "/proc",
+        )),
+    );
+
     // Runqueue starvation monitor: per-thread schedstat runqueue-wait Δ
     // over a 10s window, polled every 5s. The victim's wait is measured;
     // offender identity is eBPF-only and stays unlabeled. Degrades
@@ -1623,6 +1632,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .iter()
             .any(|t| t.is_valid())
             .then_some(watch_latency_tx),
+        // The on-demand contention probe for
+        // GET /processes/{pid}/contention.
+        process_contention: Some(contention_probe),
     });
 
     let listen_addr = std::env::var("LINNIX_LISTEN_ADDR").unwrap_or(config.api.listen_addr.clone());
