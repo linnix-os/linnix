@@ -355,6 +355,13 @@ impl ContentionProbe {
         if !pid_dir.is_dir() {
             return Err(ContentionMeasureError::NotFound);
         }
+        // Bind the incarnation before the first sample: if the PID is
+        // recycled during the probe sleep, the directory exists again but
+        // belongs to a different process. A changed (or newly unreadable)
+        // start_ticks means the process we were asked about is gone, and
+        // the measurement is discarded as absence rather than attributed
+        // to the replacement incarnation.
+        let start_ticks = read_stat_start_ticks(&self.proc_root, tgid);
         let t0 = Instant::now();
         // The process must exist AND have readable schedstat: absence of
         // the latter with presence of the former is degraded
@@ -373,7 +380,32 @@ impl ContentionProbe {
         if !pid_dir.is_dir() {
             return Err(ContentionMeasureError::NotFound);
         }
-        let second = sample_process_wait(&self.proc_root, tgid).unwrap_or_default();
+        // A schedstat that was readable before the sleep but is not now —
+        // while the PID still exists — is degraded infrastructure, exactly
+        // like the first sample. Collapsing it to an empty map would
+        // fabricate a healthy zero.
+        let second = match sample_process_wait(&self.proc_root, tgid) {
+            Some(s) => s,
+            None => {
+                return Err(if pid_dir.is_dir() {
+                    ContentionMeasureError::Degraded
+                } else {
+                    ContentionMeasureError::NotFound
+                });
+            }
+        };
+        // Read the display metadata BEFORE the final incarnation check so
+        // the check covers everything the snapshot carries. After the check
+        // below, no further /proc reads occur.
+        let comm = read_task_comm(&self.proc_root, tgid, tgid);
+        // Final incarnation binding, after the second sample: the PID may
+        // have been recycled at any point during the sleep or sampling. A
+        // changed (or newly unreadable) start_ticks means the process we
+        // were asked about is gone, and the measurement is discarded as
+        // absence rather than attributed to the replacement incarnation.
+        if read_stat_start_ticks(&self.proc_root, tgid) != start_ticks {
+            return Err(ContentionMeasureError::NotFound);
+        }
         // The honest window is the actual elapsed sample spacing, not the
         // nominal probe — the verdict fractions apply to what was really
         // measured.
@@ -385,11 +417,12 @@ impl ContentionProbe {
             .unwrap_or(0);
         Ok(ProcessContentionSnapshot {
             tgid,
-            // Birth identity captured in the same call as the measurement,
-            // so the finding can never be rebound to a recycled PID
-            // incarnation at query time.
-            comm: read_task_comm(&self.proc_root, tgid, tgid),
-            start_ticks: read_stat_start_ticks(&self.proc_root, tgid),
+            // Birth identity captured in the same call as the measurement
+            // and verified unchanged after the second sample and metadata
+            // read — with no further /proc reads past the check — so the
+            // finding can never be rebound to a recycled PID incarnation.
+            comm,
+            start_ticks,
             boot_id: self.boot_id.clone(),
             label: "measured",
             verdict: classify_for_window(total_ms, window_secs).as_str(),
@@ -3150,6 +3183,57 @@ mod tests {
             probe.measure(4242).await,
             Err(ContentionMeasureError::Degraded)
         ));
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_pid_recycled_mid_probe() {
+        let procfs = FakeProc::new();
+        procfs.set_thread(4242, 4242, "hog", 0);
+        // PID 4242 "exits" mid-probe and the number is recycled: the
+        // directory still exists afterwards, but start_ticks changes, so
+        // the second sample belongs to a different incarnation. Same
+        // field layout as FakeProc::set_stat_start.
+        let stat_path = procfs.dir.path().join("4242/stat");
+        let recycler = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            std::fs::write(
+                &stat_path,
+                "4242 (comm (with) parens) R 0 0 0 0 0 0 0 0 0 0 1000 0 0 0 0 0 0 0 999999\n",
+            )
+            .unwrap();
+        });
+        let probe = ContentionProbe::new(procfs.dir.path().to_path_buf())
+            .with_probe_interval(Duration::from_millis(300));
+        // Typed absence, not a cross-incarnation measurement: the
+        // process we were asked about is gone.
+        assert!(matches!(
+            probe.measure(4242).await,
+            Err(ContentionMeasureError::NotFound)
+        ));
+        recycler.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn probe_reports_degraded_when_schedstat_vanishes_mid_probe() {
+        let procfs = FakeProc::new();
+        procfs.set_thread(4242, 4242, "hog", 0);
+        // schedstat becomes unreadable after the first sample while the
+        // PID still exists (task dir and the leader-alias schedstat
+        // removed, pid dir kept): degraded infrastructure, never a
+        // fabricated healthy zero.
+        let pid_dir = procfs.dir.path().join("4242");
+        let vanisher = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            std::fs::remove_dir_all(pid_dir.join("task")).unwrap();
+            std::fs::remove_file(pid_dir.join("schedstat")).unwrap();
+        });
+        let probe = ContentionProbe::new(procfs.dir.path().to_path_buf())
+            .with_probe_interval(Duration::from_millis(300));
+        assert!(matches!(
+            probe.measure(4242).await,
+            Err(ContentionMeasureError::Degraded)
+        ));
+        vanisher.join().unwrap();
     }
 
     #[tokio::test]
