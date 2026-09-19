@@ -42,7 +42,9 @@ use crate::metrics::Metrics;
 use crate::types::ProcessAlert;
 use crate::types::SystemSnapshot;
 use cognitod::alerts::Alert;
-use cognitod::collectors::runqueue_starvation::{ContentionOutlet, LatencySample};
+use cognitod::collectors::runqueue_starvation::{
+    ContentionMeasureError, ContentionProbe, LatencySample,
+};
 use cognitod::{Incident, IncidentStats, IncidentStore};
 use linnix_ai_ebpf_common::EventType;
 use sysinfo::{Pid, System};
@@ -539,58 +541,48 @@ async fn get_process_by_pid(
     }
 }
 
-/// GET /processes/{pid}/contention — the per-process runqueue-wait
-/// finding from the userspace schedstat detector (label `measured`).
+/// GET /processes/{pid}/contention — an on-demand per-process
+/// runqueue-wait measurement from the userspace schedstat detector
+/// (label `measured`).
 ///
-/// This exposes the same measurement the `cpu_starvation` incidents come
-/// from, read-only per PID — a daemon surface addition, not a new
-/// sensor. Detection thresholds and incident behavior are unchanged.
+/// Every request measures: two `schedstat` samples ~1s apart for the
+/// named PID's threads, per-thread Δ aggregated to the process. No
+/// top-50 gate, no incident store, no monitor dependency — a process
+/// that exists gets a fresh answer every time, including "healthy",
+/// which the thresholded incident path structurally cannot express.
 ///
-/// Typed absence, never zero: 404 when the PID doesn't exist or when it
-/// exists but the monitor hasn't measured it (an explicit query pins the
-/// PID so the next polls measure it, exactly like configured watch
-/// targets bypass the top-50 gate). 503 when the detector is degraded
-/// (schedstat unreadable) or not running, so "no measurement
-/// infrastructure" is never confused with "this PID has no contention".
+/// Typed absence, never zero: 404 when the PID doesn't exist (checked
+/// before and after the probe, so a process that exits mid-probe is
+/// absence, not data). 503 when the PID exists but no `schedstat` is
+/// readable (`CONFIG_SCHEDSTATS` off) or the probe isn't configured, so
+/// "no measurement infrastructure" is never confused with "this PID has
+/// no contention".
 async fn get_process_contention(
     State(app_state): State<Arc<AppState>>,
     Path(pid): Path<u32>,
 ) -> impl IntoResponse {
-    let outlet = match app_state.process_contention.as_ref() {
-        Some(outlet) => outlet,
+    let probe = match app_state.process_contention.as_ref() {
+        Some(probe) => probe,
         None => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "process contention monitoring is not running"})),
+                Json(serde_json::json!({"error": "process contention measurement is not configured"})),
             )
                 .into_response();
         }
     };
-    if outlet.degraded() {
-        return (
+    match probe.measure(pid).await {
+        Ok(snapshot) => (StatusCode::OK, Json(snapshot)).into_response(),
+        Err(ContentionMeasureError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Not found"})),
+        )
+            .into_response(),
+        Err(ContentionMeasureError::Degraded) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
                 serde_json::json!({"error": "schedstat unavailable; contention measurement degraded"}),
             ),
-        )
-            .into_response();
-    }
-    // The outlet and the monitor share a /proc root, so both sides agree
-    // on what "exists" means.
-    if !outlet.proc_root().join(pid.to_string()).is_dir() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Not found"})),
-        )
-            .into_response();
-    }
-    // An explicit query is explicit intent to measure this process.
-    outlet.pin(pid);
-    match outlet.snapshot(pid) {
-        Some(snapshot) => (StatusCode::OK, Json(snapshot)).into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Not found"})),
         )
             .into_response(),
     }
@@ -1894,12 +1886,12 @@ pub struct AppState {
     /// `None` when watch mode is disarmed — the endpoint then answers 503
     /// instead of silently eating samples.
     pub watch_latency_tx: Option<mpsc::Sender<LatencySample>>,
-    /// Per-process contention snapshots published by the runqueue
-    /// starvation monitor (the same measurement its `cpu_starvation`
-    /// incidents come from), read by `GET /processes/{pid}/contention`.
-    /// `None` when the monitor isn't running — the endpoint answers 503
-    /// instead of fabricating data.
-    pub process_contention: Option<Arc<ContentionOutlet>>,
+    /// On-demand per-process contention probe for
+    /// `GET /processes/{pid}/contention`: two `schedstat` samples ~1s
+    /// apart for the named PID, measured synchronously per request. No
+    /// monitor dependency, no top-50 gate. `None` when the probe isn't
+    /// configured — the endpoint answers 503 instead of fabricating data.
+    pub process_contention: Option<Arc<ContentionProbe>>,
 }
 
 /// Every application route the daemon serves over the API listener.
@@ -5501,28 +5493,35 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
     }
 
-    /// AppState with a seeded contention outlet: a fake /proc root
-    /// containing pid 4242, whose snapshot the outlet already holds.
-    fn contention_app_state() -> (Arc<AppState>, tempfile::TempDir, Arc<ContentionOutlet>) {
+    /// AppState with a contention probe over a fake /proc root: pid 4242
+    /// exists with readable schedstat (zero wait), a stat file carrying
+    /// starttime 424242, and a boot_id file. Every request measures
+    /// on demand with a 50ms probe — no monitor, no seeding.
+    fn contention_app_state() -> (Arc<AppState>, tempfile::TempDir) {
         let proc_dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(proc_dir.path().join("4242")).unwrap();
-        let outlet = Arc::new(ContentionOutlet::new(proc_dir.path().to_path_buf()));
-        outlet.publish(std::collections::HashMap::from([(
-            4242u32,
-            cognitod::collectors::runqueue_starvation::ProcessContentionSnapshot {
-                tgid: 4242,
-                comm: Some("hog".to_string()),
-                start_ticks: Some(424242),
-                boot_id: Some("test-boot-id".to_string()),
-                label: "measured",
-                verdict: "starvation_warning",
-                wait_ms: 2500.0,
-                worst_thread_wait_ms: 2500.0,
-                measured_thread_count: 1,
-                window_secs: 10.0,
-                measured_at_unix: 1_700_000_000,
-            },
-        )]));
+        let pid_dir = proc_dir.path().join("4242");
+        std::fs::create_dir_all(pid_dir.join("task/4242")).unwrap();
+        std::fs::write(pid_dir.join("task/4242/schedstat"), "1000000 0 7\n").unwrap();
+        std::fs::write(pid_dir.join("task/4242/comm"), "hog\n").unwrap();
+        // The kernel aliases /proc/<tgid>/schedstat to the leader's task
+        // file; the probe reads the leader path.
+        std::fs::write(pid_dir.join("schedstat"), "1000000 0 7\n").unwrap();
+        std::fs::write(pid_dir.join("comm"), "hog\n").unwrap();
+        // Field 22 (starttime) = 424242.
+        std::fs::write(
+            pid_dir.join("stat"),
+            "4242 (hog) R 1 4242 4242 0 -1 4194304 100 0 0 0 1000 0 0 0 20 0 1 0 424242\n",
+        )
+        .unwrap();
+        let boot_dir = proc_dir.path().join("sys/kernel/random");
+        std::fs::create_dir_all(&boot_dir).unwrap();
+        std::fs::write(boot_dir.join("boot_id"), "test-boot-id\n").unwrap();
+        let probe = Arc::new(
+            cognitod::collectors::runqueue_starvation::ContentionProbe::new(
+                proc_dir.path().to_path_buf(),
+            )
+            .with_probe_interval(Duration::from_millis(50)),
+        );
         let app_state = Arc::new(AppState {
             context: Arc::new(ContextStore::new(Duration::from_secs(60), 10, None)),
             metrics: Arc::new(Metrics::new()),
@@ -5543,14 +5542,14 @@ mod tests {
             k8s: None,
             blame_metrics: Arc::new(cognitod::attribution::BlameMetrics::new("test-node")),
             watch_latency_tx: None,
-            process_contention: Some(Arc::clone(&outlet)),
+            process_contention: Some(probe),
         });
-        (app_state, proc_dir, outlet)
+        (app_state, proc_dir)
     }
 
     #[tokio::test]
-    async fn process_contention_endpoint_serves_measured_snapshot() {
-        let (app_state, _proc_dir, _outlet) = contention_app_state();
+    async fn process_contention_endpoint_measures_on_demand() {
+        let (app_state, _proc_dir) = contention_app_state();
         let response = super::all_routes(app_state)
             .oneshot(
                 Request::builder()
@@ -5571,16 +5570,21 @@ mod tests {
         assert_eq!(v["start_ticks"], 424242);
         assert_eq!(v["boot_id"], "test-boot-id");
         assert_eq!(v["label"], "measured");
-        assert_eq!(v["verdict"], "starvation_warning");
-        assert_eq!(v["wait_ms"], 2500.0);
+        // Zero runqueue wait is a measured healthy — the answer the
+        // incident path structurally cannot give.
+        assert_eq!(v["verdict"], "healthy");
+        assert_eq!(v["wait_ms"], 0.0);
         assert_eq!(v["measured_thread_count"], 1);
         assert_eq!(v["comm"], "hog");
+        // The window is the real probe spacing, positive and finite.
+        let window = v["window_secs"].as_f64().expect("window_secs is a number");
+        assert!(window > 0.0 && window.is_finite(), "got {window}");
     }
 
     #[tokio::test]
     async fn process_contention_endpoint_404_is_typed_absence() {
-        let (app_state, _proc_dir, outlet) = contention_app_state();
-        let response = super::all_routes(Arc::clone(&app_state))
+        let (app_state, _proc_dir) = contention_app_state();
+        let response = super::all_routes(app_state)
             .oneshot(
                 Request::builder()
                     .uri("/processes/9999/contention")
@@ -5590,11 +5594,21 @@ mod tests {
             )
             .await
             .unwrap();
-        // PID 9999: no such process — typed absence.
+        // PID 9999: no such process — typed absence, never zero.
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        // PID 4243: exists in the fake /proc but has no measurement —
-        // typed absence too.
-        std::fs::create_dir(outlet.proc_root().join("4243")).unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"], "Not found");
+    }
+
+    #[tokio::test]
+    async fn process_contention_endpoint_503_without_schedstat() {
+        let (app_state, proc_dir) = contention_app_state();
+        // PID 4243 exists in the fake /proc but has no schedstat files —
+        // the CONFIG_SCHEDSTATS-off equivalent. Degraded measurement
+        // infrastructure is 503, never 404: "no measurement" must not be
+        // confused with "no contention".
+        std::fs::create_dir(proc_dir.path().join("4243")).unwrap();
         let response = super::all_routes(app_state)
             .oneshot(
                 Request::builder()
@@ -5605,34 +5619,12 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["error"], "Not found");
-    }
-
-    #[tokio::test]
-    async fn process_contention_endpoint_503_when_degraded() {
-        let (app_state, _proc_dir, outlet) = contention_app_state();
-        outlet.set_degraded(true);
-        let response = super::all_routes(app_state)
-            .oneshot(
-                Request::builder()
-                    .uri("/processes/4242/contention")
-                    .header("Authorization", "Bearer api-secret")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        // Degraded measurement infrastructure is 503, never 404: "no
-        // measurement" must not be confused with "no contention".
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
     async fn process_contention_endpoint_sits_behind_bearer_auth() {
-        let (app_state, _proc_dir, _outlet) = contention_app_state();
+        let (app_state, _proc_dir) = contention_app_state();
         let response = super::all_routes(app_state)
             .oneshot(
                 Request::builder()

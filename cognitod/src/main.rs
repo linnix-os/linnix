@@ -1096,13 +1096,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
     }
 
-    // Per-process contention outlet: the runqueue monitor publishes one
-    // snapshot per measured process per poll; GET
-    // /processes/{pid}/contention reads them. This is the same
-    // measurement the cpu_starvation incidents come from, exposed
-    // read-only per PID — a daemon surface addition, not a new sensor.
-    let contention_outlet = std::sync::Arc::new(
-        cognitod::collectors::runqueue_starvation::ContentionOutlet::new(std::path::PathBuf::from(
+    // Per-process contention probe: GET /processes/{pid}/contention
+    // measures the named PID on demand (two schedstat samples ~1s
+    // apart), independent of the monitor's top-50 poll loop.
+    let contention_probe = std::sync::Arc::new(
+        cognitod::collectors::runqueue_starvation::ContentionProbe::new(std::path::PathBuf::from(
             "/proc",
         )),
     );
@@ -1130,9 +1128,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // Watch targets from `[watch]` (invalid entries are skipped with a
         // warning inside the builder) plus the p99 sample channel.
         .with_watch_config(config.watch.clone())
-        .with_latency_receiver(watch_latency_rx)
-        // Per-process contention snapshots for the queryable endpoint.
-        .with_contention_outlet(std::sync::Arc::clone(&contention_outlet));
+        .with_latency_receiver(watch_latency_rx);
         tokio::spawn(async move {
             monitor.run().await;
         });
@@ -1636,9 +1632,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .iter()
             .any(|t| t.is_valid())
             .then_some(watch_latency_tx),
-        // The runqueue monitor publishes per-process contention snapshots
-        // here for GET /processes/{pid}/contention.
-        process_contention: Some(contention_outlet),
+        // The on-demand contention probe for
+        // GET /processes/{pid}/contention.
+        process_contention: Some(contention_probe),
     });
 
     let listen_addr = std::env::var("LINNIX_LISTEN_ADDR").unwrap_or(config.api.listen_addr.clone());
