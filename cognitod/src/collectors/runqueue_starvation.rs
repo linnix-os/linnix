@@ -380,9 +380,6 @@ impl ContentionProbe {
         if !pid_dir.is_dir() {
             return Err(ContentionMeasureError::NotFound);
         }
-        if read_stat_start_ticks(&self.proc_root, tgid) != start_ticks {
-            return Err(ContentionMeasureError::NotFound);
-        }
         // A schedstat that was readable before the sleep but is not now —
         // while the PID still exists — is degraded infrastructure, exactly
         // like the first sample. Collapsing it to an empty map would
@@ -397,6 +394,18 @@ impl ContentionProbe {
                 });
             }
         };
+        // Read the display metadata BEFORE the final incarnation check so
+        // the check covers everything the snapshot carries. After the check
+        // below, no further /proc reads occur.
+        let comm = read_task_comm(&self.proc_root, tgid, tgid);
+        // Final incarnation binding, after the second sample: the PID may
+        // have been recycled at any point during the sleep or sampling. A
+        // changed (or newly unreadable) start_ticks means the process we
+        // were asked about is gone, and the measurement is discarded as
+        // absence rather than attributed to the replacement incarnation.
+        if read_stat_start_ticks(&self.proc_root, tgid) != start_ticks {
+            return Err(ContentionMeasureError::NotFound);
+        }
         // The honest window is the actual elapsed sample spacing, not the
         // nominal probe — the verdict fractions apply to what was really
         // measured.
@@ -408,10 +417,11 @@ impl ContentionProbe {
             .unwrap_or(0);
         Ok(ProcessContentionSnapshot {
             tgid,
-            // Birth identity captured in the same call as the measurement —
-            // and verified unchanged across the probe sleep — so the finding
-            // can never be rebound to a recycled PID incarnation.
-            comm: read_task_comm(&self.proc_root, tgid, tgid),
+            // Birth identity captured in the same call as the measurement
+            // and verified unchanged after the second sample and metadata
+            // read — with no further /proc reads past the check — so the
+            // finding can never be rebound to a recycled PID incarnation.
+            comm,
             start_ticks,
             boot_id: self.boot_id.clone(),
             label: "measured",
