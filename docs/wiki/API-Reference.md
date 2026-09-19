@@ -80,17 +80,19 @@ curl http://localhost:3000/processes | jq
 ```
 
 #### GET /processes/{pid}/contention
-Returns the per-process runqueue-wait finding from the userspace schedstat
-detector (label `measured`): ms the process's threads spent waiting on a
-runqueue inside the 10s measurement window, plus the deterministic verdict
-against the frozen 2000/5000 ms thresholds. This is the same measurement the
-`cpu_starvation` incidents come from, exposed read-only per PID — not a new
-sensor. An explicit query pins the PID so subsequent polls measure it even
-outside the top-50 CPU gate.
+Measures the named PID's runqueue wait on demand (label `measured`): two
+`schedstat` samples ~1s apart, per-thread wait deltas aggregated to the
+process, plus the deterministic verdict. The frozen 2000/5000 ms per 10s
+thresholds are scaled to the actual measured window (0.2/0.5 window
+fractions). Every request measures fresh — no top-50 gate, no incident
+store, no warm-up, no PID pinning; a process that exists gets a measured
+answer every time, including measured healthy.
 
-- `404` — the PID doesn't exist, or exists but hasn't been measured yet
-  (typed absence, never a fabricated zero).
-- `503` — the detector is degraded (schedstat unreadable) or not running.
+- `404` — the PID doesn't exist (checked before and after the probe, so a
+  mid-probe exit — or a PID recycled mid-probe — is typed absence, never
+  data attributed to the wrong incarnation).
+- `503` — the PID exists but no `schedstat` is readable (degraded
+  infrastructure, e.g. `CONFIG_SCHEDSTATS` off), or the probe isn't running.
 
 ```bash
 curl http://localhost:3000/processes/1234/contention | jq
