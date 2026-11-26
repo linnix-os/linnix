@@ -97,6 +97,8 @@ Great first contributions often include:
 
 ## Licensing
 
-By contributing, you agree that your work is licensed under the repository’s AGPL-3.0 license (and GPL-2.0 OR MIT for eBPF programs). Please ensure you have permission to contribute any code or assets you submit.
+Contributions are accepted under the [Linnix Contributor License Agreement](CLA.md). On your first pull request, the CLA bot asks you to sign it by commenting `I have read the CLA Document and I hereby sign the CLA`. You only sign once.
+
+The CLA lets the project ship your work under its open-source licenses (AGPL-3.0, and GPL-2.0 OR MIT for eBPF programs) and under commercial licenses. You keep your copyright. Please make sure you have the right to contribute any code or assets you submit.
 
 Thanks again for helping build the future of AI-assisted observability! 🚀
