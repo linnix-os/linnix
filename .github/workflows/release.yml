@@ -7,10 +7,6 @@ on:
 
 permissions:
   contents: write
-  # Sigstore-backed build provenance for every release asset
-  # (verify with `gh attestation verify <file> --repo linnix-os/linnix`).
-  id-token: write
-  attestations: write
 
 jobs:
   build-packages:
@@ -152,6 +148,12 @@ jobs:
     name: Create GitHub Release
     needs: build-packages
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # Sigstore-backed build provenance for every release asset
+      # (verify with `gh attestation verify <file> --repo linnix-os/linnix`).
+      id-token: write
+      attestations: write
     
     steps:
       - name: Checkout code

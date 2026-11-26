@@ -26,8 +26,8 @@ sha256sum -c SHA256SUMS --ignore-missing
 ```
 
 Attestations can also be checked offline: download the bundle with
-`gh attestation download` and verify it with `cosign verify-blob-attestation`
-or `gh attestation verify --bundle`. See the
+`gh attestation download`, then verify it with `gh attestation verify --bundle`.
+See the
 [GitHub artifact attestation docs](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations).
 
 ## Container images

@@ -44,12 +44,15 @@ The systemd unit runs with only `CAP_BPF` and `CAP_PERFMON`
 `ProtectKernelTunables` and `ProtectControlGroups`. Writable paths are limited
 to `/var/lib/linnix` and `/var/log/linnix`.
 
-Because `CAP_KILL` is not in the bounding set, enforcement actions cannot signal
-other users' processes under this unit, even if enforcement is enabled.
+The unit sets no `User=`, so it runs as UID 0. `CAP_KILL` is not in the
+bounding set, so an enforcement action cannot signal processes owned by
+*other* UIDs. It can still signal root-owned processes, which covers most
+system daemons. `SafetyGuard` (section 3) is what protects those.
 
-The unit sets no `CPUQuota` or `MemoryMax`. Add them through a drop-in if you
-want hard ceilings outside Kubernetes. Leave `LimitMEMLOCK=infinity` in place,
-because eBPF maps need it on kernels that still charge memlock.
+The unit sets no `CPUQuota` or `MemoryMax`. You can add them through a drop-in
+for hard ceilings outside Kubernetes. On 5.11+ kernels, BPF map memory is
+charged to the agent's memory cgroup, so a tight `MemoryMax` can make map
+creation fail at startup. Leave headroom above the agent's steady-state RSS.
 
 ### Kernel requirements
 
@@ -60,9 +63,11 @@ crash-loop.
 
 ## 2. eBPF safety
 
-- Every program passes the kernel's BPF verifier at load time. The verifier
-  rejects unbounded loops, out-of-bounds memory access and invalid helper
-  calls. A program that would crash the kernel cannot be loaded.
+- Every program must pass the kernel's BPF verifier at load time. The verifier
+  is designed to reject unbounded loops, out-of-bounds memory access and
+  invalid helper calls. Verifier bugs do occur, so keep node kernels patched.
+- kprobes on hot kernel paths add per-event overhead. Measured numbers are in
+  [OVERHEAD.md](../OVERHEAD.md).
 - The programs attach to tracepoints, BTF tracepoints and kprobes for observation. They do not
   modify packets, syscalls or scheduler decisions.
 - Data reaches userspace through ring buffers. If userspace falls behind,
@@ -74,8 +79,14 @@ crash-loop.
 | Mode | Behaviour |
 |---|---|
 | `circuit_breaker.mode = "monitor"` (**default**) | Detects incidents and *proposes* actions. Never executes them. |
-| `mode = "enforce"`, `require_human_approval = true` (**default**) | Executes a proposed kill only after a human approves it through the API. |
+| `mode = "enforce"`, `require_human_approval = true` (**default**) | Executes a proposed kill only after a human approves it through the API, or through the Slack "Approve" button when Slack interactivity is configured. |
 | `mode = "enforce"`, `require_human_approval = false` | Automatic. Opt-in only. |
+
+Slack approvals arrive at `POST /api/slack/interactions` on the API listener.
+They are rejected unless the request carries a valid Slack signature
+(`[notifications.slack] signing_secret`). The approver is recorded as a
+generic `slack_user`, not as the individual Slack identity. If you need
+per-person accountability, approve through the API instead.
 
 Every kill goes through `SafetyGuard::is_safe_to_kill`
 (`cognitod/src/enforcement/safety.rs`), which refuses PID ≤ 1, the agent
@@ -109,10 +120,8 @@ Notes:
 - `[outputs] pagerduty` is a config flag with no network sender in `cognitod`
   today.
 - **`runtime.offline = true` currently gates only the `/insights` LLM call.**
-  It does not stop the incident analyzer, Slack, Apprise or cloud export. To
-  guarantee zero egress, disable those sections. Use
-  [`k8s/hardening/networkpolicy-egress.yaml`](../../k8s/hardening/networkpolicy-egress.yaml) as
-  the enforcement backstop.
+  It does not stop the incident analyzer, Slack, Apprise or cloud export.
+  For zero egress, disable those sections.
 
 Local subprocesses the agent may run: `logger` (alert syslog), `dmesg` (OOM
 witness), `k3s --version` (environment detection), `apprise` (only when
@@ -125,6 +134,18 @@ all egress except DNS and the API server. Commented blocks cover cloud export
 and Slack. Set the API server `ipBlock` placeholder for your cluster before
 applying it. Ingress is restricted separately by
 [`k8s/networkpolicy.yaml`](../../k8s/networkpolicy.yaml).
+
+**What this policy does and doesn't protect against.** It stops a
+misconfigured or newly enabled sink from sending data off the cluster. It does
+**not** contain a compromised agent. Under the shipped DaemonSet
+(`privileged: true`, `hostPID: true`) the agent is effectively root on the
+node: it can enter the host network namespace and bypass any pod-level
+NetworkPolicy. Treat the agent's image and release provenance (see
+[verifying-releases.md](verifying-releases.md)) as the control for that risk.
+Node-level egress firewalling is the backstop.
+
+`docker-compose.yml` runs the agent with `network_mode: host`, so NetworkPolicy
+does not apply there.
 
 ## 5. Listeners
 

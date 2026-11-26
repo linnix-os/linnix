@@ -31,7 +31,7 @@ services:
     network_mode: host
     pid: host
 
-    # Minimal capabilities (requires Linux 5.8+)
+    # Minimal capabilities (requires Linux 5.12+ x86_64 / 5.18+ arm64)
     cap_add:
       - BPF
       - PERFMON
