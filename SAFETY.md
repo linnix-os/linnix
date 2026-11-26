@@ -13,17 +13,15 @@ You can deploy Linnix to 1,000 nodes without fear of it acting as a "loose canno
 
 ## 2. Architecture Safety
 
-### Minimal Privileges
-Linnix does not run as a privileged container if configured correctly. It requires specific Linux capabilities:
-*   `CAP_BPF`: To load eBPF programs.
-*   `CAP_PERFMON` (or `CAP_SYS_ADMIN` on older kernels): To read trace events.
-*   `CAP_NET_ADMIN`: Only if network monitoring is enabled.
+### Privileges
+*   **systemd**: the shipped unit runs with only `CAP_BPF` and `CAP_PERFMON`, plus systemd sandboxing (`ProtectSystem=strict`, `NoNewPrivileges`, ...).
+*   **Kubernetes**: the shipped DaemonSet currently runs `privileged: true` with `hostPID`. A capabilities-only variant is documented but not yet tested in CI.
 
-It does **not** require full `privileged: true` access to the host filesystem.
+Kernel floor: Linux 5.12+ (x86_64) / 5.18+ (arm64) with BTF. See [docs/security/blast-radius.md](docs/security/blast-radius.md) for the full privilege, egress and listener inventory.
 
 ### Resource Limits (The "Watcher" shouldn't kill the "Watched")
 *   **CPU Overhead**: Target <1% CPU usage. We use eBPF ring buffers to avoid expensive context switches.
-*   **Memory Cap**: The agent is configured with strict memory limits. If Linnix itself leaks memory, it will restart without affecting the host.
+*   **Memory Cap**: The Kubernetes DaemonSet sets hard limits (`500m` CPU, `512Mi` memory), so a leak in Linnix restarts the pod without affecting the host. `runtime.rss_cap_mb` and `cpu_target_pct` only log warnings; under systemd, add `MemoryMax`/`CPUQuota` through a drop-in for hard ceilings.
 
 ## 3. Enforcement Safety (Opt-In)
 

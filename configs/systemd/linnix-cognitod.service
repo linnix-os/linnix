@@ -20,7 +20,7 @@ Environment=LLM_ENDPOINT=http://127.0.0.1:8090/v1/chat/completions
 Environment=LLM_MODEL=linnix-qwen-v1
 Environment=RUST_LOG=info
 
-# Security: Minimal capabilities only (requires Linux 5.8+)
+# Security: Minimal capabilities only (requires Linux 5.12+ x86_64 / 5.18+ arm64)
 AmbientCapabilities=CAP_BPF CAP_PERFMON
 CapabilityBoundingSet=CAP_BPF CAP_PERFMON
 

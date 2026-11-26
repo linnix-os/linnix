@@ -119,6 +119,7 @@ EXPOSE 3000 9464
 HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:9464/readyz || exit 1
 
-# Security: runs as root with minimal capabilities (CAP_BPF + CAP_PERFMON)
-# Docker capabilities require root user. See SECURITY.md for details.
+# Security: runs as root. Capabilities are granted by the runtime, not the
+# image: docker-compose adds BPF/PERFMON/SYS_ADMIN, the k8s DaemonSet runs
+# privileged. See docs/security/blast-radius.md.
 CMD ["cognitod", "--config", "/etc/linnix/linnix.toml", "--handler", "rules:/etc/linnix/rules.yaml"]

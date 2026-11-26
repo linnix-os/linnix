@@ -7,11 +7,10 @@ Linnix is designed with a "Safety First" architecture. As an eBPF-based agent ru
 
 Cognitod requires the following capabilities to function:
 
-*   **`CAP_BPF`** (or `CAP_SYS_ADMIN` on older kernels): Required to load eBPF programs into the kernel.
-*   **`CAP_PERFMON`** (or `CAP_SYS_ADMIN`): Required to attach probes to kernel tracepoints and read from perf buffers.
-*   **`CAP_NET_ADMIN`**: Required only if network traffic shaping/enforcement is enabled (currently disabled by default).
+*   **`CAP_BPF`**: Required to load eBPF programs into the kernel.
+*   **`CAP_PERFMON`**: Required to attach probes to kernel tracepoints and read from ring buffers.
 
-We recommend running Cognitod as a systemd service with these specific capabilities rather than full root, where possible.
+The kernel floor is Linux 5.12+ (x86_64) / 5.18+ (arm64), so `CAP_BPF` is always available and the older `CAP_SYS_ADMIN` fallback does not apply. The shipped systemd unit uses only these two capabilities. The shipped Kubernetes DaemonSet currently runs `privileged: true`; see [docs/security/blast-radius.md](docs/security/blast-radius.md).
 
 ## Unsafe Code Audit
 
@@ -22,6 +21,7 @@ Linnix uses Rust for memory safety. However, `unsafe` blocks are necessary for i
 | `runtime/stream_listener.rs` | `ptr::read_unaligned`: Reading raw bytes from the eBPF ring buffer. Validated by BPF verifier. |
 | `bpf_config.rs` | `libc::sysconf`: querying system page size. Standard FFI. |
 | `config.rs` | `unsafe impl Pod`: Marker trait for configuration structs to be safely cast to bytes for BPF maps. |
+| `runtime/stream_listener.rs` | `AsyncFd::register`: registering perf-buffer fds with Tokio. Sound because `PerfEventArrayBuffer` owns its fd for its whole lifetime. |
 
 ## Data Privacy
 
@@ -31,9 +31,14 @@ Linnix uses Rust for memory safety. However, `unsafe` blocks are necessary for i
 *   **Process Info**: Command lines (sanitized).
 
 ### Data Egress
-*   **Default**: No data leaves the node. All analysis is local.
-*   **Slack**: If configured, alerts are sent to your Slack webhook.
-*   **Redaction**: You can enable `privacy.redact_sensitive_data = true` in `linnix.toml` to hash Pod names and Namespaces in alerts.
+*   **Default**: No data leaves the cluster. The LLM reasoner is enabled by default but targets a local model server (`localhost:8090`); pointing `[reasoner] endpoint` at a hosted API sends incident data to that provider.
+*   **Opt-in**: Slack, Apprise and Linnix Cloud export send data only when configured.
+*   **Inventory**: every outbound destination, its config key and default are listed in [docs/security/blast-radius.md](docs/security/blast-radius.md). `k8s/hardening/networkpolicy-egress.yaml` enforces default-deny egress.
+*   **Redaction**: `privacy.redact_sensitive_data` is parsed from `linnix.toml` but is **not yet applied** to any output. Pod names and namespaces appear unhashed in alerts. Do not rely on it.
+
+## Release Integrity
+
+Release assets and container images carry Sigstore-backed build provenance attestations, and releases include CycloneDX SBOMs. See [docs/security/verifying-releases.md](docs/security/verifying-releases.md).
 
 ## Reporting Vulnerabilities
 

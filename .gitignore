@@ -104,6 +104,8 @@ docs/images/README.md
 !docs/AWS_EC2_DEPLOYMENT.md
 !docs/prometheus-integration.md
 !docs/MCP.md
+# Public security packet (blast radius, release verification)
+!docs/security/
 ROADMAP.md
 run_manual.sh
 run-cognitod-k8s.sh

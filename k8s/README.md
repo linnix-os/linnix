@@ -18,6 +18,10 @@ This will create:
 - `DaemonSet/linnix-agent`: The agent pod on every node.
 - `NetworkPolicy/linnix-agent-ingress`: Restricts access to the privileged API.
 
+Optional hardening (not applied by `kubectl apply -f k8s/`):
+
+- `hardening/networkpolicy-egress.yaml`: Default-deny egress except DNS and the API server. Set the API server `ipBlock` placeholder first (see the comments in the file), then `kubectl apply -f k8s/hardening/`.
+
 ## Configuration
 
 Edit `k8s/configmap.yaml` to change settings.
@@ -40,7 +44,7 @@ NetworkPolicy.
 
 Linnix requires eBPF privileges. The default `daemonset.yaml` uses `privileged: true` for simplicity.
 
-For tighter security, you can disable privileged mode and use capabilities (requires kernel 5.8+ and container runtime support):
+For tighter security, you can disable privileged mode and use capabilities (requires kernel 5.12+ x86_64 / 5.18+ arm64 and container runtime support; not yet tested in CI):
 
 ```yaml
 securityContext:
