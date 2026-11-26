@@ -63,6 +63,11 @@ pub const DETECTION_CPU_STARVATION: &str = "cpu_starvation";
 pub const DETECTION_BLKIO_STALL: &str = "blkio_stall";
 pub const DETECTION_CGROUP_PRESSURE: &str = "cgroup_pressure";
 pub const DETECTION_OOM_KILL: &str = "oom_kill";
+/// Proposed minor extension, same treatment as the four above: one PSI
+/// stall-attribution row (victim pod stalled, this offender pod blamed for a
+/// share of it). Sourced from the `stall_attributions` table, not from
+/// incidents, so it never passes through [`detection_type_for`].
+pub const DETECTION_STALL_ATTRIBUTION: &str = "stall_attribution";
 
 /// Map a local incident `event_type` to a cloud `detection_type`.
 /// Returns `None` for incident kinds the v1 contract cannot describe —

@@ -72,5 +72,7 @@ data:
     # Export process identity (comm, PIDs, cmdline, executable and cgroup
     # paths) inside detection details. Default false: those fields are
     # scrubbed and the edge never sees them. Secrets and environment blocks
-    # are always scrubbed.
+    # are always scrubbed. Not affected by this flag: stall-attribution events
+    # always carry victim and offender pod names and namespaces (workload
+    # identity). Disable [cloud] if pod names must not leave the node.
     # export_process_identity = false
