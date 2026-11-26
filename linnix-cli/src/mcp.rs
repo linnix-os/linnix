@@ -22,7 +22,7 @@
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerConfig};
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -694,11 +694,11 @@ impl LinnixMcp {
 // included, on every single tool call.
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for LinnixMcp {
-    fn get_info(&self) -> ServerInfo {
-        // `ServerInfo` is `#[non_exhaustive]`, so it has to be built by
+    fn get_info(&self) -> ServerConfig {
+        // `ServerConfig` is `#[non_exhaustive]`, so it has to be built by
         // mutation rather than a struct literal — a literal stops compiling
         // the moment rmcp adds a field for a newer protocol revision.
-        let mut info = ServerInfo::default();
+        let mut info = ServerConfig::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.server_info.name = "linnix".to_string();
         info.server_info.version = env!("CARGO_PKG_VERSION").to_string();
