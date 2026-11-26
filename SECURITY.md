@@ -21,6 +21,7 @@ Linnix uses Rust for memory safety. However, `unsafe` blocks are necessary for i
 | `runtime/stream_listener.rs` | `ptr::read_unaligned`: Reading raw bytes from the eBPF ring buffer. Validated by BPF verifier. |
 | `bpf_config.rs` | `libc::sysconf`: querying system page size. Standard FFI. |
 | `config.rs` | `unsafe impl Pod`: Marker trait for configuration structs to be safely cast to bytes for BPF maps. |
+| `runtime/stream_listener.rs` | `AsyncFd::register`: registering perf-buffer fds with Tokio. Sound because `PerfEventArrayBuffer` owns its fd for its whole lifetime. |
 
 ## Data Privacy
 
