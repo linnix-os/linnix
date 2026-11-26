@@ -33,7 +33,7 @@ Linnix uses Rust for memory safety. However, `unsafe` blocks are necessary for i
 *   **Default**: No data leaves the cluster. The LLM reasoner is enabled by default but targets a local model server (`localhost:8090`); pointing `[reasoner] endpoint` at a hosted API sends incident data to that provider.
 *   **Opt-in**: Slack, Apprise and Linnix Cloud export send data only when configured.
 *   **Inventory**: every outbound destination, its config key and default are listed in [docs/security/blast-radius.md](docs/security/blast-radius.md). `k8s/hardening/networkpolicy-egress.yaml` enforces default-deny egress.
-*   **Redaction**: You can enable `privacy.redact_sensitive_data = true` in `linnix.toml` to hash Pod names and Namespaces in alerts.
+*   **Redaction**: `privacy.redact_sensitive_data` is parsed from `linnix.toml` but is **not yet applied** to any output. Pod names and namespaces appear unhashed in alerts. Do not rely on it.
 
 ## Release Integrity
 

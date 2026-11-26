@@ -106,7 +106,7 @@ behaviour with no config file. The shipped Kubernetes ConfigMap
 |---|---|---|---|---|
 | Kubernetes API server | Pod/node metadata enrichment | automatic in-cluster (`KUBERNETES_SERVICE_HOST`) | on in Kubernetes | Read-only GETs/WATCHes with the pod's ServiceAccount token |
 | LLM endpoint | Incident analysis, `/insights` summaries | `[reasoner] enabled`, `endpoint` (env `LLM_ENDPOINT`) | **enabled**, `http://localhost:8090` (local llama.cpp) | Incident facts, process names, CPU/memory figures. Sends `OPENAI_API_KEY` as a bearer token if it is set |
-| Slack webhook | Alerts | `[notifications.slack]` | off | Alert text, optionally with redacted pod/namespace |
+| Slack webhook | Alerts | `[notifications.slack]` | off | Alert text, including pod and namespace (`privacy.redact_sensitive_data` is parsed but not yet applied) |
 | Apprise | Alerts (runs the local `apprise` CLI) | `[notifications.apprise] urls` | off | Alert text to whatever URLs you configure |
 | Linnix Cloud edge | Evidence batch export | `[cloud] enabled`, `endpoint` | **off** | Detection batches. `comm`, PIDs, cmdline and cgroup paths are scrubbed unless `export_process_identity = true` |
 
