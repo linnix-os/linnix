@@ -1,0 +1,70 @@
+# Default-deny egress for the Linnix agent.
+#
+# With the shipped ConfigMap (reasoner, Slack, Apprise and cloud export all
+# disabled) the only outbound traffic the agent needs is:
+#   * DNS, to resolve the API server name
+#   * the Kubernetes API server, for pod/node metadata enrichment
+# Everything else is denied. See docs/security/blast-radius.md for the full
+# egress inventory and the config key behind each destination.
+#
+# Requires a CNI that enforces NetworkPolicy egress (Calico, Cilium,
+# Antrea, ...). The agent pod does not use hostNetwork, so this policy applies.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: linnix-agent-egress
+  namespace: default
+  labels:
+    app: linnix
+spec:
+  podSelector:
+    matchLabels:
+      app: linnix
+  policyTypes:
+    - Egress
+  egress:
+    # DNS (kube-dns / CoreDNS).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Kubernetes API server. NetworkPolicy matches the API server's endpoint
+    # IPs, not the `kubernetes` Service ClusterIP. Replace the placeholder with
+    # the output of:
+    #   kubectl get endpoints kubernetes -n default -o jsonpath='{.subsets[*].addresses[*].ip}'
+    # Managed control planes (EKS, GKE, AKS) and some CNIs (e.g. Cilium, which
+    # models the API server as the `kube-apiserver` entity) handle this
+    # differently; check your CNI's documentation.
+    - to:
+        - ipBlock:
+            cidr: 203.0.113.10/32  # PLACEHOLDER: your API server endpoint IP(s)
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
+    # Opt-in destinations. Uncomment only the ones you enable in linnix.toml.
+    #
+    # [cloud] export to Linnix Cloud (HTTPS only for non-loopback endpoints):
+    # - to:
+    #     - ipBlock:
+    #         cidr: <edge ingest IP range>
+    #   ports:
+    #     - protocol: TCP
+    #       port: 443
+    #
+    # [notifications.slack] webhook (hooks.slack.com) or an egress proxy:
+    # - to:
+    #     - ipBlock:
+    #         cidr: <egress proxy IP>/32
+    #   ports:
+    #     - protocol: TCP
+    #       port: 443

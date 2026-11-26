@@ -7,6 +7,10 @@ on:
 
 permissions:
   contents: write
+  # Sigstore-backed build provenance for every release asset
+  # (verify with `gh attestation verify <file> --repo linnix-os/linnix`).
+  id-token: write
+  attestations: write
 
 jobs:
   build-packages:
@@ -80,6 +84,22 @@ jobs:
         run: |
           cargo xtask build-ebpf --release
 
+      - name: Generate SBOMs (CycloneDX)
+        run: |
+          cargo install cargo-cyclonedx --version 0.5.10 --locked
+          cargo cyclonedx -f json --target ${{ matrix.rust_target }}
+          mkdir -p sbom
+          cp cognitod/cognitod.cdx.json sbom/cognitod-${{ matrix.arch }}.cdx.json
+          cp linnix-cli/linnix-cli.cdx.json sbom/linnix-cli-${{ matrix.arch }}.cdx.json
+          cp linnix-ai-ebpf/linnix-ai-ebpf-ebpf/linnix-ai-ebpf-ebpf.cdx.json sbom/linnix-ai-ebpf-${{ matrix.arch }}.cdx.json
+          ls -l sbom
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ matrix.arch }}
+          path: sbom/*.cdx.json
+
       - name: Create tarball
         run: |
           mkdir -p dist
@@ -148,13 +168,25 @@ jobs:
           find all-packages -name "*.deb" -exec cp {} release-packages/ \;
           find all-packages -name "*.rpm" -exec cp {} release-packages/ \;
           find all-packages -name "*.tar.gz" -exec cp {} release-packages/ \;
+          find all-packages -name "*.cdx.json" -exec cp {} release-packages/ \;
           ls -lh release-packages/
 
       - name: Generate checksums
         run: |
           cd release-packages
-          sha256sum *.tar.gz > SHA256SUMS
+          sha256sum -- *.tar.gz *.deb *.rpm *.cdx.json > SHA256SUMS
           cat SHA256SUMS
+
+      # Runs before the 'latest' symlinks exist so only real files are attested.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            release-packages/*.tar.gz
+            release-packages/*.deb
+            release-packages/*.rpm
+            release-packages/*.cdx.json
+            release-packages/SHA256SUMS
 
       - name: Create symlinks for latest
         run: |
@@ -258,7 +290,7 @@ jobs:
           EOF
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: release-packages/*
           body_path: release_notes.md

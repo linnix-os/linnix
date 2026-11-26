@@ -23,6 +23,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
 
     steps:
       - name: Checkout code
@@ -101,8 +103,11 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v5
         with:
+          provenance: mode=max
+          sbom: true
           context: .
           file: ./Dockerfile
           # TODO: ARM64 support blocked by bpf-linker LLVM issues in QEMU
@@ -117,12 +122,23 @@ jobs:
             VERSION=${{ github.ref_name }}
             COMMIT=${{ github.sha }}
 
+      # Attest by digest, never by tag, and only when the image was pushed.
+      - name: Attest image provenance
+        if: github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.COGNITOD_IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
   build-llama-cpp:
     name: Build llama.cpp Image
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
 
     steps:
       - name: Checkout code
@@ -155,8 +171,11 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v5
         with:
+          provenance: mode=max
+          sbom: true
           context: ./docker/llama-cpp
           file: ./docker/llama-cpp/Dockerfile
           platforms: linux/amd64,linux/arm64
@@ -165,6 +184,15 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # Attest by digest, never by tag, and only when the image was pushed.
+      - name: Attest image provenance
+        if: github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.LLAMA_IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
 
   test-docker-compose:
     name: Test Docker Compose Setup
