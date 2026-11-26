@@ -41,6 +41,12 @@ struct IdentityFile {
     /// existed readable.
     #[serde(default)]
     heartbeat_seq: u64,
+    /// The last `stall_attributions` row id sealed into a batch. Independent
+    /// of `export_watermark` because the two tables have separate id spaces.
+    /// `#[serde(default)]` keeps identities written before attribution
+    /// export existed readable; they start at 0 and backfill.
+    #[serde(default)]
+    attribution_watermark: i64,
 }
 
 /// Resolve the node identity: explicit config override wins, then the
@@ -99,6 +105,7 @@ impl IdentityStore {
                     next_sequence: 0,
                     export_watermark: 0,
                     heartbeat_seq: 0,
+                    attribution_watermark: 0,
                 };
                 let store = Self {
                     path: path.clone(),
@@ -161,6 +168,21 @@ impl IdentityStore {
     pub fn set_export_watermark(&mut self, last_id: i64) -> io::Result<()> {
         if last_id > self.identity.export_watermark {
             self.identity.export_watermark = last_id;
+            self.persist()?;
+        }
+        Ok(())
+    }
+
+    pub fn attribution_watermark(&self) -> i64 {
+        self.identity.attribution_watermark
+    }
+
+    /// Advance the attribution watermark past the rows sealed into a batch.
+    /// Same contract as [`Self::set_export_watermark`]: only after the batch
+    /// is durably spooled, and it never moves backwards.
+    pub fn set_attribution_watermark(&mut self, last_id: i64) -> io::Result<()> {
+        if last_id > self.identity.attribution_watermark {
+            self.identity.attribution_watermark = last_id;
             self.persist()?;
         }
         Ok(())
@@ -242,6 +264,22 @@ mod tests {
         .unwrap();
         let mut store = IdentityStore::load_or_create(dir.path(), None, None).unwrap();
         assert_eq!(store.next_heartbeat_seq().unwrap(), 1);
+        // Also predates attribution export: starts at 0 and backfills.
+        assert_eq!(store.attribution_watermark(), 0);
+    }
+
+    #[test]
+    fn attribution_watermark_is_independent_and_only_moves_forward() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = fresh_store(dir.path());
+        assert_eq!(store.attribution_watermark(), 0);
+        store.set_attribution_watermark(9).unwrap();
+        store.set_attribution_watermark(3).unwrap();
+        assert_eq!(store.attribution_watermark(), 9);
+        assert_eq!(store.export_watermark(), 0, "separate id spaces");
+        drop(store);
+        let reopened = fresh_store(dir.path());
+        assert_eq!(reopened.attribution_watermark(), 9);
     }
 
     #[test]

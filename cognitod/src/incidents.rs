@@ -82,6 +82,17 @@ pub struct StallAttribution {
     pub event_id: Option<String>,
 }
 
+/// One `stall_attributions` row as pulled for cloud export: the stored
+/// attribution plus the row id (the export watermark) and the victim, which
+/// [`StallAttribution`] leaves out because its API callers filter by victim.
+#[derive(Debug, Clone)]
+pub struct ExportedAttribution {
+    pub id: i64,
+    pub victim_pod: String,
+    pub victim_namespace: String,
+    pub attribution: StallAttribution,
+}
+
 /// Incident storage backed by SQLite
 pub struct IncidentStore {
     pool: SqlitePool,
@@ -882,6 +893,57 @@ impl IncidentStore {
         Ok(rows.into_iter().map(incident_from_row).collect())
     }
 
+    /// Pull stall-attribution rows for cloud export: `id > after_id`, in id
+    /// order, at most `limit`. Mirrors [`Self::export_batch`] for the
+    /// `stall_attributions` table, which has its own id space and watermark.
+    pub async fn export_attributions(
+        &self,
+        after_id: i64,
+        limit: i64,
+    ) -> Result<Vec<ExportedAttribution>, sqlx::Error> {
+        let rows = sqlx::query(
+            r#"
+                SELECT id, victim_pod, victim_namespace, offender_pod, offender_namespace,
+                       stall_us, attributed_stall_us, blame_score, timestamp,
+                       cpu_share, fork_count, short_job_count, event_id
+                FROM stall_attributions
+                WHERE id > ?
+                ORDER BY id ASC
+                LIMIT ?
+            "#,
+        )
+        .bind(after_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| ExportedAttribution {
+                id: r.get("id"),
+                victim_pod: r.get("victim_pod"),
+                victim_namespace: r.get("victim_namespace"),
+                attribution: StallAttribution {
+                    offender_pod: r.get("offender_pod"),
+                    offender_namespace: r.get("offender_namespace"),
+                    stall_us: r.get::<i64, _>("stall_us").max(0) as u64,
+                    attributed_stall_us: r
+                        .get::<Option<i64>, _>("attributed_stall_us")
+                        .map(|v| v.max(0) as u64),
+                    blame_score: r.get("blame_score"),
+                    timestamp: r.get::<i64, _>("timestamp").max(0) as u64,
+                    cpu_share: r.get::<Option<f64>, _>("cpu_share").unwrap_or(0.0),
+                    fork_count: r.get::<Option<i64>, _>("fork_count").unwrap_or(0).max(0) as u64,
+                    short_job_count: r
+                        .get::<Option<i64>, _>("short_job_count")
+                        .unwrap_or(0)
+                        .max(0) as u64,
+                    event_id: r.get("event_id"),
+                },
+            })
+            .collect())
+    }
+
     /// Get statistics about incidents
     pub async fn stats(&self) -> Result<IncidentStats, sqlx::Error> {
         let total_row = sqlx::query("SELECT COUNT(*) FROM incidents")
@@ -1117,6 +1179,57 @@ mod tests {
             retention_cutoff_unix(Some(30), now),
             Some(now - 30 * 86_400)
         );
+    }
+
+    #[tokio::test]
+    async fn export_attributions_pages_by_id_and_keeps_legacy_nulls() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = IncidentStore::new(dir.path().join("incidents.db"))
+            .await
+            .unwrap();
+        // A row written before attributed_stall_us / event_id existed.
+        sqlx::query(
+            "INSERT INTO stall_attributions (victim_pod, victim_namespace, offender_pod, \
+             offender_namespace, stall_us, blame_score, timestamp) \
+             VALUES ('v', 'ns', 'o', 'ns2', 500, 1.0, 1700000000)",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        for i in 0..3u64 {
+            store
+                .insert_stall_attribution(&crate::collectors::psi::BlameAttribution {
+                    event_id: format!("evt-{i}"),
+                    victim_pod: "v".to_string(),
+                    victim_namespace: "ns".to_string(),
+                    offender_pod: format!("o{i}"),
+                    offender_namespace: "ns2".to_string(),
+                    blame_score: 1.0,
+                    stall_us: 1_000,
+                    attributed_stall_us: 400,
+                    timestamp: 1_700_000_001 + i,
+                    cpu_share: 0.5,
+                    fork_count: 0,
+                    short_job_count: 0,
+                })
+                .await
+                .unwrap();
+        }
+
+        let first = store.export_attributions(0, 2).await.unwrap();
+        assert_eq!(first.iter().map(|r| r.id).collect::<Vec<_>>(), [1, 2]);
+        let legacy = &first[0].attribution;
+        assert_eq!(
+            legacy.attributed_stall_us, None,
+            "unknown share stays unknown"
+        );
+        assert_eq!(legacy.event_id, None);
+        assert_eq!(first[0].victim_pod, "v");
+        assert_eq!(first[1].attribution.attributed_stall_us, Some(400));
+
+        let rest = store.export_attributions(2, 10).await.unwrap();
+        assert_eq!(rest.iter().map(|r| r.id).collect::<Vec<_>>(), [3, 4]);
+        assert!(store.export_attributions(4, 10).await.unwrap().is_empty());
     }
 
     #[tokio::test]

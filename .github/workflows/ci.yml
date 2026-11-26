@@ -75,7 +75,9 @@ jobs:
     strategy:
       matrix:
         include:
-          - runner: ubuntu-latest
+          # Pinned: apt.llvm.org has no LLVM 20 repo for Ubuntu 26.04 (the
+          # current ubuntu-latest), so llvm.sh 404s there.
+          - runner: ubuntu-24.04
           - runner: ubuntu-22.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
@@ -87,7 +89,7 @@ jobs:
           components: rust-src, llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - name: Install LLVM 20
-        if: matrix.runner == 'ubuntu-latest'
+        if: matrix.runner == 'ubuntu-24.04'
         run: |
           wget https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
@@ -95,7 +97,7 @@ jobs:
           sudo apt-get install -y llvm-20-dev libpolly-20-dev
           echo "LLVM_SYS_200_PREFIX=/usr/lib/llvm-20" >> $GITHUB_ENV
       - name: Install bpf-linker
-        if: matrix.runner == 'ubuntu-latest'
+        if: matrix.runner == 'ubuntu-24.04'
         run: cargo install bpf-linker --version 0.9.13 --locked
       - name: Install bpf-linker (prebuilt, aarch64)
         # v0.9.13 has no aarch64 release binary and building it from source via the

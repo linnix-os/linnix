@@ -1,9 +1,24 @@
 [advisories]
 yanked = "warn"
 
+# Each ignore names why the advisory does not apply or what unblocks the fix.
+# Revisit on every dependency bump; remove an entry once it stops matching.
+
 [[advisories.ignore]]
-id = "RUSTSEC-2025-0052"
-reason = "httpmock is used in tests only; async-std is unmaintained but no replacement is available yet."
+id = "RUSTSEC-2026-0459"
+reason = "Bundled SQLite in libsqlite3-sys 0.30 (via sqlx 0.8). Exploit needs a crafted DB + -wal pair; cognitod only opens its own DB under /var/lib/linnix, writable only by node root. Fix requires sqlx 0.9 (Rust 1.94; Dockerfile is on 1.93)."
+
+[[advisories.ignore]]
+id = "RUSTSEC-2026-0543"
+reason = "chrono unmaintained, no fixed release. Direct dep of cognitod, linnix-reasoner, xtask-lab; migrating to jiff/time is tracked separately."
+
+[[advisories.ignore]]
+id = "RUSTSEC-2024-0449"
+reason = "unsafe-libyaml unmaintained, pulled in by deprecated serde_yaml 0.9 (rules.yaml parsing). Replacement is tracked separately."
+
+[[advisories.ignore]]
+id = "RUSTSEC-2026-0441"
+reason = "pin-utils unmaintained, transitive via futures-util (axum, futures). No action available downstream."
 
 [licenses]
 # Only these SPDX licenses are allowed; everything else fails.

@@ -1,10 +1,11 @@
 //! Cloud export loop.
 //!
-//! One tick (every [`SEAL_INTERVAL_SECS`]) pulls new incidents from the
-//! store in row-ID order behind a persisted watermark, converts them to
-//! schema-v1 detection events (scrubbed of secrets and, by default, process
-//! identity), adds heartbeats and degradation-state events, seals batches,
-//! spools them durably, and drains the spool through the sender.
+//! One tick (every [`SEAL_INTERVAL_SECS`]) pulls new incidents and new
+//! stall-attribution rows from the store, each in row-ID order behind its own
+//! persisted watermark, converts them to schema-v1 detection events (scrubbed
+//! of secrets and, by default, process identity), adds heartbeats and
+//! degradation-state events, seals batches, spools them durably, and drains
+//! the spool through the sender.
 //!
 //! Failure isolation: every fallible step logs and continues. The exporter
 //! never panics, never blocks monitoring, and never touches the local API
@@ -20,15 +21,15 @@ use serde_json::Value;
 use tokio::task::JoinHandle;
 
 use crate::attribution::BlameMetrics;
-use crate::incidents::{Incident, IncidentStore};
+use crate::incidents::{ExportedAttribution, Incident, IncidentStore};
 
 use super::identity::IdentityStore;
 use super::model::{
-    AgentStatus, AttributionQuality, DegradationStatePayload, DetailLevel, DetectionAction,
-    DetectionPayload, Event, EventPayload, EventType, FallbackMode, HeartbeatPayload, Severity,
-    TimeRange, Transport, detection_type_for, rfc3339,
+    AgentStatus, AttributionQuality, DETECTION_STALL_ATTRIBUTION, DegradationStatePayload,
+    DetailLevel, DetectionAction, DetectionPayload, Event, EventPayload, EventType, FallbackMode,
+    HeartbeatPayload, Severity, TimeRange, Transport, WorkloadRef, detection_type_for, rfc3339,
 };
-use super::scrub::{ScrubPolicy, scrub_snapshot};
+use super::scrub::{ScrubPolicy, scrub_snapshot, scrub_value};
 use super::seal::{BatchSealer, PushOutcome, SealContext, SealIdentity, SealedBatch};
 use super::sender::{SendDecision, Sender, backoff_delay};
 use super::spool::{Spool, SpoolPriority};
@@ -116,6 +117,8 @@ pub struct Exporter {
     /// durably spooled, so a crash replays unsealed rows (the idempotency
     /// key makes the replay harmless downstream).
     pushed_watermark: i64,
+    /// Same as `pushed_watermark`, for `stall_attributions` row IDs.
+    pushed_attribution_watermark: i64,
     /// Lowest drop priority among the events currently buffered; a batch is
     /// spooled at its most important event's priority.
     pending_priority: SpoolPriority,
@@ -153,6 +156,7 @@ impl Exporter {
         let quality = config.quality.quality();
         let policy = ScrubPolicy::from_opt_in(config.export_process_identity);
         let watermark = identity.export_watermark();
+        let attribution_watermark = identity.attribution_watermark();
         let last_evictions = blame.evictions();
         let sealer = new_sealer(quality, &config.tenant_id, &identity);
         let mut exporter = Self {
@@ -162,6 +166,7 @@ impl Exporter {
             sender,
             sealer,
             pushed_watermark: watermark,
+            pushed_attribution_watermark: attribution_watermark,
             pending_priority: SpoolPriority::Heartbeat,
             store,
             blame,
@@ -239,6 +244,8 @@ impl Exporter {
             Err(e) => warn!("[cloud] incident pull failed: {e}; will retry next tick"),
         }
 
+        self.pull_attributions().await;
+
         if self.last_heartbeat.elapsed() >= Duration::from_secs(HEARTBEAT_INTERVAL_SECS)
             && let Some(heartbeat) = self.heartbeat_event()
         {
@@ -251,6 +258,34 @@ impl Exporter {
         }
 
         self.drain().await;
+    }
+
+    /// Pull new stall-attribution rows behind their own watermark. Same
+    /// contract as the incident pull: stop (without advancing) at the first
+    /// row that cannot be buffered, so it is retried next tick.
+    async fn pull_attributions(&mut self) {
+        let rows = match self
+            .store
+            .export_attributions(self.pushed_attribution_watermark, EXPORT_PULL_LIMIT)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!("[cloud] attribution pull failed: {e}; will retry next tick");
+                return;
+            }
+        };
+        for row in &rows {
+            let event = self.attribution_event(row);
+            if !self.push_event(event, SpoolPriority::Detection).await {
+                warn!(
+                    "[cloud] could not buffer attribution {}; pausing pull until the spool recovers",
+                    row.id
+                );
+                break;
+            }
+            self.pushed_attribution_watermark = self.pushed_attribution_watermark.max(row.id);
+        }
     }
 
     /// Run ticks forever on the seal cadence.
@@ -337,6 +372,14 @@ impl Exporter {
                 self.sealer.clear();
                 if let Err(e) = self.identity.set_export_watermark(self.pushed_watermark) {
                     error!("[cloud] spooled batch {sequence} but failed to persist watermark: {e}");
+                }
+                if let Err(e) = self
+                    .identity
+                    .set_attribution_watermark(self.pushed_attribution_watermark)
+                {
+                    error!(
+                        "[cloud] spooled batch {sequence} but failed to persist attribution watermark: {e}"
+                    );
                 }
                 self.pending_priority = SpoolPriority::Heartbeat;
             }
@@ -528,6 +571,67 @@ impl Exporter {
                 details,
             }),
         })
+    }
+}
+
+impl Exporter {
+    /// One stall-attribution row as a `stall_attribution` detection.
+    ///
+    /// Built only from the stored row (no clock reads, no config): a replay
+    /// after a crash must produce a byte-identical body, or the edge answers
+    /// 409 and quarantines the whole batch.
+    fn attribution_event(&self, row: &ExportedAttribution) -> Event {
+        let attr = &row.attribution;
+        let instance = self.identity.agent_instance_id();
+        let at = attr.timestamp as i64;
+        let mut details = serde_json::json!({
+            "offender": {
+                "namespace": attr.offender_namespace,
+                "pod": attr.offender_pod,
+            },
+            // The victim's total stall for the window. Repeats across every
+            // offender of one stall event: group by `stall_event_id`, never
+            // sum this across rows.
+            "victim_total_stall_us": attr.stall_us,
+            // This offender's share of the stall; sums correctly per event.
+            // null on rows written before the split existed.
+            "attributed_stall_us": attr.attributed_stall_us,
+            "blame_score": attr.blame_score,
+            "cpu_share": attr.cpu_share,
+            "fork_count": attr.fork_count,
+            "short_job_count": attr.short_job_count,
+            "stall_event_id": attr.event_id,
+        });
+        // No identity or secret keys are built above; scrub anyway so a field
+        // added later cannot bypass the export policy.
+        scrub_value(&mut details, self.policy);
+        Event {
+            event_id: format!("attribution-{}", row.id),
+            event_idempotency_key: format!("e:attr:{instance}:{}", row.id),
+            event_type: EventType::Detection,
+            occurred_at: rfc3339(at),
+            detail_level: DetailLevel::Evidence,
+            payload: EventPayload::Detection(DetectionPayload {
+                detection_type: DETECTION_STALL_ATTRIBUTION.to_string(),
+                // An attribution explains a stall; it is not itself an alert.
+                severity: Severity::Info,
+                subject: Some(WorkloadRef {
+                    namespace: row.victim_namespace.clone(),
+                    pod: row.victim_pod.clone(),
+                    container_id: None,
+                }),
+                // The sustained-pressure window is config-dependent and not
+                // stored on the row, so the window marks the one second in
+                // which the attribution was computed.
+                window: TimeRange {
+                    start: rfc3339(at.saturating_sub(1)),
+                    end: rfc3339(at),
+                },
+                rule_name: DETECTION_STALL_ATTRIBUTION.to_string(),
+                action: DetectionAction::Observe,
+                details,
+            }),
+        }
     }
 }
 
@@ -1071,5 +1175,172 @@ mod tests {
         )
         .unwrap();
         assert!(note.contains("409"), "quarantine note explains why: {note}");
+    }
+
+    fn sample_attribution(event: &str, offender: &str) -> crate::collectors::psi::BlameAttribution {
+        crate::collectors::psi::BlameAttribution {
+            event_id: event.to_string(),
+            victim_pod: "payment-api".to_string(),
+            victim_namespace: "payments".to_string(),
+            offender_pod: offender.to_string(),
+            offender_namespace: "media".to_string(),
+            blame_score: 2.0,
+            stall_us: 900_000,
+            attributed_stall_us: 600_000,
+            timestamp: 1_700_000_000,
+            cpu_share: 0.7,
+            fork_count: 10,
+            short_job_count: 2,
+        }
+    }
+
+    fn attribution_events(batch: &serde_json::Value) -> Vec<&serde_json::Value> {
+        batch["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["payload"]["detection_type"] == DETECTION_STALL_ATTRIBUTION)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn attribution_event_shape_is_workload_level_and_scrub_safe() {
+        let h = harness("http://127.0.0.1:9/unused").await;
+        h.store
+            .insert_stall_attribution(&sample_attribution("evt-a", "image-resizer"))
+            .await
+            .unwrap();
+        let rows = h.store.export_attributions(0, 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        // The harness runs the default STRICT policy (export_process_identity
+        // = false): pod/namespace are workload identity and must survive it.
+        let event = h.exporter.attribution_event(&rows[0]);
+        let v = serde_json::to_value(&event).unwrap();
+        let instance = h.exporter.identity.agent_instance_id();
+        assert_eq!(v["event_type"], "detection");
+        assert_eq!(v["event_id"], format!("attribution-{}", rows[0].id));
+        assert_eq!(
+            v["event_idempotency_key"],
+            format!("e:attr:{instance}:{}", rows[0].id)
+        );
+        let p = &v["payload"];
+        assert_eq!(p["detection_type"], "stall_attribution");
+        assert_eq!(p["severity"], "info");
+        assert_eq!(p["subject"]["namespace"], "payments");
+        assert_eq!(p["subject"]["pod"], "payment-api");
+        let d = &p["details"];
+        assert_eq!(d["offender"]["namespace"], "media");
+        assert_eq!(d["offender"]["pod"], "image-resizer");
+        assert_eq!(d["victim_total_stall_us"], 900_000);
+        assert_eq!(d["attributed_stall_us"], 600_000);
+        assert_eq!(d["stall_event_id"], "evt-a");
+        assert!(d.get("stall_us").is_none(), "ambiguous name must not ship");
+        for key in ["comm", "pid", "cmdline", "cgroup_path"] {
+            assert!(!v.to_string().contains(&format!("\"{key}\"")), "{key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn attribution_event_body_is_deterministic_for_replay() {
+        // A crash between pull and spool replays the row; the edge 409s (and
+        // quarantines the batch) if the rebuilt body differs at all.
+        let h = harness("http://127.0.0.1:9/unused").await;
+        h.store
+            .insert_stall_attribution(&sample_attribution("evt-a", "image-resizer"))
+            .await
+            .unwrap();
+        let rows = h.store.export_attributions(0, 10).await.unwrap();
+        let first = serde_json::to_string(&h.exporter.attribution_event(&rows[0])).unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let again = h.store.export_attributions(0, 10).await.unwrap();
+        let second = serde_json::to_string(&h.exporter.attribution_event(&again[0])).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn attribution_watermark_advances_only_after_durable_spool() {
+        let h = harness("http://127.0.0.1:9/unused").await;
+        for (event, offender) in [("evt-a", "image-resizer"), ("evt-a", "batch-etl")] {
+            h.store
+                .insert_stall_attribution(&sample_attribution(event, offender))
+                .await
+                .unwrap();
+        }
+        // An incident in the same tick: the two watermarks are independent.
+        h.store
+            .insert(&sample_incident(None, "fork_storm", None))
+            .await
+            .unwrap();
+        let mut exporter = h.exporter;
+        exporter.tick().await;
+        assert_eq!(exporter.identity.attribution_watermark(), 0);
+        assert_eq!(exporter.pushed_attribution_watermark, 2);
+        assert_eq!(exporter.pushed_watermark, 1);
+
+        exporter.seal_and_spool().await;
+        assert_eq!(exporter.identity.attribution_watermark(), 2);
+        assert_eq!(exporter.identity.export_watermark(), 1);
+        let bytes = exporter.spool.read(0).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let attrs = attribution_events(&v);
+        assert_eq!(attrs.len(), 2);
+        // Both rows share the stall event, so a consumer can group them.
+        assert!(
+            attrs
+                .iter()
+                .all(|e| e["payload"]["details"]["stall_event_id"] == "evt-a")
+        );
+
+        // Next tick pulls nothing new.
+        exporter.tick().await;
+        assert_eq!(exporter.pushed_attribution_watermark, 2);
+    }
+
+    #[tokio::test]
+    async fn failed_spool_store_preserves_attributions_for_retry() {
+        let h = harness("http://127.0.0.1:9/unused").await;
+        h.store
+            .insert_stall_attribution(&sample_attribution("evt-a", "image-resizer"))
+            .await
+            .unwrap();
+        let mut exporter = h.exporter;
+        exporter.tick().await;
+        assert_eq!(exporter.pushed_attribution_watermark, 1);
+
+        let spool_dir = h.dir.path().join(super::super::spool::SPOOL_DIR_NAME);
+        std::fs::write(spool_dir.join("0.json"), b"sabotage").unwrap();
+        exporter.seal_and_spool().await;
+        assert!(!exporter.sealer.is_empty());
+        assert_eq!(exporter.identity.attribution_watermark(), 0);
+
+        std::fs::remove_file(spool_dir.join("0.json")).unwrap();
+        exporter.seal_and_spool().await;
+        assert_eq!(exporter.identity.attribution_watermark(), 1);
+        let v: serde_json::Value =
+            serde_json::from_slice(&exporter.spool.read(1).unwrap()).unwrap();
+        assert_eq!(attribution_events(&v).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn restart_resumes_attribution_export_from_persisted_watermark() {
+        let h = harness("http://127.0.0.1:9/unused").await;
+        h.store
+            .insert_stall_attribution(&sample_attribution("evt-a", "image-resizer"))
+            .await
+            .unwrap();
+        let mut exporter = h.exporter;
+        exporter.tick().await;
+        exporter.seal_and_spool().await;
+        drop(exporter);
+
+        h.store
+            .insert_stall_attribution(&sample_attribution("evt-b", "batch-etl"))
+            .await
+            .unwrap();
+        let mut restarted =
+            build_exporter(h.dir.path(), "http://127.0.0.1:9/unused", h.store.clone()).await;
+        assert_eq!(restarted.pushed_attribution_watermark, 1);
+        restarted.tick().await;
+        assert_eq!(restarted.pushed_attribution_watermark, 2);
     }
 }
