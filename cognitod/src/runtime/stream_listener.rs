@@ -103,10 +103,15 @@ pub fn start_perf_listener(
         let event_tx = event_tx.clone();
 
         tokio::spawn(async move {
-            let mut async_buffer = match AsyncFd::new(buffer) {
+            // SAFETY: `PerfEventArrayBuffer` owns its perf-event fd (aya's
+            // `PerfBuffer` holds it as an owned fd and never replaces it), so
+            // the fd stays open and `as_raw_fd()` returns the same value for
+            // as long as the `AsyncFd` owns the buffer.
+            let mut async_buffer = match unsafe { AsyncFd::register(buffer) } {
                 Ok(fd) => fd,
                 Err(e) => {
-                    log::error!("failed to create AsyncFd for perf buffer: {e}");
+                    let (_, err) = e.into_parts();
+                    log::error!("failed to create AsyncFd for perf buffer: {err}");
                     return;
                 }
             };
